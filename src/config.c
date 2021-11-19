@@ -271,6 +271,7 @@ extern module AP_MODULE_DECLARE_DATA auth_openidc_module;
  */
 typedef struct oidc_dir_cfg {
 	char *discover_url;
+	char *redirect_uri;
 	char *cookie_path;
 	char *cookie;
 	char *authn_header;
@@ -380,16 +381,6 @@ static const char* oidc_set_relative_or_absolute_url_slot_dir_cfg(
 		// absolute uri
 		return oidc_set_url_slot_type(cmd, ptr, arg, NULL);
 	}
-}
-
-/*
- * set a relative or absolute URL value in the server config
- */
-static const char* oidc_set_relative_or_absolute_url_slot(cmd_parms *cmd,
-		void *ptr, const char *arg) {
-	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(cmd->server->module_config,
-			&auth_openidc_module);
-	return oidc_set_relative_or_absolute_url_slot_dir_cfg(cmd, cfg, arg);
 }
 
 /*
@@ -1322,7 +1313,6 @@ void* oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
 
 	c->merged = FALSE;
 
-	c->redirect_uri = NULL;
 	c->default_sso_url = NULL;
 	c->default_slo_url = NULL;
 	c->public_keys = NULL;
@@ -1448,8 +1438,6 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 
 	c->merged = TRUE;
 
-	c->redirect_uri =
-			add->redirect_uri != NULL ? add->redirect_uri : base->redirect_uri;
 	c->default_sso_url =
 			add->default_sso_url != NULL ?
 					add->default_sso_url : base->default_sso_url;
@@ -1952,6 +1940,7 @@ int oidc_cfg_session_cache_fallback_to_cookie(request_rec *r) {
 void* oidc_create_dir_config(apr_pool_t *pool, char *path) {
 	oidc_dir_cfg *c = apr_pcalloc(pool, sizeof(oidc_dir_cfg));
 	c->discover_url = OIDC_CONFIG_STRING_UNSET;
+	c->redirect_uri = OIDC_CONFIG_STRING_UNSET;
 	c->cookie = OIDC_CONFIG_STRING_UNSET;
 	c->cookie_path = OIDC_CONFIG_STRING_UNSET;
 	c->authn_header = OIDC_CONFIG_STRING_UNSET;
@@ -1997,6 +1986,17 @@ char* oidc_cfg_dir_cookie(request_rec *r) {
 							== 0)))
 		return OIDC_DEFAULT_COOKIE;
 	return dir_cfg->cookie;
+}
+
+char* oidc_cfg_dir_redirect_uri(request_rec *r) {
+	oidc_dir_cfg *dir_cfg = ap_get_module_config(r->per_dir_config,
+			&auth_openidc_module);
+	if ((dir_cfg->redirect_uri != NULL) && (apr_strnatcmp(dir_cfg->redirect_uri,
+			OIDC_CONFIG_STRING_UNSET) == 0)){
+		return NULL;
+	}else{
+		return dir_cfg->redirect_uri;
+	}
 }
 
 char* oidc_cfg_dir_cookie_path(request_rec *r) {
@@ -2168,6 +2168,9 @@ void* oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->discover_url =
 			(apr_strnatcmp(add->discover_url, OIDC_CONFIG_STRING_UNSET) != 0) ?
 					add->discover_url : base->discover_url;
+	c->redirect_uri =
+			(apr_strnatcmp(add->redirect_uri, OIDC_CONFIG_STRING_UNSET) != 0) ?
+					add->redirect_uri : base->redirect_uri;
 	c->cookie =
 			(apr_strnatcmp(add->cookie, OIDC_CONFIG_STRING_UNSET) != 0) ?
 					add->cookie : base->cookie;
@@ -2250,6 +2253,59 @@ void* oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD) {
 }
 
 /*
+ * report a directory config error
+ */
+static int oidc_check_per_dir_config_error(request_rec *r, const char *config_str) {
+	oidc_error(r, "mandatory parameter '%s' is not set", config_str);
+	return HTTP_INTERNAL_SERVER_ERROR;
+}
+
+/*
+ * check the directory-level config required for the OpenID Connect RP role
+ */
+static int oidc_check_per_dir_config_openid_openidc(request_rec *r, oidc_cfg *c, oidc_dir_cfg *dc) {
+	apr_uri_t r_uri;
+	apr_byte_t redirect_uri_is_relative;
+
+	if (dc->redirect_uri == NULL)
+		return oidc_check_per_dir_config_error(r, OIDCRedirectURI);
+	redirect_uri_is_relative = (dc->redirect_uri[0] == OIDC_CHAR_FORWARD_SLASH);
+
+	apr_uri_parse(r->server->process->pconf, dc->redirect_uri, &r_uri);
+	if (!redirect_uri_is_relative) {
+		if (apr_strnatcmp(r_uri.scheme, "https") != 0) {
+			oidc_warn(r,
+					"the URL scheme (%s) of the configured " OIDCRedirectURI " SHOULD be \"https\" for security reasons (moreover: some Providers may reject non-HTTPS URLs)",
+					r_uri.scheme);
+		}
+	}
+	if(c->metadata_dir == NULL && c->provider.metadata_url != NULL){
+		apr_uri_parse(r->server->process->pconf, c->provider.metadata_url, &r_uri);
+		if ((r_uri.scheme == NULL)
+				|| (apr_strnatcmp(r_uri.scheme, "https") != 0)) {
+			oidc_warn(r,
+					"the URL scheme (%s) of the configured " OIDCProviderMetadataURL " SHOULD be \"https\" for security reasons!",
+					r_uri.scheme);
+		}
+	}
+
+	if (c->cookie_domain != NULL) {
+		if (redirect_uri_is_relative) {
+			oidc_warn(r,
+					"if the configured " OIDCRedirectURI " is relative, " OIDCCookieDomain " SHOULD be empty");
+		} else if (!oidc_util_cookie_domain_valid(r_uri.hostname,
+				c->cookie_domain)) {
+			oidc_error(r,
+					"the domain (%s) configured in " OIDCCookieDomain " does not match the URL hostname (%s) of the configured " OIDCRedirectURI " (%s): setting \"state\" and \"session\" cookies will not work!",
+					c->cookie_domain, r_uri.hostname, dc->redirect_uri);
+			return HTTP_INTERNAL_SERVER_ERROR;
+		}
+	}
+	return DECLINED;
+}
+
+
+/*
  * report a config error
  */
 static int oidc_check_config_error(server_rec *s, const char *config_str) {
@@ -2257,13 +2313,11 @@ static int oidc_check_config_error(server_rec *s, const char *config_str) {
 	return HTTP_INTERNAL_SERVER_ERROR;
 }
 
+
 /*
  * check the config required for the OpenID Connect RP role
  */
 static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg *c) {
-
-	apr_uri_t r_uri;
-	apr_byte_t redirect_uri_is_relative;
 
 	if ((c->metadata_dir == NULL) && (c->provider.issuer == NULL)
 			&& (c->provider.metadata_url == NULL)) {
@@ -2272,9 +2326,6 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg *c) {
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
-	if (c->redirect_uri == NULL)
-		return oidc_check_config_error(s, OIDCRedirectURI);
-	redirect_uri_is_relative = (c->redirect_uri[0] == OIDC_CHAR_FORWARD_SLASH);
 
 	if (c->crypto_passphrase == NULL)
 		return oidc_check_config_error(s, OIDCCryptoPassphrase);
@@ -2286,14 +2337,6 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg *c) {
 			if (c->provider.authorization_endpoint_url == NULL)
 				return oidc_check_config_error(s,
 						OIDCProviderAuthorizationEndpoint);
-		} else {
-			apr_uri_parse(s->process->pconf, c->provider.metadata_url, &r_uri);
-			if ((r_uri.scheme == NULL)
-					|| (apr_strnatcmp(r_uri.scheme, "https") != 0)) {
-				oidc_swarn(s,
-						"the URL scheme (%s) of the configured " OIDCProviderMetadataURL " SHOULD be \"https\" for security reasons!",
-						r_uri.scheme);
-			}
 		}
 		if (c->provider.client_id == NULL)
 			return oidc_check_config_error(s, OIDCClientID);
@@ -2301,28 +2344,6 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg *c) {
 		if (c->provider.metadata_url != NULL) {
 			oidc_serror(s,
 					"only one of '" OIDCProviderMetadataURL "' or '" OIDCMetadataDir "' should be set");
-			return HTTP_INTERNAL_SERVER_ERROR;
-		}
-	}
-
-	apr_uri_parse(s->process->pconf, c->redirect_uri, &r_uri);
-	if (!redirect_uri_is_relative) {
-		if (apr_strnatcmp(r_uri.scheme, "https") != 0) {
-			oidc_swarn(s,
-					"the URL scheme (%s) of the configured " OIDCRedirectURI " SHOULD be \"https\" for security reasons (moreover: some Providers may reject non-HTTPS URLs)",
-					r_uri.scheme);
-		}
-	}
-
-	if (c->cookie_domain != NULL) {
-		if (redirect_uri_is_relative) {
-			oidc_swarn(s,
-					"if the configured " OIDCRedirectURI " is relative, " OIDCCookieDomain " SHOULD be empty");
-		} else if (!oidc_util_cookie_domain_valid(r_uri.hostname,
-				c->cookie_domain)) {
-			oidc_serror(s,
-					"the domain (%s) configured in " OIDCCookieDomain " does not match the URL hostname (%s) of the configured " OIDCRedirectURI " (%s): setting \"state\" and \"session\" cookies will not work!",
-					c->cookie_domain, r_uri.hostname, c->redirect_uri);
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 	}
@@ -2516,6 +2537,25 @@ static apr_status_t oidc_cleanup_parent(void *data) {
 			"%s - shutdown", NAMEVERSION);
 
 	return APR_SUCCESS;
+}
+
+/*
+ * handler that is called prior to the request content handler to validate the directory-level configuration for openidc RP
+ * This handler has to invoke the main content handler if successful, to ensure this runs before the OIDC main handler runs.
+ * To ensure proper sequence, the content handler is invoked from inside this if the config validates successfully.
+ */
+static int oidc_config_and_handle_content(request_rec *r) {
+	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(r->server->module_config,
+			&auth_openidc_module);
+	
+	oidc_dir_cfg *dir_cfg = (oidc_dir_cfg*) ap_get_module_config(r->per_dir_config,
+			&auth_openidc_module);
+
+	int rc = oidc_check_per_dir_config_openid_openidc(r, cfg, dir_cfg);
+	if(rc == OK || rc == DECLINED)
+		return oidc_content_handler(r);
+	else
+		return rc;
 }
 
 /*
@@ -2767,7 +2807,7 @@ static apr_status_t oidc_filter_in_filter(ap_filter_t *f,
 void oidc_register_hooks(apr_pool_t *pool) {
 	ap_hook_post_config(oidc_post_config, NULL, NULL, APR_HOOK_LAST);
 	ap_hook_child_init(oidc_child_init, NULL, NULL, APR_HOOK_MIDDLE);
-	ap_hook_handler(oidc_content_handler, NULL, NULL, APR_HOOK_FIRST);
+	ap_hook_handler(oidc_config_and_handle_content, NULL, NULL, APR_HOOK_FIRST);
 	ap_hook_insert_filter(oidc_filter_in_insert_filter, NULL, NULL,
 			APR_HOOK_MIDDLE);
 	ap_register_input_filter(oidcFilterName, oidc_filter_in_filter, NULL,
@@ -3016,9 +3056,9 @@ const command_rec oidc_config_cmds[] = {
 				RSRC_CONF,
 				"TLS client certificate private key password used for calls to OpenID Connect OP token endpoint."),
 		AP_INIT_TAKE1(OIDCRedirectURI,
-				oidc_set_relative_or_absolute_url_slot,
-				(void *)APR_OFFSETOF(oidc_cfg, redirect_uri),
-				RSRC_CONF,
+				oidc_set_relative_or_absolute_url_slot_dir_cfg,
+				(void *)APR_OFFSETOF(oidc_dir_cfg, redirect_uri),
+				RSRC_CONF | ACCESS_CONF | OR_AUTHCFG,
 				"Define the Redirect URI (e.g.: https://localhost:9031/protected/example/)"),
 		AP_INIT_TAKE1(OIDCDefaultURL,
 				oidc_set_url_slot,
