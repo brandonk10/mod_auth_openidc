@@ -1429,7 +1429,7 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 
 	if (rv == OIDC_REFRESH_ERROR) {
 		*needs_save = FALSE;
-		return oidc_handle_logout_request(r, cfg, session, cfg->default_slo_url);
+		return oidc_handle_logout_request(r, cfg, session, oidc_cfg_dir_default_slo_url(r));
 	}
 
 	*needs_save |= rv;
@@ -3154,7 +3154,7 @@ static int oidc_handle_logout(request_rec *r, oidc_cfg *c,
 
 	if ((url == NULL) || (apr_strnatcmp(url, "") == 0)) {
 
-		url = c->default_slo_url;
+		url = oidc_cfg_dir_default_slo_url(r);
 
 	} else {
 
@@ -3360,7 +3360,7 @@ static int oidc_handle_session_management(request_rec *r, oidc_cfg *c,
 	if (apr_strnatcmp("logout", cmd) == 0) {
 		oidc_debug(r,
 				"[session=logout] calling oidc_handle_logout_request because of session mgmt local logout call.");
-		return oidc_handle_logout_request(r, c, session, c->default_slo_url);
+		return oidc_handle_logout_request(r, c, session, oidc_cfg_dir_default_slo_url(r));
 	}
 
 	if (oidc_get_provider_from_session(r, c, session, &provider) == FALSE) {
