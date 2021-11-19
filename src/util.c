@@ -696,15 +696,14 @@ char* oidc_get_current_url(request_rec *r, const apr_byte_t x_forwarded_headers)
  * determine absolute redirect uri
  */
 const char* oidc_get_redirect_uri(request_rec *r, oidc_cfg *cfg) {
-
-	char *redirect_uri = cfg->redirect_uri;
+	char *redirect_uri = oidc_cfg_dir_redirect_uri(r);
 
 	if ((redirect_uri != NULL)
 			&& (redirect_uri[0] == OIDC_CHAR_FORWARD_SLASH)) {
 		// relative redirect uri
 
-		redirect_uri = apr_pstrcat(r->pool, oidc_get_current_url_base(r, cfg->x_forwarded_headers),
-				cfg->redirect_uri, NULL);
+		redirect_uri = apr_pstrcat(r->pool, oidc_get_current_url_base(r),
+				redirect_uri, NULL);
 
 		oidc_debug(r, "determined absolute redirect uri: %s", redirect_uri);
 	}

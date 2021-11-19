@@ -289,7 +289,9 @@ int key2jwk(int argc, char **argv, apr_pool_t *pool) {
 
 extern module AP_MODULE_DECLARE_DATA auth_openidc_module;
 
-typedef struct oidc_dir_cfg oidc_dir_cfg;
+typedef struct oidc_dir_cfg{
+	char* redirect_uri;
+} oidc_dir_cfg;
 
 static request_rec * request_setup(apr_pool_t *pool) {
 	const unsigned int kIdx = 0;
@@ -333,9 +335,9 @@ static request_rec * request_setup(apr_pool_t *pool) {
 			"https://idp.example.com/authorize";
 	cfg->provider.scope = "openid";
 	cfg->provider.client_id = "client_id";
-	cfg->redirect_uri = "https://www.example.com/protected/";
 
 	oidc_dir_cfg *d_cfg = oidc_create_dir_config(request->pool, NULL);
+	d_cfg->redirect_uri = "https://www.example.com/protected/";
 
 	request->server->module_config = apr_pcalloc(request->pool,
 			sizeof(ap_conf_vector_t *) * kEls);

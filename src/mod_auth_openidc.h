@@ -376,8 +376,6 @@ typedef struct oidc_cfg {
 	/* HTML to display error messages+description */
 	char *error_template;
 
-	/* the redirect URI as configured with the OpenID Connect OP's that we talk to */
-	char *redirect_uri;
 	/* (optional) default URL for 3rd-party initiated SSO */
 	char *default_sso_url;
 	/* (optional) default URL to go to after logout */
@@ -762,6 +760,7 @@ void *oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD);
 void oidc_register_hooks(apr_pool_t *pool);
 char *oidc_cfg_dir_discover_url(request_rec *r);
 char *oidc_cfg_dir_cookie(request_rec *r);
+char *oidc_cfg_dir_redirect_uri(request_rec *r);
 char *oidc_cfg_dir_cookie_path(request_rec *r);
 char *oidc_cfg_dir_authn_header(request_rec *r);
 apr_byte_t oidc_cfg_dir_pass_info_in_headers(request_rec *r);
