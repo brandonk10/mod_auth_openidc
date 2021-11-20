@@ -2198,8 +2198,6 @@ void* oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->default_sso_url =
 			add->default_sso_url != NULL ?
 					add->default_sso_url : base->default_sso_url;
-	c->redirect_uri =
-			add->redirect_uri != NULL ? add->redirect_uri : base->redirect_uri;
 	c->default_slo_url =
 			add->default_slo_url != NULL ?
 					add->default_slo_url : base->default_slo_url;
