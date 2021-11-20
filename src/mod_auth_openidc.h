@@ -376,8 +376,12 @@ typedef struct oidc_cfg {
 	/* HTML to display error messages+description */
 	char *error_template;
 
+	/* the redirect URI as configured with the OpenID Connect OP's that we talk to */
+	char *redirect_uri;
 	/* (optional) default URL for 3rd-party initiated SSO */
 	char *default_sso_url;
+	/* (optional) default URL to go to after logout */
+	char *default_slo_url;
 
 	/* public keys in JWK format, used by parters for encrypting JWTs sent to us */
 	apr_array_header_t *public_keys;
@@ -768,6 +772,7 @@ int oidc_cfg_dir_pass_info_encoding(request_rec *r);
 apr_byte_t oidc_cfg_dir_pass_refresh_token(request_rec *r);
 apr_byte_t oidc_cfg_dir_accept_token_in(request_rec *r);
 char *oidc_cfg_dir_accept_token_in_option(request_rec *r, const char *key);
+char *oidc_cfg_dir_default_sso_url(request_rec *r);
 int oidc_cfg_token_introspection_interval(request_rec *r);
 int oidc_cfg_dir_preserve_post(request_rec *r);
 apr_array_header_t *oidc_dir_cfg_pass_cookies(request_rec *r);

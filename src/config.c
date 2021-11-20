@@ -286,6 +286,7 @@ typedef struct oidc_dir_cfg {
 #if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
 	ap_expr_info_t *unauth_expression;
 #endif
+	char *default_sso_url;
 	int unautz_action;
 	char *unauthz_arg;
 	apr_array_header_t *pass_cookies;
@@ -1669,7 +1670,9 @@ void* oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
 
 	c->merged = FALSE;
 
+	c->redirect_uri = NULL;
 	c->default_sso_url = NULL;
+	c->default_slo_url = NULL;
 	c->public_keys = NULL;
 	c->private_keys = NULL;
 
@@ -1802,14 +1805,18 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 
 	c->merged = TRUE;
 
+	c->redirect_uri =
+			add->redirect_uri != NULL ? add->redirect_uri : base->redirect_uri;
 	c->default_sso_url =
 			add->default_sso_url != NULL ?
 					add->default_sso_url : base->default_sso_url;
-	c->public_keys = oidc_jwk_list_copy(pool,
-			add->public_keys != NULL ? add->public_keys : base->public_keys);
-
-	c->private_keys = oidc_jwk_list_copy(pool,
-			add->private_keys != NULL ? add->private_keys : base->private_keys);
+	c->default_slo_url =
+			add->default_slo_url != NULL ?
+					add->default_slo_url : base->default_slo_url;
+	c->public_keys =
+			add->public_keys != NULL ? add->public_keys : base->public_keys;
+	c->private_keys =
+			add->private_keys != NULL ? add->private_keys : base->private_keys;
 
 	oidc_merge_provider_config(pool, &c->provider, &base->provider,
 			&add->provider);
@@ -2139,6 +2146,7 @@ void* oidc_create_dir_config(apr_pool_t *pool, char *path) {
 	c->cookie_path = OIDC_CONFIG_STRING_UNSET;
 	c->authn_header = OIDC_CONFIG_STRING_UNSET;
 	c->unauth_action = OIDC_CONFIG_POS_INT_UNSET;
+	c->default_sso_url = NULL;
 #if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
 	c->unauth_expression = NULL;
 #endif
@@ -2173,6 +2181,15 @@ char* oidc_cfg_dir_discover_url(request_rec *r) {
 			OIDC_CONFIG_STRING_UNSET) == 0))
 		return NULL;
 	return dir_cfg->discover_url;
+}
+
+char* oidc_cfg_dir_default_sso_url(request_rec *r) {
+	oidc_dir_cfg *dir_cfg = ap_get_module_config(r->per_dir_config,
+			&auth_openidc_module);
+	if ((dir_cfg->default_sso_url == NULL) || (apr_strnatcmp(dir_cfg->default_sso_url,
+			OIDC_CONFIG_STRING_UNSET) == 0))
+		return NULL;
+	return dir_cfg->default_sso_url;
 }
 
 char* oidc_cfg_dir_cookie(request_rec *r) {
@@ -2410,6 +2427,7 @@ void* oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->default_slo_url =
 			add->default_slo_url != NULL ?
 					add->default_slo_url : base->default_slo_url;
+
 #if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
 	c->unauth_expression =
 			add->unauth_expression != NULL ?
@@ -3296,9 +3314,9 @@ const command_rec oidc_config_cmds[] = {
 				RSRC_CONF | ACCESS_CONF | OR_AUTHCFG,
 				"Define the Redirect URI (e.g.: https://localhost:9031/protected/example/)"),
 		AP_INIT_TAKE1(OIDCDefaultURL,
-				oidc_set_url_slot,
-				(void *)APR_OFFSETOF(oidc_cfg, default_sso_url),
-				RSRC_CONF,
+				oidc_set_relative_or_absolute_url_slot_dir_cfg,
+				(void *)APR_OFFSETOF(oidc_dir_cfg, default_sso_url),
+				RSRC_CONF|ACCESS_CONF|OR_AUTHCFG,
 				"Defines the default URL where the user is directed to in case of 3rd-party initiated SSO."),
 		AP_INIT_TAKE1(OIDCDefaultLoggedOutURL,
 				oidc_set_relative_or_absolute_url_slot_dir_cfg,

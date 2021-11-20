@@ -649,7 +649,7 @@ static apr_byte_t oidc_restore_proto_state(request_rec *r, oidc_cfg *c, const ch
 	/* check that the timestamp is not beyond the valid interval */
 	if (apr_time_now() > ts + apr_time_from_sec(c->state_timeout)) {
 		oidc_error(r, "state has expired");
-		if ((c->default_sso_url == NULL)
+		if ((oidc_cfg_dir_default_sso_url(r) == NULL)
 				|| (apr_table_get(r->subprocess_env, "OIDC_NO_DEFAULT_URL_ON_STATE_TIMEOUT") != NULL)) {
 			oidc_util_html_send_error(r, c->error_template, "Invalid Authentication Response", apr_psprintf(r->pool, "This is due to a timeout; please restart your authentication session by re-entering the URL/bookmark you originally wanted to access: %s", oidc_proto_state_get_original_url(*proto_state)),
 									  OK);
@@ -1910,12 +1910,13 @@ static int oidc_handle_authorization_response(request_rec *r, oidc_cfg *c,
 	if (oidc_authorization_response_match_state(r, c,
 			apr_table_get(params, OIDC_PROTO_STATE), &provider, &proto_state)
 			== FALSE) {
-		if (c->default_sso_url != NULL) {
+		char *default_sso_url = oidc_cfg_dir_default_sso_url(r);
+		if (default_sso_url != NULL) {
 			oidc_warn(r,
 					"invalid authorization response state; a default SSO URL is set, sending the user there: %s",
-					c->default_sso_url);
-			oidc_util_hdr_out_location_set(r, c->default_sso_url);
-			//oidc_util_hdr_err_out_add(r, "Location", c->default_sso_url));
+					default_sso_url);
+			oidc_util_hdr_out_location_set(r, default_sso_url);
+			//oidc_util_hdr_err_out_add(r, "Location", default_sso_url));
 			return HTTP_MOVED_TEMPORARILY;
 		}
 		oidc_error(r,
@@ -2600,13 +2601,14 @@ static int oidc_handle_discovery_response(request_rec *r, oidc_cfg *c) {
 			issuer, target_link_uri, login_hint, user);
 
 	if (target_link_uri == NULL) {
-		if (c->default_sso_url == NULL) {
+		char *default_sso_url = oidc_cfg_dir_default_sso_url(r);
+		if (default_sso_url == NULL) {
 			return oidc_util_html_send_error(r, c->error_template,
 					"Invalid Request",
 					"SSO to this module without specifying a \"target_link_uri\" parameter is not possible because " OIDCDefaultURL " is not set.",
 					HTTP_INTERNAL_SERVER_ERROR);
 		}
-		target_link_uri = c->default_sso_url;
+		target_link_uri = default_sso_url;
 	}
 
 	/* do open redirect prevention, step 1 */
