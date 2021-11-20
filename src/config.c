@@ -2424,9 +2424,9 @@ void* oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->unauth_action =
 			add->unauth_action != OIDC_CONFIG_POS_INT_UNSET ?
 					add->unauth_action : base->unauth_action;
-	c->default_slo_url =
-			add->default_slo_url != NULL ?
-					add->default_slo_url : base->default_slo_url;
+	c->default_sso_url =
+			add->default_sso_url != NULL ?
+					add->default_sso_url : base->default_sso_url;
 
 #if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
 	c->unauth_expression =
