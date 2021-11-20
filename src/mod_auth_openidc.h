@@ -362,16 +362,6 @@ typedef struct oidc_cfg {
 	/* HTML to display error messages+description */
 	char *error_template;
 
-<<<<<<< HEAD
-	/* (optional) default URL for 3rd-party initiated SSO */
-	char *default_sso_url;
-=======
-	/* the redirect URI as configured with the OpenID Connect OP's that we talk to */
-	char *redirect_uri;
-	/* (optional) default URL to go to after logout */
-	char *default_slo_url;
->>>>>>> origin/pr3_defaulturl
-
 	/* public keys in JWK format, used by parters for encrypting JWTs sent to us */
 	apr_array_header_t *public_keys;
 	/* private keys in JWK format used for decrypting encrypted JWTs sent to us */
