@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2021 ZmartZone Holding BV
+ * Copyright (C) 2017-2022 ZmartZone Holding BV
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -97,6 +97,12 @@ static int TST_RC;
 			return TST_ERR_MSG; \
 		}
 
+#define TST_ASSERT_BYTE(message, result, expected) \
+		if (result != expected) { \
+			sprintf(TST_ERR_MSG, TST_FORMAT("%s"), __FUNCTION__, message, result ? "TRUE" : "FALSE", expected ? "TRUE" : "FALSE"); \
+			return TST_ERR_MSG; \
+		}
+
 #define TST_RUN(test, pool) message = test(pool); test_nr_run++; if (message) return message;
 
 static char *_jwk_parse(apr_pool_t *pool, const char *s, oidc_jwk_t **jwk,
@@ -119,8 +125,11 @@ static char *test_public_key_parse(apr_pool_t *pool) {
 	int isPrivateKey = 0;
 	int result;
 
-	const char publicKeyFile[] = "./test/public.pem";
-	const char certificateFile[] = "./test/certificate.pem";
+	const char publicKeyFile[512];
+	const char certificateFile[512];
+	char *dir = getenv("srcdir") ? getenv("srcdir") : ".";
+	sprintf((char *)publicKeyFile, "%s/%s", dir, "/test/public.pem");
+	sprintf((char *)certificateFile, "%s/%s", dir, "/test/certificate.pem");
 
 	input = BIO_new(BIO_s_file());
 	TST_ASSERT_ERR("test_public_key_parse_BIO_new_public_key", input != NULL,
@@ -1234,57 +1243,77 @@ static char * test_current_url(request_rec *r) {
 	r->uri = "/test";
 	r->unparsed_uri = apr_pstrcat(r->pool, r->uri, "?", r->args, NULL);
 
-	url = oidc_get_current_url(r);
+	url = oidc_get_current_url(r, 0);
 	TST_ASSERT_STR("test_current_url (1)", url,
 			"https://www.example.com/test?foo=bar&param1=value1");
 
 	apr_table_set(r->headers_in, "X-Forwarded-Host", "www.outer.com");
-	url = oidc_get_current_url(r);
-	TST_ASSERT_STR("test_current_url (2)", url,
+	url = oidc_get_current_url(r, 0);
+	TST_ASSERT_STR("test_current_url (2a)", url,
+			"https://www.example.com/test?foo=bar&param1=value1");
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_HOST);
+	TST_ASSERT_STR("test_current_url (2b)", url,
 			"https://www.outer.com/test?foo=bar&param1=value1");
 
 	apr_table_set(r->headers_in, "X-Forwarded-Host", "www.outer.com:654");
-	url = oidc_get_current_url(r);
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_HOST);
 	TST_ASSERT_STR("test_current_url (3)", url,
 			"https://www.outer.com:654/test?foo=bar&param1=value1");
 
 	apr_table_set(r->headers_in, "X-Forwarded-Port", "321");
-	url = oidc_get_current_url(r);
+	url = oidc_get_current_url(r, 0);
+	TST_ASSERT_STR("test_current_url (4a)", url,
+			"https://www.example.com/test?foo=bar&param1=value1");
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_HOST);
+	TST_ASSERT_STR("test_current_url (4b)", url,
+			"https://www.outer.com:654/test?foo=bar&param1=value1");
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_HOST | OIDC_HDR_X_FORWARDED_PORT);
 	TST_ASSERT_STR("test_current_url (4)", url,
 			"https://www.outer.com:321/test?foo=bar&param1=value1");
 
 	apr_table_set(r->headers_in, "X-Forwarded-Proto", "http");
-	url = oidc_get_current_url(r);
-	TST_ASSERT_STR("test_current_url (5)", url,
+	url = oidc_get_current_url(r, 0);
+	TST_ASSERT_STR("test_current_url (5a)", url,
+			"https://www.example.com/test?foo=bar&param1=value1");
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_HOST);
+	TST_ASSERT_STR("test_current_url (5b)", url,
+			"https://www.outer.com:654/test?foo=bar&param1=value1");
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_HOST | OIDC_HDR_X_FORWARDED_PORT);
+	TST_ASSERT_STR("test_current_url (5c)", url,
+			"https://www.outer.com:321/test?foo=bar&param1=value1");
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_HOST | OIDC_HDR_X_FORWARDED_PORT | OIDC_HDR_X_FORWARDED_PROTO);
+	TST_ASSERT_STR("test_current_url (5d)", url,
 			"http://www.outer.com:321/test?foo=bar&param1=value1");
 
 	apr_table_set(r->headers_in, "X-Forwarded-Proto", "https , http");
-	url = oidc_get_current_url(r);
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_HOST | OIDC_HDR_X_FORWARDED_PORT | OIDC_HDR_X_FORWARDED_PROTO);
 	TST_ASSERT_STR("test_current_url (6)", url,
 			"https://www.outer.com:321/test?foo=bar&param1=value1");
 
 	apr_table_unset(r->headers_in, "X-Forwarded-Host");
 	apr_table_unset(r->headers_in, "X-Forwarded-Port");
-	url = oidc_get_current_url(r);
+	url = oidc_get_current_url(r,  OIDC_HDR_X_FORWARDED_PROTO);
 	TST_ASSERT_STR("test_current_url (7)", url,
 			"https://www.example.com/test?foo=bar&param1=value1");
 
 	apr_table_set(r->headers_in, "X-Forwarded-Proto", "http ");
 	apr_table_set(r->headers_in, "Host", "remotehost:8380");
 	r->uri = "http://remotehost:8380/private/";
-	url = oidc_get_current_url(r);
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_PROTO);
 	TST_ASSERT_STR("test_current_url (8)", url,
 			"http://remotehost:8380/private/?foo=bar&param1=value1");
 
 	apr_table_set(r->headers_in, "Host", "[fd04:41b1:1170:28:16b0:446b:9fb7:7118]:8380");
-	url = oidc_get_current_url(r);
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_PROTO);
 	TST_ASSERT_STR("test_current_url (9)", url,
 			"http://[fd04:41b1:1170:28:16b0:446b:9fb7:7118]:8380/private/?foo=bar&param1=value1");
 
 	apr_table_set(r->headers_in, "Host", "[fd04:41b1:1170:28:16b0:446b:9fb7:7118]");
-	url = oidc_get_current_url(r);
+	url = oidc_get_current_url(r, OIDC_HDR_X_FORWARDED_PROTO);
 	TST_ASSERT_STR("test_current_url (10)", url,
 			"http://[fd04:41b1:1170:28:16b0:446b:9fb7:7118]/private/?foo=bar&param1=value1");
+
+	apr_table_set(r->headers_in, "Host", "www.example.com");
 
 	return 0;
 }
@@ -1504,6 +1533,8 @@ static char* test_remote_user(request_rec *r) {
 	s = "{\"upn\":\"nneul@umsystem.edu\"}";
 	rc = oidc_util_decode_json_object(r, s, &json);
 	TST_ASSERT("test remote user (1) valid JSON", rc == TRUE);
+	rc = oidc_get_remote_user(r, "upn", "^(.*)@umsystem\\.edu", NULL, json, &remote_user);
+	TST_ASSERT_STR("remote_user (0) string", remote_user, "nneul");
 	rc = oidc_get_remote_user(r, "upn", "^(.*)@umsystem\\.edu", "$1", json, &remote_user);
 	TST_ASSERT("test remote user (1) function result", rc == TRUE);
 	TST_ASSERT_STR("remote_user (1) string", remote_user, "nneul");
@@ -1565,6 +1596,42 @@ static char* test_is_auth_capable_request(request_rec *r) {
 	return 0;
 }
 
+#define TST_OPEN_REDIRECT(url, result) \
+		err_str = NULL; \
+		err_desc = NULL; \
+		rc = oidc_validate_redirect_url(r, c, url, TRUE, &err_str, &err_desc); \
+		msg = apr_psprintf(r->pool, "test validate_redirect_url (%s): %s: %s", url, err_str, err_desc); \
+		TST_ASSERT_BYTE(msg, rc, result);
+
+static char* test_open_redirect(request_rec *r) {
+	apr_byte_t rc = FALSE;
+	char *err_str = NULL, *err_desc = NULL, *url = NULL, *msg = NULL;
+	char filename[512];
+	char line_buf[8096];
+	apr_file_t *f;
+	size_t line_s;
+	char *dir = getenv("srcdir") ? getenv("srcdir") : ".";
+	// https://github.com/payloadbox/open-redirect-payload-list
+	sprintf((char* )filename, "%s/%s", dir, "/test/open-redirect-payload-list.txt");
+
+	oidc_cfg *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+
+	TST_OPEN_REDIRECT("https://www.example.com/somewhere", TRUE);
+	TST_OPEN_REDIRECT("https://evil.example.com/somewhere", FALSE);
+
+	apr_file_open(&f, filename, APR_READ, APR_OS_DEFAULT, r->pool);
+	while (1) {
+		if (apr_file_gets(line_buf, sizeof(line_buf), f) != APR_SUCCESS)
+			break;
+		line_s = strlen(line_buf);
+		line_buf[--line_s] = '\0';
+		TST_OPEN_REDIRECT(line_buf, FALSE);
+	}
+	apr_file_close(f);
+
+	return 0;
+}
+
 static char * all_tests(apr_pool_t *pool, request_rec *r) {
 	char *message;
 	TST_RUN(test_public_key_parse, pool);
@@ -1602,6 +1669,7 @@ static char * all_tests(apr_pool_t *pool, request_rec *r) {
 
 	TST_RUN(test_remote_user, r);
 	TST_RUN(test_is_auth_capable_request, r);
+	TST_RUN(test_open_redirect, r);
 
 #if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
 	TST_RUN(test_authz_worker, r);

@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2021 ZmartZone Holding BV
+ * Copyright (C) 2017-2022 ZmartZone Holding BV
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -515,11 +515,10 @@ typedef struct oidc_state_cookies_t {
 	struct oidc_state_cookies_t *next;
 } oidc_state_cookies_t;
 
-static int oidc_delete_oldest_state_cookies(request_rec *r,
+static int oidc_delete_oldest_state_cookies(request_rec *r, oidc_cfg *c,
 		int number_of_valid_state_cookies, int max_number_of_state_cookies,
 		oidc_state_cookies_t *first) {
-	oidc_state_cookies_t *cur = NULL, *prev = NULL, *prev_oldest = NULL,
-			*oldest = NULL;
+	oidc_state_cookies_t *cur = NULL, *prev = NULL, *prev_oldest = NULL, *oldest = NULL;
 	while (number_of_valid_state_cookies >= max_number_of_state_cookies) {
 		oldest = first;
 		prev_oldest = NULL;
@@ -533,11 +532,8 @@ static int oidc_delete_oldest_state_cookies(request_rec *r,
 			prev = cur;
 			cur = cur->next;
 		}
-		oidc_warn(r,
-				"deleting oldest state cookie: %s (time until expiry %" APR_TIME_T_FMT " seconds)",
-				oldest->name, apr_time_sec(oldest->timestamp - apr_time_now()));
-		oidc_util_set_cookie(r, oldest->name, "", 0,
-				OIDC_COOKIE_EXT_SAME_SITE_NONE(r));
+		oidc_warn(r, "deleting oldest state cookie: %s (time until expiry %" APR_TIME_T_FMT " seconds)", oldest->name, apr_time_sec(oldest->timestamp - apr_time_now()));
+		oidc_util_set_cookie(r, oldest->name, "", 0, OIDC_COOKIE_EXT_SAME_SITE_NONE(c, r));
 		if (prev_oldest)
 			prev_oldest->next = oldest->next;
 		else
@@ -571,29 +567,20 @@ static int oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg *c,
 					*cookie = '\0';
 					cookie++;
 					if ((currentCookieName == NULL)
-							|| (apr_strnatcmp(cookieName, currentCookieName)
-									!= 0)) {
+							|| (apr_strnatcmp(cookieName, currentCookieName) != 0)) {
 						oidc_proto_state_t *proto_state =
 								oidc_proto_state_from_cookie(r, c, cookie);
 						if (proto_state != NULL) {
-							json_int_t ts = oidc_proto_state_get_timestamp(
-									proto_state);
+							json_int_t ts = oidc_proto_state_get_timestamp(proto_state);
 							if (apr_time_now() > ts + apr_time_from_sec(c->state_timeout)) {
-								oidc_warn(r,
-										"state (%s) has expired (original_url=%s)",
-										cookieName,
-										oidc_proto_state_get_original_url(
-												proto_state));
-								oidc_util_set_cookie(r, cookieName, "", 0,
-										OIDC_COOKIE_EXT_SAME_SITE_NONE(r));
+								oidc_warn(r, "state (%s) has expired (original_url=%s)", cookieName, oidc_proto_state_get_original_url(proto_state));
+								oidc_util_set_cookie(r, cookieName, "", 0, OIDC_COOKIE_EXT_SAME_SITE_NONE(c, r));
 							} else {
 								if (first == NULL) {
-									first = apr_pcalloc(r->pool,
-											sizeof(oidc_state_cookies_t));
+									first = apr_pcalloc(r->pool, sizeof(oidc_state_cookies_t));
 									last = first;
 								} else {
-									last->next = apr_pcalloc(r->pool,
-											sizeof(oidc_state_cookies_t));
+									last->next = apr_pcalloc(r->pool, sizeof(oidc_state_cookies_t));
 									last = last->next;
 								}
 								last->name = cookieName;
@@ -603,11 +590,8 @@ static int oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg *c,
 							}
 							oidc_proto_state_destroy(proto_state);
 						} else {
-							oidc_warn(r,
-									"state cookie could not be retrieved/decoded, deleting: %s",
-									cookieName);
-							oidc_util_set_cookie(r, cookieName, "", 0,
-									OIDC_COOKIE_EXT_SAME_SITE_NONE(r));
+							oidc_warn(r, "state cookie could not be retrieved/decoded, deleting: %s", cookieName);
+							oidc_util_set_cookie(r, cookieName, "", 0, OIDC_COOKIE_EXT_SAME_SITE_NONE(c, r));
 						}
 					}
 				}
@@ -617,9 +601,8 @@ static int oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg *c,
 	}
 
 	if (delete_oldest > 0)
-		number_of_valid_state_cookies = oidc_delete_oldest_state_cookies(r,
-				number_of_valid_state_cookies, c->max_number_of_state_cookies,
-				first);
+		number_of_valid_state_cookies =
+				oidc_delete_oldest_state_cookies(r, c, number_of_valid_state_cookies, c->max_number_of_state_cookies, first);
 
 	return number_of_valid_state_cookies;
 }
@@ -627,8 +610,8 @@ static int oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg *c,
 /*
  * restore the state that was maintained between authorization request and response in an encrypted cookie
  */
-static apr_byte_t oidc_restore_proto_state(request_rec *r, oidc_cfg *c,
-		const char *state, oidc_proto_state_t **proto_state) {
+static apr_byte_t oidc_restore_proto_state(request_rec *r, oidc_cfg *c, const char *state,
+		oidc_proto_state_t **proto_state) {
 
 	oidc_debug(r, "enter");
 
@@ -640,15 +623,12 @@ static apr_byte_t oidc_restore_proto_state(request_rec *r, oidc_cfg *c,
 	/* get the state cookie value first */
 	char *cookieValue = oidc_util_get_cookie(r, cookieName);
 	if (cookieValue == NULL) {
-		oidc_error(r,
-				"no \"%s\" state cookie found: check domain and samesite cookie settings",
-				cookieName);
+		oidc_error(r, "no \"%s\" state cookie found: check domain and samesite cookie settings", cookieName);
 		return FALSE;
 	}
 
 	/* clear state cookie because we don't need it anymore */
-	oidc_util_set_cookie(r, cookieName, "", 0,
-			OIDC_COOKIE_EXT_SAME_SITE_NONE(r));
+	oidc_util_set_cookie(r, cookieName, "", 0, OIDC_COOKIE_EXT_SAME_SITE_NONE(c, r));
 
 	*proto_state = oidc_proto_state_from_cookie(r, c, cookieValue);
 	if (*proto_state == NULL)
@@ -660,9 +640,7 @@ static apr_byte_t oidc_restore_proto_state(request_rec *r, oidc_cfg *c,
 	char *calc = oidc_get_browser_state_hash(r, c, nonce);
 	/* compare the calculated hash with the value provided in the authorization response */
 	if (apr_strnatcmp(calc, state) != 0) {
-		oidc_error(r,
-				"calculated state from cookie does not match state parameter passed back in URL: \"%s\" != \"%s\"",
-				state, calc);
+		oidc_error(r, "calculated state from cookie does not match state parameter passed back in URL: \"%s\" != \"%s\"", state, calc);
 		oidc_proto_state_destroy(*proto_state);
 		return FALSE;
 	}
@@ -690,8 +668,7 @@ static apr_byte_t oidc_restore_proto_state(request_rec *r, oidc_cfg *c,
 	oidc_proto_state_set_state(*proto_state, state);
 
 	/* log the restored state object */
-	oidc_debug(r, "restored state: %s",
-			oidc_proto_state_to_string(r, *proto_state));
+	oidc_debug(r, "restored state: %s", oidc_proto_state_to_string(r, *proto_state));
 
 	/* we've made it */
 	return TRUE;
@@ -921,7 +898,7 @@ static int oidc_handle_unauthenticated_user(request_rec *r, oidc_cfg *c) {
 	 * else: no session (regardless of whether it is main or sub-request),
 	 * and we need to authenticate the user
 	 */
-	return oidc_authenticate_user(r, c, NULL, oidc_get_current_url(r), NULL,
+	return oidc_authenticate_user(r, c, NULL, oidc_get_current_url(r, c->x_forwarded_headers), NULL,
 			NULL, NULL, oidc_dir_cfg_path_auth_request_params(r),
 			oidc_dir_cfg_path_scope(r));
 }
@@ -962,7 +939,7 @@ static apr_byte_t oidc_check_cookie_domain(request_rec *r, oidc_cfg *cfg,
 		oidc_session_t *session) {
 	const char *c_cookie_domain =
 			cfg->cookie_domain ?
-					cfg->cookie_domain : oidc_get_current_url_host(r);
+					cfg->cookie_domain : oidc_get_current_url_host(r, cfg->x_forwarded_headers);
 	const char *s_cookie_domain = oidc_session_get_cookie_domain(r, session);
 	if ((s_cookie_domain == NULL)
 			|| (apr_strnatcmp(c_cookie_domain, s_cookie_domain) != 0)) {
@@ -1791,7 +1768,7 @@ static apr_byte_t oidc_save_in_session(request_rec *r, oidc_cfg *c,
 
 	/* store the domain for which this session is valid */
 	oidc_session_set_cookie_domain(r, session,
-			c->cookie_domain ? c->cookie_domain : oidc_get_current_url_host(r));
+			c->cookie_domain ? c->cookie_domain : oidc_get_current_url_host(r, c->x_forwarded_headers));
 
 	char *sid = NULL;
 	oidc_debug(r, "provider->backchannel_logout_supported=%d",
@@ -2114,7 +2091,7 @@ static int oidc_discovery(request_rec *r, oidc_cfg *cfg) {
 	oidc_debug(r, "enter");
 
 	/* obtain the URL we're currently accessing, to be stored in the state/session */
-	char *current_url = oidc_get_current_url(r);
+	char *current_url = oidc_get_current_url(r, cfg->x_forwarded_headers);
 	const char *method = oidc_original_request_method(r, cfg, FALSE);
 
 	/* generate CSRF token */
@@ -2453,7 +2430,7 @@ static int oidc_target_link_uri_matches_configuration(request_rec *r,
 
 #define OIDC_MAX_URL_LENGTH 8192 * 2
 
-static apr_byte_t oidc_validate_redirect_url(request_rec *r, oidc_cfg *c,
+apr_byte_t oidc_validate_redirect_url(request_rec *r, oidc_cfg *c,
 		const char *redirect_to_url, apr_byte_t restrict_to_host, char **err_str,
 		char **err_desc) {
 	apr_uri_t uri;
@@ -2492,7 +2469,7 @@ static apr_byte_t oidc_validate_redirect_url(request_rec *r, oidc_cfg *c,
 			return FALSE;
 		}
 	} else if ((uri.hostname != NULL) && (restrict_to_host == TRUE)) {
-		c_host = oidc_get_current_url_host(r);
+		c_host = oidc_get_current_url_host(r, c->x_forwarded_headers);
 		if ((strstr(c_host, uri.hostname) == NULL)
 				|| (strstr(uri.hostname, c_host) == NULL)) {
 			*err_str = apr_pstrdup(r->pool, "Invalid Request");
@@ -2538,6 +2515,20 @@ static apr_byte_t oidc_validate_redirect_url(request_rec *r, oidc_cfg *c,
 		return FALSE;
 	}
 
+	if ((strstr(url, "/%09") != NULL) || (strstr(url, "/%2f") != NULL)
+			|| (strstr(url, "/%68") != NULL) || (strstr(url, "/http:") != NULL)
+			|| (strstr(url, "/https:") != NULL) || (strstr(url, "/javascript:") != NULL)
+			|| (strstr(url, "/〱") != NULL) || (strstr(url, "/〵") != NULL)
+			|| (strstr(url, "/ゝ") != NULL) || (strstr(url, "/ー") != NULL)
+			|| (strstr(url, "/〱") != NULL) || (strstr(url, "/ｰ") != NULL)
+			|| (strstr(url, "/<") != NULL) || (strstr(url, "%01javascript:") != NULL)
+			|| (strstr(url, "/%5c") != NULL)) {
+		*err_str = apr_pstrdup(r->pool, "Invalid URL");
+		*err_desc = apr_psprintf(r->pool, "URL value \"%s\" contains illegal character(s)", url);
+		oidc_error(r, "%s: %s", *err_str, *err_desc);
+		return FALSE;
+	}
+
 	return TRUE;
 }
 
@@ -2569,7 +2560,7 @@ static int oidc_handle_discovery_response(request_rec *r, oidc_cfg *c) {
 
 		/* clean CSRF cookie */
 		oidc_util_set_cookie(r, OIDC_CSRF_NAME, "", 0,
-				OIDC_COOKIE_EXT_SAME_SITE_NONE(r));
+				OIDC_COOKIE_EXT_SAME_SITE_NONE(c, r));
 
 		/* compare CSRF cookie value with query parameter value */
 		if ((csrf_query == NULL)
@@ -2812,7 +2803,8 @@ static int oidc_handle_logout_request(request_rec *r, oidc_cfg *c,
 		oidc_util_hdr_err_out_add(r, OIDC_HTTP_HDR_PRAGMA, "no-cache");
 		oidc_util_hdr_err_out_add(r, OIDC_HTTP_HDR_P3P, "CAO PSA OUR");
 		oidc_util_hdr_err_out_add(r, OIDC_HTTP_HDR_EXPIRES, "0");
-		oidc_util_hdr_err_out_add(r, OIDC_HTTP_HDR_X_FRAME_OPTIONS, "DENY");
+		oidc_util_hdr_err_out_add(r, OIDC_HTTP_HDR_X_FRAME_OPTIONS,
+				c->logout_x_frame_options ? c->logout_x_frame_options : "DENY");
 
 		/* see if this is PF-PA style logout in which case we return a transparent pixel */
 		const char *accept = oidc_util_hdr_in_accept_get(r);
@@ -3671,6 +3663,9 @@ static int oidc_handle_info_request(request_rec *r, oidc_cfg *c,
 int oidc_handle_redirect_uri_request(request_rec *r, oidc_cfg *c,
 		oidc_session_t *session) {
 
+	apr_byte_t needs_save = FALSE;
+	int rc = OK;
+
 	if (oidc_proto_is_redirect_authorization_response(r, c)) {
 
 		/* this is an authorization response from the OP using the Basic Client profile or a Hybrid flow*/
@@ -3739,13 +3734,13 @@ int oidc_handle_redirect_uri_request(request_rec *r, oidc_cfg *c,
 		if (session->remote_user == NULL)
 			return HTTP_UNAUTHORIZED;
 
-		/*
-		 * Will be handled in the content handler; avoid:
-		 * No authentication done but request not allowed without authentication
-		 * by setting r->user
-		 */
-		r->user = "";
-		return OK;
+		// need to establish user/claims for authorization purposes
+		rc = oidc_handle_existing_session(r, c, session, &needs_save);
+
+		if (needs_save)
+			oidc_request_state_set(r, OIDC_REQUEST_STATE_KEY_SAVE, "");
+
+		return rc;
 
 	} else if ((r->args == NULL) || (apr_strnatcmp(r->args, "") == 0)) {
 
@@ -4023,7 +4018,7 @@ static authz_status oidc_handle_unauthorized_user24(request_rec *r) {
 			break;
 	}
 
-	oidc_authenticate_user(r, c, NULL, oidc_get_current_url(r), NULL,
+	oidc_authenticate_user(r, c, NULL, oidc_get_current_url(r, c->x_forwarded_headers), NULL,
 			NULL, NULL, oidc_dir_cfg_path_auth_request_params(r), oidc_dir_cfg_path_scope(r));
 
 	if (oidc_request_state_get(r, OIDC_REQUEST_STATE_KEY_DISCOVERY) != NULL)
@@ -4144,7 +4139,7 @@ static int oidc_handle_unauthorized_user22(request_rec *r) {
 			return HTTP_UNAUTHORIZED;
 	}
 
-	return oidc_authenticate_user(r, c, NULL, oidc_get_current_url(r), NULL,
+	return oidc_authenticate_user(r, c, NULL, oidc_get_current_url(r, c->x_forwarded_headers), NULL,
 			NULL, NULL, oidc_dir_cfg_path_auth_request_params(r), oidc_dir_cfg_path_scope(r));
 }
 
@@ -4153,9 +4148,6 @@ static int oidc_handle_unauthorized_user22(request_rec *r) {
  * handles both OpenID Connect and OAuth 2.0 in the same way, based on the claims stored in the request context
  */
 int oidc_auth_checker(request_rec *r) {
-
-	oidc_cfg *c = ap_get_module_config(r->server->module_config,
-			&auth_openidc_module);
 
 	/* check for anonymous access and PASS mode */
 	if (r->user != NULL && strlen(r->user) == 0) {
@@ -4244,10 +4236,10 @@ int oidc_content_handler(request_rec *r) {
 
 				oidc_session_load(r, &session);
 
-				rc = oidc_handle_existing_session(r, c, session, &needs_save);
-				if (rc == OK)
-					/* handle request for session info */
-					rc = oidc_handle_info_request(r, c, session, needs_save);
+				needs_save = (oidc_request_state_get(r, OIDC_REQUEST_STATE_KEY_SAVE) != NULL);;
+
+				/* handle request for session info */
+				rc = oidc_handle_info_request(r, c, session, needs_save);
 
 				/* free resources allocated for the session */
 				oidc_session_free(r, session);

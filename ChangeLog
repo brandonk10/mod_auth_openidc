@@ -1,3 +1,43 @@
+01/12/2022
+- add AM_PROG_CC_C_O to configure.ac (at least for RHEL 7.7); see #765; thanks @bitmagewb
+- include <openssl/bn.h> in jose.c to compile with OpenSSL 1.0.x
+- fix parameters to get_current_url in oidc_handle_unauthorized_user22
+- bump to 2.4.11rc2
+
+01/06/2022
+- improve detection of suspicious redirect URLs; add test list
+- bump to 2.4.11rc1
+
+12/24/2021
+- make interpretation of X-Forwarded-* headers configurable, defaulting to none
+  so mod_auth_openidc running behind a reverse proxy that sets X-Forwarded-* headers
+  needs explicit configuration of OIDCXForwardedHeaders
+- bump to 2.4.11rc0
+
+12/21/2021
+- add "x5t" to JWT header in private_key_jwt client assertions; for interop with Azure AD
+- add CI Github workflow over Travis
+- bump to 2.4.10.1rc4
+
+12/16/2021
+- make X-Frame-Options header returned on OIDC front-channel logout requests configurable
+  through OIDCLogoutXFrameOptions; closes #464
+- bump to 2.4.10.1rc3
+
+12/15/2021
+- remove typedef for oidc_pcre to avoid compiler errors
+
+12/02/2021
+- add support for libpcre2; see #740
+- bump to 2.4.10.1rc2
+
+12/01/2021
+- allow authorization on info requests, see #746
+- bump to 2.4.10rc1
+
+11/28/2021
+- install taking into account DESTDIR; see #674; thanks @alerque
+
 11/11/2021
 - correct ap_hook_insert_filter function signature in stub.c; closes #732; thanks @stroeder
 - bump to 2.4.10.1rc0
