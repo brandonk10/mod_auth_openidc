@@ -61,7 +61,8 @@ EXTRA_DIST = \
 	LICENSE.txt \
 	auth_openidc.conf \
 	test/public.pem \
-	test/certificate.pem
+	test/certificate.pem \
+	test/open-redirect-payload-list.txt
 
 noinst_DATA = mod_auth_openidc.la
 
@@ -70,7 +71,11 @@ mod_auth_openidc.la: libauth_openidc.la
 
 install-exec-local:
 #	@APXS@ -i -a -n auth_openidc mod_auth_openidc.la
-	${INSTALL} -p -m 755 -D .libs/mod_auth_openidc.so $(DESTDIR)@APACHE_MODULEDIR@/mod_auth_openidc.so
+	${INSTALL} -d $(DESTDIR)@APACHE_MODULEDIR@
+	${INSTALL} -p -m 755 .libs/mod_auth_openidc.so $(DESTDIR)@APACHE_MODULEDIR@/mod_auth_openidc.so
+
+uninstall-local:
+	rm -f $(DESTDIR)@APACHE_MODULEDIR@/mod_auth_openidc.so mod_auth_openidc.la
 
 LDADD = libauth_openidc.la ${LIBADD}
 
