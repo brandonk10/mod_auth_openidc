@@ -381,6 +381,7 @@ apr_byte_t oidc_session_free(request_rec *r, oidc_session_t *z) {
  * terminate a session
  */
 apr_byte_t oidc_session_kill(request_rec *r, oidc_session_t *z) {
+	r->user = NULL;
 	if (z->state) {
 		json_decref(z->state);
 		z->state = NULL;

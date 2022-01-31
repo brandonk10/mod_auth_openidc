@@ -906,8 +906,8 @@ static int oidc_handle_unauthenticated_user(request_rec *r, oidc_cfg *c) {
 /*
  * check if maximum session duration was exceeded
  */
-static int oidc_check_max_session_duration(request_rec *r, oidc_cfg *cfg,
-		oidc_session_t *session) {
+static apr_byte_t oidc_check_max_session_duration(request_rec *r, oidc_cfg *cfg,
+		oidc_session_t *session, int *rc) {
 
 	/* get the session expiry from the session data */
 	apr_time_t session_expires = oidc_session_get_session_expires(r, session);
@@ -917,13 +917,16 @@ static int oidc_check_max_session_duration(request_rec *r, oidc_cfg *cfg,
 		oidc_warn(r, "maximum session duration exceeded for user: %s",
 				session->remote_user);
 		oidc_session_kill(r, session);
-		return oidc_handle_unauthenticated_user(r, cfg);
+		*rc = oidc_handle_unauthenticated_user(r, cfg);
+		return FALSE;
 	}
 
 	/* log message about max session duration */
 	oidc_log_session_expires(r, "session max lifetime", session_expires);
 
-	return OK;
+	*rc = OK;
+
+	return TRUE;
 }
 
 /*
@@ -1385,6 +1388,9 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 		oidc_session_t *session, apr_byte_t *needs_save) {
 
 	apr_byte_t rv = FALSE;
+	int rc = OK;
+	const char *s_claims = NULL;
+	const char *s_id_token = NULL;
 
 	oidc_debug(r, "enter");
 
@@ -1399,13 +1405,23 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 	apr_byte_t pass_base64url = oidc_cfg_dir_pass_info_base64url(r);
 
 	/* verify current cookie domain against issued cookie domain */
-	if (oidc_check_cookie_domain(r, cfg, session) == FALSE)
+	if (oidc_check_cookie_domain(r, cfg, session) == FALSE) {
+		*needs_save = FALSE;
 		return HTTP_UNAUTHORIZED;
+	}
+
+	/*
+	 * we're going to pass the information that we have to the application,
+	 * but first we need to scrub the headers that we're going to use for security reasons
+	 * NB: need it before oidc_check_max_session_duration since OIDCUnAuthAction pass may be set
+	 */
+	oidc_scrub_headers(r);
 
 	/* check if the maximum session duration was exceeded */
-	int rc = oidc_check_max_session_duration(r, cfg, session);
-	if (rc != OK)
+	if (oidc_check_max_session_duration(r, cfg, session, &rc) == FALSE) {
+		*needs_save = FALSE;
 		return rc;
+	}
 
 	/* if needed, refresh the access token */
 	rv = oidc_refresh_access_token_before_expiry(r, cfg, session,
@@ -1423,18 +1439,9 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 	if (oidc_refresh_claims_from_userinfo_endpoint(r, cfg, session) == TRUE)
 		*needs_save = TRUE;
 
-	/*
-	 * we're going to pass the information that we have to the application,
-	 * but first we need to scrub the headers that we're going to use for security reasons
-	 */
-	oidc_scrub_headers(r);
-
 	/* set the user authentication HTTP header if set and required */
 	if ((r->user != NULL) && (authn_header != NULL))
 		oidc_util_hdr_in_set(r, authn_header, r->user);
-
-	const char *s_claims = NULL;
-	const char *s_id_token = NULL;
 
 	/* copy id_token and claims from session to request state and obtain their values */
 	oidc_copy_tokens_to_request_state(r, session, &s_id_token, &s_claims);
@@ -2243,6 +2250,8 @@ static int oidc_authenticate_user(request_rec *r, oidc_cfg *c,
 		const char *login_hint, const char *id_token_hint, const char *prompt,
 		const char *auth_request_params, const char *path_scope) {
 
+	int rc;
+
 	oidc_debug(r, "enter");
 
 	if (provider == NULL) {
@@ -2250,14 +2259,13 @@ static int oidc_authenticate_user(request_rec *r, oidc_cfg *c,
 		// TODO: should we use an explicit redirect to the discovery endpoint (maybe a "discovery" param to the redirect_uri)?
 		if (c->metadata_dir != NULL) {
 			/*
-			 * Will be handled in the content handler; avoid:
 			 * No authentication done but request not allowed without authentication
 			 * by setting r->user
 			 */
-			oidc_debug(r, "defer discovery to the content handler");
 			oidc_request_state_set(r, OIDC_REQUEST_STATE_KEY_DISCOVERY, "");
 			r->user = "";
-			return OK;
+			rc = oidc_discovery(r, c);
+			return (rc == OK) ? DONE : rc;
 		}
 
 		/* we're not using multiple OP's configured in a metadata directory, pick the statically configured OP */
@@ -2309,7 +2317,7 @@ static int oidc_authenticate_user(request_rec *r, oidc_cfg *c,
 	 * create state that restores the context when the authorization response comes in
 	 * and cryptographically bind it to the browser
 	 */
-	int rc = oidc_authorization_request_set_cookie(r, c, state, proto_state);
+	rc = oidc_authorization_request_set_cookie(r, c, state, proto_state);
 	if (rc != OK) {
 		oidc_proto_state_destroy(proto_state);
 		return rc;
@@ -4073,18 +4081,18 @@ authz_status oidc_authz_checker(request_rec *r, const char *require_args,
 		const void *parsed_require_args,
 		oidc_authz_match_claim_fn_type match_claim_fn) {
 
-	oidc_debug(r, "enter: require_args=\"%s\"", require_args);
+	oidc_debug(r, "enter: (r->user=%s) require_args=\"%s\"", r->user, require_args);
 
 	/* check for anonymous access and PASS mode */
-	if (r->user != NULL && strlen(r->user) == 0) {
+	if ((r->user != NULL) && (strlen(r->user) == 0))
 		r->user = NULL;
-		if (oidc_dir_cfg_unauth_action(r) == OIDC_UNAUTH_PASS)
-			return AUTHZ_GRANTED;
-		if (oidc_request_state_get(r, OIDC_REQUEST_STATE_KEY_DISCOVERY) != NULL)
-			return AUTHZ_GRANTED;
-		if (r->method_number == M_OPTIONS)
-			return AUTHZ_GRANTED;
-	}
+
+	if (oidc_dir_cfg_unauth_action(r) == OIDC_UNAUTH_PASS)
+		return AUTHZ_GRANTED;
+	if (oidc_request_state_get(r, OIDC_REQUEST_STATE_KEY_DISCOVERY) != NULL)
+		return AUTHZ_GRANTED;
+	if (r->method_number == M_OPTIONS)
+		return AUTHZ_GRANTED;
 
 	/* get the set of claims from the request state (they've been set in the authentication part earlier */
 	json_t *claims = NULL, *id_token = NULL;
@@ -4173,15 +4181,15 @@ static int oidc_handle_unauthorized_user22(request_rec *r) {
 int oidc_auth_checker(request_rec *r) {
 
 	/* check for anonymous access and PASS mode */
-	if (r->user != NULL && strlen(r->user) == 0) {
+	if ((r->user != NULL) && (strlen(r->user) == 0))
 		r->user = NULL;
-		if (oidc_dir_cfg_unauth_action(r) == OIDC_UNAUTH_PASS)
-			return OK;
-		if (oidc_request_state_get(r, OIDC_REQUEST_STATE_KEY_DISCOVERY) != NULL)
-			return OK;
-		if (r->method_number == M_OPTIONS)
-			return OK;
-	}
+
+	if (oidc_dir_cfg_unauth_action(r) == OIDC_UNAUTH_PASS)
+		return OK;
+	if (oidc_request_state_get(r, OIDC_REQUEST_STATE_KEY_DISCOVERY) != NULL)
+		return OK;
+	if (r->method_number == M_OPTIONS)
+		return OK;
 
 	/* get the set of claims from the request state (they've been set in the authentication part earlier */
 	json_t *claims = NULL, *id_token = NULL;
