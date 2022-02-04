@@ -591,9 +591,15 @@ const char* oidc_get_current_url_host(request_rec *r, const apr_byte_t x_forward
  */
 static const char* oidc_get_current_url_base(request_rec *r, const apr_byte_t x_forwarded_headers) {
 
-	const char *scheme_str = oidc_get_current_url_scheme(r, x_forwarded_headers);
-	const char *host_str = oidc_get_current_url_host(r, x_forwarded_headers);
-	const char *port_str = oidc_get_current_url_port(r, scheme_str, x_forwarded_headers);
+	const char *scheme_str = NULL;
+	const char *host_str = NULL;
+	const char *port_str = NULL;
+
+	oidc_config_check_x_forwarded(r, x_forwarded_headers);
+
+	scheme_str = oidc_get_current_url_scheme(r, x_forwarded_headers);
+	host_str = oidc_get_current_url_host(r, x_forwarded_headers);
+	port_str = oidc_get_current_url_port(r, scheme_str, x_forwarded_headers);
 	port_str = port_str ? apr_psprintf(r->pool, ":%s", port_str) : "";
 
 	char *url = apr_pstrcat(r->pool, scheme_str, "://", host_str, port_str,
@@ -2054,8 +2060,8 @@ void oidc_util_set_app_infos(request_rec *r, const json_t *j_attrs,
 
 			/* some logging about what we're going to do */
 			oidc_debug(r,
-					"parsing attribute array for key \"%s\" (#nr-of-elems: %llu)",
-					s_key, (unsigned long long )json_array_size(j_value));
+					"parsing attribute array for key \"%s\" (#nr-of-elems: %lu)",
+					s_key, (unsigned long)json_array_size(j_value));
 
 			/* string to hold the concatenated array string values */
 			char *s_concat = apr_pstrdup(r->pool, "");
