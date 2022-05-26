@@ -1,3 +1,11 @@
+05/20/2022
+- fix handling of IPv6 based logout URLs; thanks @@codemaker219
+- bump to 2.4.11.3rc1
+
+05/16/2022
+- Use optionally provided sid and iss request parameters during front channel
+  logout; see #855; thanks @rpluem-vf
+
 05/06/2022
 - support Forwarded header in addition to X-Forwarded-*; see #853; thanks @studersi
 - bump to 2.4.11.3rc0
