@@ -1,3 +1,20 @@
+08/24/2022
+- avoid using $< in Makefile
+- allow storing the id_token in a client-cookie based session; see #812 and #888
+- bump to 2.4.11.4rc1
+
+08/22/2022
+- add oidc_util_strcasestr
+- bump to 2.4.11.4rc0
+
+08/22/2022
+- release 2.4.11.3
+
+08/15/2022
+- avoid memory leak when using PCRE2 regular expressions with array matching; closes #902; thanks @smanolache
+- avoid memory leak when cjose_jws_get_plaintext fails; closes #903; thanks @smanolache
+- bump to 2.4.11.3rc4
+
 05/20/2022
 - fix handling of IPv6 based logout URLs; thanks @@codemaker219
 - bump to 2.4.11.3rc1
