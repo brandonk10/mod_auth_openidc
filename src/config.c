@@ -2783,11 +2783,11 @@ static apr_status_t oidc_cleanup_parent(void *data) {
 }
 
 /*
- * handler that is called prior to the request content handler to validate the directory-level configuration for openidc RP
- * This handler has to invoke the main content handler if successful, to ensure this runs before the OIDC main handler runs.
- * To ensure proper sequence, the content handler is invoked from inside this if the config validates successfully.
+ * handler that is called prior to the authn handler to validate the directory-level configuration for openidc RP
+ * This handler has to invoke the main authn handler if successful, to ensure this runs before the OIDC main handler runs.
+ * To ensure proper sequence, the authn handler is invoked from inside this if the config validates successfully.
  */
-static int oidc_config_and_handle_content(request_rec *r) {
+static int oidc_config_and_check_user_id(request_rec *r) {
 	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(r->server->module_config,
 			&auth_openidc_module);
 	
@@ -2796,7 +2796,7 @@ static int oidc_config_and_handle_content(request_rec *r) {
 
 	int rc = oidc_check_per_dir_config_openid_openidc(r, cfg, dir_cfg);
 	if(rc == OK || rc == DECLINED)
-		return oidc_content_handler(r);
+		return oidc_check_user_id(r);
 	else
 		return rc;
 }
@@ -3050,13 +3050,13 @@ static apr_status_t oidc_filter_in_filter(ap_filter_t *f,
 void oidc_register_hooks(apr_pool_t *pool) {
 	ap_hook_post_config(oidc_post_config, NULL, NULL, APR_HOOK_LAST);
 	ap_hook_child_init(oidc_child_init, NULL, NULL, APR_HOOK_MIDDLE);
-	ap_hook_handler(oidc_config_and_handle_content, NULL, NULL, APR_HOOK_FIRST);
+	ap_hook_handler(oidc_content_handler, NULL, NULL, APR_HOOK_FIRST);
 	ap_hook_insert_filter(oidc_filter_in_insert_filter, NULL, NULL,
 			APR_HOOK_MIDDLE);
 	ap_register_input_filter(oidcFilterName, oidc_filter_in_filter, NULL,
 			AP_FTYPE_RESOURCE);
 #if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
-	ap_hook_check_authn(oidc_check_user_id, NULL, NULL, APR_HOOK_MIDDLE,
+	ap_hook_check_authn(oidc_config_and_check_user_id, NULL, NULL, APR_HOOK_MIDDLE,
 			AP_AUTH_INTERNAL_PER_CONF);
 	ap_register_auth_provider(pool, AUTHZ_PROVIDER_GROUP,
 			OIDC_REQUIRE_CLAIM_NAME, "0", &oidc_authz_claim_provider,
@@ -3068,7 +3068,7 @@ void oidc_register_hooks(apr_pool_t *pool) {
 #endif
 #else
 	static const char * const authzSucc[] = {"mod_authz_user.c", NULL};
-	ap_hook_check_user_id(oidc_check_user_id, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_check_user_id(oidc_config_and_check_user_id, NULL, NULL, APR_HOOK_MIDDLE);
 	ap_hook_auth_checker(oidc_auth_checker, NULL, authzSucc, APR_HOOK_MIDDLE);
 #endif
 }
