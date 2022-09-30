@@ -400,6 +400,14 @@ typedef struct oidc_cfg {
 #ifdef USE_MEMCACHE
 	/* cache_type= memcache: list of memcache host/port servers to use */
 	char *cache_memcache_servers;
+	/* cache_type= memcache: minimum number of connections to each memcache server per process*/
+	apr_uint32_t cache_memcache_min;
+	/* cache_type= memcache: soft maximum number of connections to each memcache server per process */
+	apr_uint32_t cache_memcache_smax;
+	/* cache_type= memcache: hard maximum number of connections to each memcache server per process */
+	apr_uint32_t cache_memcache_hmax;
+	/* cache_type= memcache: maximum time in microseconds a connection to a memcache server can be idle before being closed */
+	apr_uint32_t cache_memcache_ttl;
 #endif
 	/* cache_type = shm: size of the shared memory segment (cq. max number of cached entries) */
 	int cache_shm_size_max;
@@ -718,6 +726,10 @@ int oidc_oauth_return_www_authenticate(request_rec *r, const char *error, const 
 #define OIDCOAuthRemoteUserClaim             "OIDCOAuthRemoteUserClaim"
 #define OIDCSessionType                      "OIDCSessionType"
 #define OIDCMemCacheServers                  "OIDCMemCacheServers"
+#define OIDCMemCacheConnectionsMin           "OIDCMemCacheConnectionsMin"
+#define OIDCMemCacheConnectionsSMax          "OIDCMemCacheConnectionsSMax"
+#define OIDCMemCacheConnectionsHMax          "OIDCMemCacheConnectionsHMax"
+#define OIDCMemCacheConnectionsTTL           "OIDCMemCacheConnectionsTTL"
 #define OIDCCacheShmMax                      "OIDCCacheShmMax"
 #define OIDCCacheShmEntrySizeMax             "OIDCCacheShmEntrySizeMax"
 #define OIDCRedisCacheServer                 "OIDCRedisCacheServer"
@@ -883,6 +895,7 @@ apr_byte_t oidc_util_hdr_in_accept_contains(const request_rec *r, const char *ne
 apr_byte_t oidc_util_json_validate_cnf(request_rec *r, json_t *jwt, int token_binding_policy);
 
 // oidc_metadata.c
+apr_byte_t oidc_metadata_provider_get(request_rec *r, oidc_cfg *cfg, const char *issuer, json_t **j_provider, apr_byte_t allow_discovery);
 apr_byte_t oidc_metadata_provider_retrieve(request_rec *r, oidc_cfg *cfg, const char *issuer, const char *url, json_t **j_metadata, char **response);
 apr_byte_t oidc_metadata_provider_parse(request_rec *r, oidc_cfg *cfg, json_t *j_provider, oidc_provider_t *provider);
 apr_byte_t oidc_metadata_provider_is_valid(request_rec *r, oidc_cfg *cfg, json_t *j_provider, const char *issuer);

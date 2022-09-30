@@ -2541,7 +2541,7 @@ static apr_byte_t oidc_proto_validate_hash(request_rec *r, const char *alg,
 			decoded_len, calc_len);
 
 	/* compare the calculated hash against the provided hash */
-	if ((decoded_len < hash_len) || (calc_len < hash_len)
+	if ((decoded_len != hash_len) || (calc_len < hash_len)
 			|| (memcmp(decoded, calc, hash_len) != 0)) {
 		oidc_error(r,
 				"provided \"%s\" hash value (%s) does not match the calculated value",
@@ -2945,8 +2945,8 @@ static apr_byte_t oidc_proto_resolve_code_and_validate_response(request_rec *r,
 		apr_table_set(params, OIDC_PROTO_ID_TOKEN, id_token);
 	}
 
-	if ((apr_table_get(params, OIDC_PROTO_ACCESS_TOKEN) == NULL)
-			&& (access_token != NULL)) {
+	/* override access token if returned from the token endpoint in the backchannel */
+	if (access_token != NULL) {
 		apr_table_set(params, OIDC_PROTO_ACCESS_TOKEN, access_token);
 		if (token_type != NULL)
 			apr_table_set(params, OIDC_PROTO_TOKEN_TYPE, token_type);
