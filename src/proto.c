@@ -1659,8 +1659,11 @@ apr_byte_t oidc_proto_parse_idtoken(request_rec *r, oidc_cfg *cfg,
 
 		jwk = NULL;
 		if (oidc_util_create_symmetric_key(r, provider->client_secret, 0,
-				NULL, TRUE, &jwk) == FALSE)
+				NULL, TRUE, &jwk) == FALSE) {
+			oidc_jwt_destroy(*jwt);
+			*jwt = NULL;
 			return FALSE;
+		}
 
 		oidc_jwks_uri_t jwks_uri = { provider->jwks_uri,
 				provider->jwks_refresh_interval, provider->ssl_validate_server };
@@ -2899,6 +2902,7 @@ static apr_byte_t oidc_proto_parse_idtoken_and_validate_code(request_rec *r,
 			&& (oidc_proto_validate_code(r, provider, *jwt, response_type, code)
 					== FALSE)) {
 		oidc_jwt_destroy(*jwt);
+		*jwt = NULL;
 		return FALSE;
 	}
 
@@ -3070,8 +3074,11 @@ apr_byte_t oidc_proto_handle_authorization_response_code(request_rec *r,
 	if ((apr_table_get(params, OIDC_PROTO_ACCESS_TOKEN) != NULL)
 			&& (oidc_proto_validate_access_token(r, provider, *jwt,
 					response_type,
-					apr_table_get(params, OIDC_PROTO_ACCESS_TOKEN)) == FALSE))
+					apr_table_get(params, OIDC_PROTO_ACCESS_TOKEN)) == FALSE)) {
+		oidc_jwt_destroy(*jwt);
+		*jwt = NULL;
 		return FALSE;
+	}
 
 	return TRUE;
 }
