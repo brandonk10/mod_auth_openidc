@@ -79,6 +79,10 @@ APLOG_USE_MODULE(auth_openidc);
 #define OIDC_DEBUG APLOG_DEBUG
 #endif
 
+#ifndef APLOG_TRACE1
+#define APLOG_TRACE1 APLOG_DEBUG
+#endif
+
 #define oidc_log(r, level, fmt, ...) ap_log_rerror(APLOG_MARK, level, 0, r,"%s: %s", __FUNCTION__, apr_psprintf(r->pool, fmt, ##__VA_ARGS__))
 #define oidc_slog(s, level, fmt, ...) ap_log_error(APLOG_MARK, level, 0, s, "%s: %s", __FUNCTION__, apr_psprintf(s->process->pconf, fmt, ##__VA_ARGS__))
 //#define oidc_log(r, level, fmt, ...) fprintf(stderr, "# %s: %s\n", __FUNCTION__, apr_psprintf(r->pool, fmt, ##__VA_ARGS__))
@@ -149,6 +153,9 @@ APLOG_USE_MODULE(auth_openidc);
 #define OIDC_PASS_USERINFO_AS_JSON_OBJECT 2
 /* pass userinfo as a JWT in header (when returned as a JWT) */
 #define OIDC_PASS_USERINFO_AS_JWT         4
+
+#define OIDC_PASS_APP_INFO_AS_BASE64URL 1
+#define OIDC_PASS_APP_INFO_AS_LATIN1    2
 
 /* logout on refresh error before expiry */
 #define OIDC_LOGOUT_ON_ERROR_REFRESH 1
@@ -755,7 +762,7 @@ char *oidc_cfg_dir_cookie_path(request_rec *r);
 char *oidc_cfg_dir_authn_header(request_rec *r);
 apr_byte_t oidc_cfg_dir_pass_info_in_headers(request_rec *r);
 apr_byte_t oidc_cfg_dir_pass_info_in_envvars(request_rec *r);
-apr_byte_t oidc_cfg_dir_pass_info_base64url(request_rec *r);
+int oidc_cfg_dir_pass_info_encoding(request_rec *r);
 apr_byte_t oidc_cfg_dir_pass_refresh_token(request_rec *r);
 apr_byte_t oidc_cfg_dir_accept_token_in(request_rec *r);
 char *oidc_cfg_dir_accept_token_in_option(request_rec *r, const char *key);
@@ -815,8 +822,8 @@ apr_byte_t oidc_util_file_write(request_rec *r, const char *path, const char *da
 apr_byte_t oidc_util_issuer_match(const char *a, const char *b);
 int oidc_util_html_send_error(request_rec *r, const char *html_template, const char *error, const char *description, int status_code);
 apr_byte_t oidc_util_json_array_has_value(request_rec *r, json_t *haystack, const char *needle);
-void oidc_util_set_app_info(request_rec *r, const char *s_key, const char *s_value, const char *claim_prefix, apr_byte_t as_header, apr_byte_t as_env_var, apr_byte_t base64url);
-void oidc_util_set_app_infos(request_rec *r, const json_t *j_attrs, const char *claim_prefix, const char *claim_delimiter, apr_byte_t as_header, apr_byte_t as_env_var, apr_byte_t base64url);
+void oidc_util_set_app_info(request_rec *r, const char *s_key, const char *s_value, const char *claim_prefix, apr_byte_t as_header, apr_byte_t as_env_var, int pass_as);
+void oidc_util_set_app_infos(request_rec *r, const json_t *j_attrs, const char *claim_prefix, const char *claim_delimiter, apr_byte_t as_header, apr_byte_t as_env_var, int pass_as);
 apr_hash_t *oidc_util_spaced_string_to_hashtable(apr_pool_t *pool, const char *str);
 apr_byte_t oidc_util_spaced_string_equals(apr_pool_t *pool, const char *a, const char *b);
 apr_byte_t oidc_util_spaced_string_contains(apr_pool_t *pool, const char *str, const char *match);

@@ -1,3 +1,20 @@
+11/08/2022
+- add option to use ISO-8859-1 encoding for propagated claim values by adding
+  "latin1" option to OIDCPassClaimsAs <> latin1; see #957; thanks @nvchaudhari1991
+  Note that the encoding - including the existing "base64url" - apply to both header and
+  environment variables as well now.
+- bump to 2.4.12.1rc4
+
+10/26/2022
+- OIDCProviderMetadataRefreshInterval was interpreted in microseconds instead
+  of the documented and intended seconds; setting in to seconds would effectively
+  turn of caching and pull the configuration document on each request
+- bump to 2.4.12.1rc3
+
+10/25/2022
+- define APLOG_TRACE1 if it does not exist
+- bump to 2.4.12.1rc2
+
 10/20/2022
 - CI: add memory and semaphore checks on various distro's
 - correct ap_hook_insert_filter function signature in stub.c, part 3; see #784
