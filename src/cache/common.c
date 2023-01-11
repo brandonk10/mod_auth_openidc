@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2022 ZmartZone Holding BV
+ * Copyright (C) 2017-2023 ZmartZone Holding BV
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -40,7 +40,7 @@
  *
  * core cache functions: locking, crypto and utils
  *
- * @Author: Hans Zandbelt - hans.zandbelt@zmartzone.eu
+ * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
 #ifndef WIN32

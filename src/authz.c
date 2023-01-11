@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2022 ZmartZone Holding BV
+ * Copyright (C) 2017-2023 ZmartZone Holding BV
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -40,7 +40,7 @@
  *
  * mostly copied from mod_auth_cas
  *
- * @Author: Hans Zandbelt - hans.zandbelt@zmartzone.eu
+ * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
 #include "mod_auth_openidc.h"
