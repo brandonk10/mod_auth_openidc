@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2022 ZmartZone Holding BV
+ * Copyright (C) 2017-2023 ZmartZone Holding BV
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -44,7 +44,7 @@
  * Other code copied/borrowed/adapted:
  * shared memory caching: mod_auth_mellon
  *
- * @Author: Hans Zandbelt - hans.zandbelt@zmartzone.eu
+ * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  *
  **************************************************************************/
 
@@ -468,7 +468,7 @@ apr_byte_t oidc_post_preserve_javascript(request_rec *r, const char *location,
 }
 
 /*
- * restore POST parameters on original_url from HTML5 local storage
+ * restore POST parameters on original_url from HTML5 session storage
  */
 static int oidc_request_post_preserved_restore(request_rec *r,
 		const char *original_url) {
