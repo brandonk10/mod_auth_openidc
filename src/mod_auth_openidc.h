@@ -380,8 +380,6 @@ typedef struct oidc_cfg {
 	char *redirect_uri;
 	/* (optional) default URL for 3rd-party initiated SSO */
 	char *default_sso_url;
-	/* (optional) default URL to go to after logout */
-	char *default_slo_url;
 
 	/* public keys in JWK format, used by parters for encrypting JWTs sent to us */
 	apr_array_header_t *public_keys;
