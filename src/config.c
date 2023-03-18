@@ -1809,10 +1809,10 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->default_sso_url =
 			add->default_sso_url != NULL ?
 					add->default_sso_url : base->default_sso_url;
-	c->public_keys =
-			add->public_keys != NULL ? add->public_keys : base->public_keys;
-	c->private_keys =
-			add->private_keys != NULL ? add->private_keys : base->private_keys;
+	c->public_keys = oidc_jwk_list_copy(pool,
+			add->public_keys != NULL ? add->public_keys : base->public_keys);
+	c->private_keys = oidc_jwk_list_copy(pool,
+			add->private_keys != NULL ? add->private_keys : base->private_keys);
 
 	oidc_merge_provider_config(pool, &c->provider, &base->provider,
 			&add->provider);
