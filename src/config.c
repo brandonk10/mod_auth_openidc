@@ -2582,6 +2582,7 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg *c) {
 				return oidc_check_config_error(s,
 						OIDCProviderAuthorizationEndpoint);
 		} else {
+			apr_uri_t r_uri;
 			apr_uri_parse(s->process->pconf, c->provider.metadata_url, &r_uri);
 			if ((r_uri.scheme == NULL)
 					|| (apr_strnatcmp(r_uri.scheme, "https") != 0)) {
