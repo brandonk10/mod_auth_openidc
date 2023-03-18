@@ -2586,6 +2586,14 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg *c) {
 			if (c->provider.authorization_endpoint_url == NULL)
 				return oidc_check_config_error(s,
 						OIDCProviderAuthorizationEndpoint);
+		} else {
+			apr_uri_parse(s->process->pconf, c->provider.metadata_url, &r_uri);
+			if ((r_uri.scheme == NULL)
+					|| (apr_strnatcmp(r_uri.scheme, "https") != 0)) {
+				oidc_swarn(s,
+						"the URL scheme (%s) of the configured " OIDCProviderMetadataURL " SHOULD be \"https\" for security reasons!",
+						r_uri.scheme);
+			}
 		}
 		if (c->provider.client_id == NULL)
 			return oidc_check_config_error(s, OIDCClientID);
