@@ -371,6 +371,14 @@ oidc_jwk_t* oidc_jwk_parse(apr_pool_t *pool, const char *s_json,
 	return oidc_jwk_from_cjose(pool, cjose_jwk);
 }
 
+oidc_jwk_t* oidc_jwk_copy(apr_pool_t *pool, const oidc_jwk_t *src) {
+	char *s_json = NULL;
+	oidc_jose_error_t err;
+	if (oidc_jwk_to_json(pool, src, &s_json, &err) == FALSE)
+		return NULL;
+	return oidc_jwk_parse(pool, s_json, &err);
+}
+
 /*
  * destroy resources allocated for a JWK struct
  */
@@ -386,18 +394,33 @@ void oidc_jwk_destroy(oidc_jwk_t *jwk) {
 /*
  * destroy a list of JWKs structs
  */
-void oidc_jwk_list_destroy_hash(apr_pool_t *pool, apr_hash_t *keys) {
+void oidc_jwk_list_destroy_hash(apr_hash_t *keys) {
 	apr_hash_index_t *hi = NULL;
 	if (keys == NULL)
 		return;
-	for (hi = apr_hash_first(pool, keys); hi; hi = apr_hash_next(hi)) {
+	for (hi = apr_hash_first(NULL, keys); hi; hi = apr_hash_next(hi)) {
 		oidc_jwk_t *jwk = NULL;
 		apr_hash_this(hi, NULL, NULL, (void**) &jwk);
 		oidc_jwk_destroy(jwk);
 	}
 }
 
-void oidc_jwk_list_destroy(apr_pool_t *pool, apr_array_header_t *keys_list) {
+apr_array_header_t* oidc_jwk_list_copy(apr_pool_t *pool,
+		apr_array_header_t *src) {
+	apr_array_header_t *dst = NULL;
+	int i = 0;
+	if (src != NULL) {
+		dst = apr_array_make(pool, src->nelts, sizeof(const oidc_jwk_t*));
+		for (i = 0; (src) && (i < src->nelts); i++) {
+			const oidc_jwk_t *jwk = ((const oidc_jwk_t**) src->elts)[i];
+			*(const oidc_jwk_t**) apr_array_push(dst) = oidc_jwk_copy(pool,
+					jwk);
+		}
+	}
+	return dst;
+}
+
+void oidc_jwk_list_destroy(apr_array_header_t *keys_list) {
 	if (keys_list == NULL)
 		return;
 	oidc_jwk_t **jwk = NULL;

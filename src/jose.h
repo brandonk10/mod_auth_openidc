@@ -164,6 +164,7 @@ apr_byte_t oidc_jwe_decrypt(apr_pool_t *pool, const char *input_json,
 /* parse a JSON string to a JWK struct */
 oidc_jwk_t* oidc_jwk_parse(apr_pool_t *pool, const char *s_json,
 		oidc_jose_error_t *err);
+oidc_jwk_t *oidc_jwk_copy(apr_pool_t *pool, const oidc_jwk_t *jwk);
 /* parse a JSON object in to a JWK struct */
 apr_byte_t oidc_jwk_parse_json(apr_pool_t *pool, json_t *json, oidc_jwk_t **jwk,
 		oidc_jose_error_t *err);
@@ -173,8 +174,9 @@ apr_byte_t oidc_jwk_to_json(apr_pool_t *pool, const oidc_jwk_t *jwk,
 /* destroy resources allocated for a JWK struct */
 void oidc_jwk_destroy(oidc_jwk_t *jwk);
 /* destroy a list of JWKs structs */
-void oidc_jwk_list_destroy_hash(apr_pool_t *pool, apr_hash_t *key);
-void oidc_jwk_list_destroy(apr_pool_t *pool, apr_array_header_t *keys_list);
+void oidc_jwk_list_destroy_hash(apr_hash_t *key);
+apr_array_header_t *oidc_jwk_list_copy(apr_pool_t *pool, apr_array_header_t *src);
+void oidc_jwk_list_destroy(apr_array_header_t *keys_list);
 /* create an "oct" symmetric JWK */
 oidc_jwk_t* oidc_jwk_create_symmetric_key(apr_pool_t *pool, const char *kid,
 		const unsigned char *key, unsigned int key_len, apr_byte_t set_kid,

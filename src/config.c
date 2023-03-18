@@ -96,11 +96,9 @@
 /* default duration in seconds after which retrieved JWS should be refreshed */
 #define OIDC_DEFAULT_JWKS_REFRESH_INTERVAL 3600
 /* default max cache size for shm */
-#define OIDC_DEFAULT_CACHE_SHM_SIZE 500
+#define OIDC_DEFAULT_CACHE_SHM_SIZE 2000
 /* default max cache entry size for shm: # value + # key + # overhead */
 #define OIDC_DEFAULT_CACHE_SHM_ENTRY_SIZE_MAX 16384 + 512 + 17
-/* minimum size of a cache entry */
-#define OIDC_MINIMUM_CACHE_SHM_ENTRY_SIZE_MAX 8192 + 512 + 17
 /* for issued-at timestamp (iat) checking */
 #define OIDC_DEFAULT_IDTOKEN_IAT_SLACK 600
 /* for file-based caching: clean interval in seconds */
@@ -173,6 +171,7 @@
 #define OIDCProviderEndSessionEndpoint         "OIDCProviderEndSessionEndpoint"
 #define OIDCProviderBackChannelLogoutSupported "OIDCProviderBackChannelLogoutSupported"
 #define OIDCProviderJwksUri                    "OIDCProviderJwksUri"
+#define OIDCProviderSignedJwksUri              "OIDCProviderSignedJwksUri"
 #define OIDCProviderVerifyCertFiles            "OIDCProviderVerifyCertFiles"
 #define OIDCResponseType                       "OIDCResponseType"
 #define OIDCResponseMode                       "OIDCResponseMode"
@@ -207,7 +206,6 @@
 #define OIDCCookieHTTPOnly                     "OIDCCookieHTTPOnly"
 #define OIDCCookieSameSite                     "OIDCCookieSameSite"
 #define OIDCOutgoingProxy                      "OIDCOutgoingProxy"
-#define OIDCCryptoPassphrase                   "OIDCCryptoPassphrase"
 #define OIDCClaimDelimiter                     "OIDCClaimDelimiter"
 #define OIDCPassIDTokenAs                      "OIDCPassIDTokenAs"
 #define OIDCPassUserInfoAs                     "OIDCPassUserInfoAs"
@@ -793,15 +791,6 @@ static const char* oidc_set_session_max_duration(cmd_parms *cmd,
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
-static apr_status_t oidc_cleanup_keys(void *data) {
-	apr_array_header_t *keys_list = (apr_array_header_t*) data;
-	oidc_jwk_t **jwk = NULL;
-	while ((jwk = apr_array_pop(keys_list))) {
-		oidc_jwk_destroy(*jwk);
-	}
-	return APR_SUCCESS;
-}
-
 /*
  * add a public key from an X.509 file to our list of JWKs with public keys
  */
@@ -833,11 +822,8 @@ static const char* oidc_set_public_key_files(cmd_parms *cmd, void *struct_ptr,
 				kid, fname, oidc_jose_e2s(cmd->pool, err));
 	}
 
-	if (*public_keys == NULL) {
+	if (*public_keys == NULL)
 		*public_keys = apr_array_make(cmd->pool, 4, sizeof(const oidc_jwk_t*));
-		apr_pool_cleanup_register(cmd->pool, *public_keys, oidc_cleanup_keys,
-				oidc_cleanup_keys);
-	}
 
 	*(const oidc_jwk_t**) apr_array_push(*public_keys) = jwk;
 
@@ -906,12 +892,9 @@ static const char* oidc_set_private_key_files_enc(cmd_parms *cmd, void *dummy,
 				kid, fname, oidc_jose_e2s(cmd->pool, err));
 	}
 
-	if (cfg->private_keys == NULL) {
+	if (cfg->private_keys == NULL)
 		cfg->private_keys = apr_array_make(cmd->pool, 4,
 				sizeof(const oidc_jwk_t*));
-		apr_pool_cleanup_register(cmd->pool, cfg->private_keys,
-				oidc_cleanup_keys, oidc_cleanup_keys);
-	}
 
 	*(const oidc_jwk_t**) apr_array_push(cfg->private_keys) = jwk;
 
@@ -1149,7 +1132,7 @@ static const char* oidc_set_jwks_refresh_interval(cmd_parms *cmd,
 	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(cmd->server->module_config,
 			&auth_openidc_module);
 	const char *rv = oidc_parse_jwks_refresh_interval(cmd->pool, arg,
-			&cfg->provider.jwks_refresh_interval);
+			&cfg->provider.jwks_uri.refresh_interval);
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
@@ -1366,6 +1349,25 @@ static const char* oidc_set_redirect_urls_allowed(cmd_parms *cmd, void *m,
 	return NULL;
 }
 
+static const char* oidc_set_signed_jwks_uri(cmd_parms *cmd, void *m,
+		const char *arg1, const char *arg2) {
+	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(cmd->server->module_config,
+			&auth_openidc_module);
+	const char *rv = NULL;
+	oidc_jose_error_t err;
+	if (apr_strnatcmp(arg1, "") != 0) {
+		rv = oidc_set_url_slot(cmd, cfg, arg1);
+		if (rv != NULL)
+			return OIDC_CONFIG_DIR_RV(cmd, rv);
+	}
+	cfg->provider.jwks_uri.jwk = oidc_jwk_parse(cmd->pool, arg2, &err);
+	if (cfg->provider.jwks_uri.jwk == NULL) {
+		return apr_psprintf(cmd->pool, "oidc_jwk_parse failed: %s",
+				oidc_jose_e2s(cmd->pool, err));
+	}
+	return NULL;
+}
+
 int oidc_cfg_dir_refresh_access_token_before_expiry(request_rec *r) {
 	oidc_dir_cfg *dir_cfg = ap_get_module_config(r->per_dir_config,
 			&auth_openidc_module);
@@ -1393,7 +1395,21 @@ char* oidc_cfg_dir_state_cookie_prefix(request_rec *r) {
 	return dir_cfg->state_cookie_prefix;
 }
 
-void oidc_cfg_provider_init(oidc_provider_t *provider) {
+static void oidc_cfg_provider_destroy(oidc_provider_t *provider) {
+	if (provider->jwks_uri.jwk)
+		oidc_jwk_destroy(provider->jwks_uri.jwk);
+	oidc_jwk_list_destroy(provider->verify_public_keys);
+	oidc_jwk_list_destroy(provider->client_signing_keys);
+	oidc_jwk_list_destroy(provider->client_encryption_keys);
+}
+
+static apr_status_t oidc_provider_config_cleanup(void *data) {
+	oidc_provider_t *provider = (oidc_provider_t*) data;
+	oidc_cfg_provider_destroy(provider);
+	return APR_SUCCESS;
+}
+
+static void oidc_cfg_provider_init(oidc_provider_t *provider) {
 	provider->metadata_url = NULL;
 	provider->issuer = NULL;
 	provider->authorization_endpoint_url = NULL;
@@ -1411,7 +1427,10 @@ void oidc_cfg_provider_init(oidc_provider_t *provider) {
 	provider->registration_endpoint_json = NULL;
 	provider->check_session_iframe = NULL;
 	provider->end_session_endpoint = NULL;
-	provider->jwks_uri = NULL;
+	provider->jwks_uri.uri = NULL;
+	provider->jwks_uri.refresh_interval = OIDC_DEFAULT_JWKS_REFRESH_INTERVAL;
+	provider->jwks_uri.signed_uri = NULL;
+	provider->jwks_uri.jwk = NULL;
 	provider->verify_public_keys = NULL;
 	provider->backchannel_logout_supported = OIDC_CONFIG_POS_INT_UNSET;
 
@@ -1423,7 +1442,6 @@ void oidc_cfg_provider_init(oidc_provider_t *provider) {
 	provider->scope = OIDC_DEFAULT_SCOPE;
 	provider->response_type = OIDC_DEFAULT_RESPONSE_TYPE;
 	provider->response_mode = NULL;
-	provider->jwks_refresh_interval = OIDC_DEFAULT_JWKS_REFRESH_INTERVAL;
 	provider->idtoken_iat_slack = OIDC_DEFAULT_IDTOKEN_IAT_SLACK;
 	provider->session_max_duration = OIDC_DEFAULT_SESSION_MAX_DURATION;
 	provider->auth_request_params = NULL;
@@ -1443,11 +1461,212 @@ void oidc_cfg_provider_init(oidc_provider_t *provider) {
 	provider->auth_request_method = OIDC_DEFAULT_AUTH_REQUEST_METHOD;
 }
 
+oidc_provider_t* oidc_cfg_provider_create(apr_pool_t *pool) {
+	oidc_provider_t *provider = apr_pcalloc(pool, sizeof(oidc_provider_t));
+	oidc_cfg_provider_init(provider);
+	apr_pool_cleanup_register(pool, provider, oidc_provider_config_cleanup,
+			oidc_provider_config_cleanup);
+	return provider;
+}
+
+static void oidc_merge_provider_config(apr_pool_t *pool, oidc_provider_t *dst,
+		const oidc_provider_t *base, const oidc_provider_t *add) {
+	dst->metadata_url =
+			add->metadata_url != NULL ? add->metadata_url : base->metadata_url;
+	dst->issuer = add->issuer != NULL ? add->issuer : base->issuer;
+	dst->authorization_endpoint_url =
+			add->authorization_endpoint_url != NULL ?
+					add->authorization_endpoint_url :
+					base->authorization_endpoint_url;
+	dst->token_endpoint_url =
+			add->token_endpoint_url != NULL ?
+					add->token_endpoint_url : base->token_endpoint_url;
+	dst->token_endpoint_auth =
+			add->token_endpoint_auth != NULL ?
+					add->token_endpoint_auth : base->token_endpoint_auth;
+	dst->token_endpoint_params =
+			add->token_endpoint_params != NULL ?
+					add->token_endpoint_params : base->token_endpoint_params;
+	dst->userinfo_endpoint_url =
+			add->userinfo_endpoint_url != NULL ?
+					add->userinfo_endpoint_url : base->userinfo_endpoint_url;
+	dst->revocation_endpoint_url =
+			add->revocation_endpoint_url != NULL ?
+					add->revocation_endpoint_url :
+					base->revocation_endpoint_url;
+	dst->jwks_uri.uri =
+			add->jwks_uri.uri != NULL ? add->jwks_uri.uri : base->jwks_uri.uri;
+	dst->jwks_uri.refresh_interval =
+			add->jwks_uri.refresh_interval != OIDC_DEFAULT_JWKS_REFRESH_INTERVAL ?
+					add->jwks_uri.refresh_interval :
+					base->jwks_uri.refresh_interval;
+	dst->jwks_uri.signed_uri =
+			add->jwks_uri.signed_uri != NULL ?
+					add->jwks_uri.signed_uri : base->jwks_uri.signed_uri;
+	dst->jwks_uri.jwk = oidc_jwk_copy(pool,
+			add->jwks_uri.jwk != NULL ? add->jwks_uri.jwk : base->jwks_uri.jwk);
+	dst->verify_public_keys = oidc_jwk_list_copy(pool,
+			add->verify_public_keys != NULL ?
+					add->verify_public_keys : base->verify_public_keys);
+	dst->client_id = add->client_id != NULL ? add->client_id : base->client_id;
+	dst->client_secret =
+			add->client_secret != NULL ?
+					add->client_secret : base->client_secret;
+
+	dst->token_endpoint_tls_client_key =
+			add->token_endpoint_tls_client_key != NULL ?
+					add->token_endpoint_tls_client_key :
+					base->token_endpoint_tls_client_key;
+	dst->token_endpoint_tls_client_key_pwd =
+			add->token_endpoint_tls_client_key_pwd != NULL ?
+					add->token_endpoint_tls_client_key_pwd :
+					base->token_endpoint_tls_client_key_pwd;
+	dst->token_endpoint_tls_client_cert =
+			add->token_endpoint_tls_client_cert != NULL ?
+					add->token_endpoint_tls_client_cert :
+					base->token_endpoint_tls_client_cert;
+
+	dst->registration_endpoint_url =
+			add->registration_endpoint_url != NULL ?
+					add->registration_endpoint_url :
+					base->registration_endpoint_url;
+	dst->registration_endpoint_json =
+			add->registration_endpoint_json != NULL ?
+					add->registration_endpoint_json :
+					base->registration_endpoint_json;
+
+	dst->check_session_iframe =
+			add->check_session_iframe != NULL ?
+					add->check_session_iframe : base->check_session_iframe;
+	dst->end_session_endpoint =
+			add->end_session_endpoint != NULL ?
+					add->end_session_endpoint : base->end_session_endpoint;
+	dst->backchannel_logout_supported =
+			add->backchannel_logout_supported != OIDC_CONFIG_POS_INT_UNSET ?
+					add->backchannel_logout_supported :
+					base->backchannel_logout_supported;
+
+	dst->ssl_validate_server =
+			add->ssl_validate_server != OIDC_DEFAULT_SSL_VALIDATE_SERVER ?
+					add->ssl_validate_server : base->ssl_validate_server;
+	dst->validate_issuer =
+			add->validate_issuer != OIDC_DEFAULT_VALIDATE_ISSUER ?
+					add->validate_issuer : base->validate_issuer;
+	dst->client_name =
+			apr_strnatcmp(add->client_name, OIDC_DEFAULT_CLIENT_NAME) != 0 ?
+					add->client_name : base->client_name;
+	dst->client_contact =
+			add->client_contact != NULL ?
+					add->client_contact : base->client_contact;
+	dst->registration_token =
+			add->registration_token != NULL ?
+					add->registration_token : base->registration_token;
+	dst->scope =
+			apr_strnatcmp(add->scope, OIDC_DEFAULT_SCOPE) != 0 ?
+					add->scope : base->scope;
+	dst->response_type = apr_strnatcmp(add->response_type,
+			OIDC_DEFAULT_RESPONSE_TYPE) != 0 ? add->response_type : base->response_type;
+	dst->response_mode =
+			add->response_mode != NULL ?
+					add->response_mode : base->response_mode;
+	dst->idtoken_iat_slack =
+			add->idtoken_iat_slack != OIDC_DEFAULT_IDTOKEN_IAT_SLACK ?
+					add->idtoken_iat_slack : base->idtoken_iat_slack;
+	dst->session_max_duration =
+			add->session_max_duration != OIDC_DEFAULT_SESSION_MAX_DURATION ?
+					add->session_max_duration : base->session_max_duration;
+	dst->auth_request_params =
+			add->auth_request_params != NULL ?
+					add->auth_request_params : base->auth_request_params;
+	dst->pkce = add->pkce != NULL ? add->pkce : base->pkce;
+
+	dst->client_jwks_uri =
+			add->client_jwks_uri != NULL ?
+					add->client_jwks_uri : base->client_jwks_uri;
+	dst->client_signing_keys =
+			add->client_signing_keys != NULL ?
+					add->client_signing_keys : base->client_signing_keys;
+	dst->client_encryption_keys =
+			add->client_encryption_keys != NULL ?
+					add->client_encryption_keys : base->client_encryption_keys;
+
+	dst->id_token_signed_response_alg =
+			add->id_token_signed_response_alg != NULL ?
+					add->id_token_signed_response_alg :
+					base->id_token_signed_response_alg;
+	dst->id_token_encrypted_response_alg =
+			add->id_token_encrypted_response_alg != NULL ?
+					add->id_token_encrypted_response_alg :
+					base->id_token_encrypted_response_alg;
+	dst->id_token_encrypted_response_enc =
+			add->id_token_encrypted_response_enc != NULL ?
+					add->id_token_encrypted_response_enc :
+					base->id_token_encrypted_response_enc;
+	dst->userinfo_signed_response_alg =
+			add->userinfo_signed_response_alg != NULL ?
+					add->userinfo_signed_response_alg :
+					base->userinfo_signed_response_alg;
+	dst->userinfo_encrypted_response_alg =
+			add->userinfo_encrypted_response_alg != NULL ?
+					add->userinfo_encrypted_response_alg :
+					base->userinfo_encrypted_response_alg;
+	dst->userinfo_encrypted_response_enc =
+			add->userinfo_encrypted_response_enc != NULL ?
+					add->userinfo_encrypted_response_enc :
+					base->userinfo_encrypted_response_enc;
+	dst->userinfo_token_method =
+			add->userinfo_token_method != OIDC_USER_INFO_TOKEN_METHOD_HEADER ?
+					add->userinfo_token_method : base->userinfo_token_method;
+	dst->auth_request_method =
+			add->auth_request_method != OIDC_DEFAULT_AUTH_REQUEST_METHOD ?
+					add->auth_request_method : base->auth_request_method;
+
+	dst->userinfo_refresh_interval =
+			add->userinfo_refresh_interval
+			!= OIDC_DEFAULT_USERINFO_REFRESH_INTERVAL ?
+					add->userinfo_refresh_interval :
+					base->userinfo_refresh_interval;
+	dst->request_object =
+			add->request_object != NULL ?
+					add->request_object : base->request_object;
+
+	dst->token_binding_policy =
+			add->token_binding_policy
+			!= OIDC_DEFAULT_PROVIDER_TOKEN_BINDING_POLICY ?
+					add->token_binding_policy : base->token_binding_policy;
+
+	dst->issuer_specific_redirect_uri =
+			add->issuer_specific_redirect_uri
+			!= OIDC_DEFAULT_PROVIDER_ISSUER_SPECIFIC_REDIRECT_URI ?
+					add->issuer_specific_redirect_uri :
+					base->issuer_specific_redirect_uri;
+
+}
+
+oidc_provider_t* oidc_cfg_provider_copy(apr_pool_t *pool,
+		const oidc_provider_t *src) {
+	oidc_provider_t *dst = oidc_cfg_provider_create(pool);
+	oidc_merge_provider_config(pool, dst, dst, src);
+	return dst;
+}
+
+static apr_status_t oidc_destroy_server_config(void *data) {
+	oidc_cfg *cfg = (oidc_cfg*) data;
+	oidc_cfg_provider_destroy(&cfg->provider);
+	oidc_jwk_list_destroy(cfg->oauth.verify_public_keys);
+	oidc_jwk_list_destroy_hash(cfg->oauth.verify_shared_keys);
+	oidc_jwk_list_destroy(cfg->public_keys);
+	oidc_jwk_list_destroy(cfg->private_keys);
+	return APR_SUCCESS;
+}
+
 /*
  * create a new server config record with defaults
  */
 void* oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
 	oidc_cfg *c = apr_pcalloc(pool, sizeof(oidc_cfg));
+	apr_pool_cleanup_register(pool, c, oidc_destroy_server_config,
+			oidc_destroy_server_config);
 
 	c->merged = FALSE;
 
@@ -1574,9 +1793,12 @@ void* oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
  * merge a new server config with a base one
  */
 void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
+	oidc_cfg *base = (oidc_cfg*) BASE;
+	oidc_cfg *add = (oidc_cfg*) ADD;
+
 	oidc_cfg *c = apr_pcalloc(pool, sizeof(oidc_cfg));
-	oidc_cfg *base = BASE;
-	oidc_cfg *add = ADD;
+	apr_pool_cleanup_register(pool, c, oidc_destroy_server_config,
+			oidc_destroy_server_config);
 
 	c->merged = TRUE;
 
@@ -1585,186 +1807,8 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->private_keys =
 			add->private_keys != NULL ? add->private_keys : base->private_keys;
 
-	c->provider.metadata_url =
-			add->provider.metadata_url != NULL ?
-					add->provider.metadata_url : base->provider.metadata_url;
-	c->provider.issuer =
-			add->provider.issuer != NULL ?
-					add->provider.issuer : base->provider.issuer;
-	c->provider.authorization_endpoint_url =
-			add->provider.authorization_endpoint_url != NULL ?
-					add->provider.authorization_endpoint_url :
-					base->provider.authorization_endpoint_url;
-	c->provider.token_endpoint_url =
-			add->provider.token_endpoint_url != NULL ?
-					add->provider.token_endpoint_url :
-					base->provider.token_endpoint_url;
-	c->provider.token_endpoint_auth =
-			add->provider.token_endpoint_auth != NULL ?
-					add->provider.token_endpoint_auth :
-					base->provider.token_endpoint_auth;
-	c->provider.token_endpoint_params =
-			add->provider.token_endpoint_params != NULL ?
-					add->provider.token_endpoint_params :
-					base->provider.token_endpoint_params;
-	c->provider.userinfo_endpoint_url =
-			add->provider.userinfo_endpoint_url != NULL ?
-					add->provider.userinfo_endpoint_url :
-					base->provider.userinfo_endpoint_url;
-	c->provider.revocation_endpoint_url =
-			add->provider.revocation_endpoint_url != NULL ?
-					add->provider.revocation_endpoint_url :
-					base->provider.revocation_endpoint_url;
-	c->provider.jwks_uri =
-			add->provider.jwks_uri != NULL ?
-					add->provider.jwks_uri : base->provider.jwks_uri;
-	c->provider.verify_public_keys =
-			add->provider.verify_public_keys != NULL ?
-					add->provider.verify_public_keys :
-					base->provider.verify_public_keys;
-	c->provider.client_id =
-			add->provider.client_id != NULL ?
-					add->provider.client_id : base->provider.client_id;
-	c->provider.client_secret =
-			add->provider.client_secret != NULL ?
-					add->provider.client_secret : base->provider.client_secret;
-
-	c->provider.token_endpoint_tls_client_key =
-			add->provider.token_endpoint_tls_client_key != NULL ?
-					add->provider.token_endpoint_tls_client_key :
-					base->provider.token_endpoint_tls_client_key;
-	c->provider.token_endpoint_tls_client_key_pwd =
-		add->provider.token_endpoint_tls_client_key_pwd != NULL ?
-				add->provider.token_endpoint_tls_client_key_pwd :
-				base->provider.token_endpoint_tls_client_key_pwd;
-	c->provider.token_endpoint_tls_client_cert =
-			add->provider.token_endpoint_tls_client_cert != NULL ?
-					add->provider.token_endpoint_tls_client_cert :
-					base->provider.token_endpoint_tls_client_cert;
-
-	c->provider.registration_endpoint_url =
-			add->provider.registration_endpoint_url != NULL ?
-					add->provider.registration_endpoint_url :
-					base->provider.registration_endpoint_url;
-	c->provider.registration_endpoint_json =
-			add->provider.registration_endpoint_json != NULL ?
-					add->provider.registration_endpoint_json :
-					base->provider.registration_endpoint_json;
-
-	c->provider.check_session_iframe =
-			add->provider.check_session_iframe != NULL ?
-					add->provider.check_session_iframe :
-					base->provider.check_session_iframe;
-	c->provider.end_session_endpoint =
-			add->provider.end_session_endpoint != NULL ?
-					add->provider.end_session_endpoint :
-					base->provider.end_session_endpoint;
-	c->provider.backchannel_logout_supported =
-			add->provider.backchannel_logout_supported
-			!= OIDC_CONFIG_POS_INT_UNSET ?
-					add->provider.backchannel_logout_supported :
-					base->provider.backchannel_logout_supported;
-
-	c->provider.ssl_validate_server =
-			add->provider.ssl_validate_server
-			!= OIDC_DEFAULT_SSL_VALIDATE_SERVER ?
-					add->provider.ssl_validate_server :
-					base->provider.ssl_validate_server;
-	c->provider.validate_issuer =
-			add->provider.validate_issuer != OIDC_DEFAULT_VALIDATE_ISSUER ?
-					add->provider.validate_issuer :
-					base->provider.validate_issuer;
-	c->provider.client_name =
-			apr_strnatcmp(add->provider.client_name, OIDC_DEFAULT_CLIENT_NAME)
-			!= 0 ?
-					add->provider.client_name : base->provider.client_name;
-	c->provider.client_contact =
-			add->provider.client_contact != NULL ?
-					add->provider.client_contact :
-					base->provider.client_contact;
-	c->provider.registration_token =
-			add->provider.registration_token != NULL ?
-					add->provider.registration_token :
-					base->provider.registration_token;
-	c->provider.scope =
-			apr_strnatcmp(add->provider.scope, OIDC_DEFAULT_SCOPE) != 0 ?
-					add->provider.scope : base->provider.scope;
-	c->provider.response_type =
-			apr_strnatcmp(add->provider.response_type,
-					OIDC_DEFAULT_RESPONSE_TYPE) != 0 ?
-							add->provider.response_type : base->provider.response_type;
-	c->provider.response_mode =
-			add->provider.response_mode != NULL ?
-					add->provider.response_mode : base->provider.response_mode;
-	c->provider.jwks_refresh_interval =
-			add->provider.jwks_refresh_interval
-			!= OIDC_DEFAULT_JWKS_REFRESH_INTERVAL ?
-					add->provider.jwks_refresh_interval :
-					base->provider.jwks_refresh_interval;
-	c->provider.idtoken_iat_slack =
-			add->provider.idtoken_iat_slack != OIDC_DEFAULT_IDTOKEN_IAT_SLACK ?
-					add->provider.idtoken_iat_slack :
-					base->provider.idtoken_iat_slack;
-	c->provider.session_max_duration =
-			add->provider.session_max_duration
-			!= OIDC_DEFAULT_SESSION_MAX_DURATION ?
-					add->provider.session_max_duration :
-					base->provider.session_max_duration;
-	c->provider.auth_request_params =
-			add->provider.auth_request_params != NULL ?
-					add->provider.auth_request_params :
-					base->provider.auth_request_params;
-	c->provider.pkce =
-			add->provider.pkce != NULL ?
-					add->provider.pkce : base->provider.pkce;
-
-	c->provider.client_jwks_uri =
-			add->provider.client_jwks_uri != NULL ?
-					add->provider.client_jwks_uri :
-					base->provider.client_jwks_uri;
-	c->provider.client_signing_keys =
-			add->provider.client_signing_keys != NULL ?
-					add->provider.client_signing_keys :
-					base->provider.client_signing_keys;
-	c->provider.client_encryption_keys =
-			add->provider.client_encryption_keys != NULL ?
-					add->provider.client_encryption_keys :
-					base->provider.client_encryption_keys;
-
-	c->provider.id_token_signed_response_alg =
-			add->provider.id_token_signed_response_alg != NULL ?
-					add->provider.id_token_signed_response_alg :
-					base->provider.id_token_signed_response_alg;
-	c->provider.id_token_encrypted_response_alg =
-			add->provider.id_token_encrypted_response_alg != NULL ?
-					add->provider.id_token_encrypted_response_alg :
-					base->provider.id_token_encrypted_response_alg;
-	c->provider.id_token_encrypted_response_enc =
-			add->provider.id_token_encrypted_response_enc != NULL ?
-					add->provider.id_token_encrypted_response_enc :
-					base->provider.id_token_encrypted_response_enc;
-	c->provider.userinfo_signed_response_alg =
-			add->provider.userinfo_signed_response_alg != NULL ?
-					add->provider.userinfo_signed_response_alg :
-					base->provider.userinfo_signed_response_alg;
-	c->provider.userinfo_encrypted_response_alg =
-			add->provider.userinfo_encrypted_response_alg != NULL ?
-					add->provider.userinfo_encrypted_response_alg :
-					base->provider.userinfo_encrypted_response_alg;
-	c->provider.userinfo_encrypted_response_enc =
-			add->provider.userinfo_encrypted_response_enc != NULL ?
-					add->provider.userinfo_encrypted_response_enc :
-					base->provider.userinfo_encrypted_response_enc;
-	c->provider.userinfo_token_method =
-			add->provider.userinfo_token_method
-			!= OIDC_USER_INFO_TOKEN_METHOD_HEADER ?
-					add->provider.userinfo_token_method :
-					base->provider.userinfo_token_method;
-	c->provider.auth_request_method =
-			add->provider.auth_request_method
-			!= OIDC_DEFAULT_AUTH_REQUEST_METHOD ?
-					add->provider.auth_request_method :
-					base->provider.auth_request_method;
+	oidc_merge_provider_config(pool, &c->provider, &base->provider,
+			&add->provider);
 
 	c->oauth.ssl_validate_server =
 			add->oauth.ssl_validate_server != OIDC_DEFAULT_SSL_VALIDATE_SERVER ?
@@ -1849,10 +1893,10 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->oauth.verify_jwks_uri =
 			add->oauth.verify_jwks_uri != NULL ?
 					add->oauth.verify_jwks_uri : base->oauth.verify_jwks_uri;
-	c->oauth.verify_public_keys =
+	c->oauth.verify_public_keys = oidc_jwk_list_copy(pool,
 			add->oauth.verify_public_keys != NULL ?
 					add->oauth.verify_public_keys :
-					base->oauth.verify_public_keys;
+					base->oauth.verify_public_keys);
 	c->oauth.verify_shared_keys =
 			add->oauth.verify_shared_keys != NULL ?
 					add->oauth.verify_shared_keys :
@@ -1949,7 +1993,8 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 					add->cache_redis_database : base->cache_redis_database;
 	c->cache_redis_connect_timeout =
 			add->cache_redis_connect_timeout != -1 ?
-					add->cache_redis_connect_timeout : base->cache_redis_connect_timeout;
+					add->cache_redis_connect_timeout :
+					base->cache_redis_connect_timeout;
 	c->cache_redis_timeout =
 			add->cache_redis_timeout != -1 ?
 					add->cache_redis_timeout : base->cache_redis_timeout;
@@ -1970,8 +2015,7 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 					base->persistent_session_cookie;
 	c->store_id_token =
 			add->store_id_token != OIDC_DEFAULT_STORE_ID_TOKEN ?
-					add->store_id_token :
-					base->store_id_token;
+					add->store_id_token : base->store_id_token;
 	c->session_cookie_chunk_size =
 			add->session_cookie_chunk_size
 			!= OIDC_DEFAULT_SESSION_CLIENT_COOKIE_CHUNK_SIZE ?
@@ -2024,27 +2068,11 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 			add->error_template != NULL ?
 					add->error_template : base->error_template;
 
-	c->provider.userinfo_refresh_interval =
-			add->provider.userinfo_refresh_interval
-			!= OIDC_DEFAULT_USERINFO_REFRESH_INTERVAL ?
-					add->provider.userinfo_refresh_interval :
-					base->provider.userinfo_refresh_interval;
-	c->provider.request_object =
-			add->provider.request_object != NULL ?
-					add->provider.request_object :
-					base->provider.request_object;
-
 	c->provider_metadata_refresh_interval =
 			add->provider_metadata_refresh_interval
 			!= OIDC_DEFAULT_PROVIDER_METADATA_REFRESH_INTERVAL ?
 					add->provider_metadata_refresh_interval :
 					base->provider_metadata_refresh_interval;
-
-	c->provider.token_binding_policy =
-			add->provider.token_binding_policy
-			!= OIDC_DEFAULT_PROVIDER_TOKEN_BINDING_POLICY ?
-					add->provider.token_binding_policy :
-					base->provider.token_binding_policy;
 
 	c->info_hook_data =
 			add->info_hook_data != NULL ?
@@ -2055,12 +2083,6 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->white_listed_claims =
 			add->white_listed_claims != NULL ?
 					add->white_listed_claims : base->white_listed_claims;
-
-	c->provider.issuer_specific_redirect_uri =
-			add->provider.issuer_specific_redirect_uri
-			!= OIDC_DEFAULT_PROVIDER_ISSUER_SPECIFIC_REDIRECT_URI ?
-					add->provider.issuer_specific_redirect_uri :
-					base->provider.issuer_specific_redirect_uri;
 
 	c->state_input_headers =
 			add->state_input_headers != OIDC_DEFAULT_STATE_INPUT_HEADERS ?
@@ -2581,7 +2603,7 @@ static int oidc_check_config_oauth(server_rec *s, oidc_cfg *c) {
 	apr_uri_t r_uri;
 
 	oidc_swarn(s,
-			"The OAuth 2.0 Resource Server functionality is deprecated and superseded by a new module, see: https://github.com/zmartzone/mod_oauth2!");
+			"The OAuth 2.0 Resource Server functionality is deprecated and superseded by a new module, see: https://github.com/OpenIDC/mod_oauth2!");
 
 	if (c->oauth.metadata_url != NULL) {
 		apr_uri_parse(s->process->pconf, c->oauth.metadata_url, &r_uri);
@@ -2719,18 +2741,6 @@ static apr_status_t oidc_cleanup_child(void *data) {
 				oidc_serror(sp, "cache destroy function failed");
 			}
 		}
-
-		// can do this even though we haven't got a deep copy
-		// since references within the object will be set to NULL
-		oidc_jwk_list_destroy(sp->process->pool,
-				cfg->provider.verify_public_keys);
-		oidc_jwk_list_destroy(sp->process->pool,
-				cfg->oauth.verify_public_keys);
-		oidc_jwk_list_destroy_hash(sp->process->pool,
-				cfg->oauth.verify_shared_keys);
-		oidc_jwk_list_destroy(sp->process->pool, cfg->public_keys);
-		oidc_jwk_list_destroy(sp->process->pool, cfg->private_keys);
-
 		sp = sp->next;
 	}
 
@@ -3121,9 +3131,14 @@ const command_rec oidc_config_cmds[] = {
 				"Define whether the OP supports OpenID Connect Back Channel Logout."),
 		AP_INIT_TAKE1(OIDCProviderJwksUri,
 				oidc_set_https_slot,
-				(void *)APR_OFFSETOF(oidc_cfg, provider.jwks_uri),
+				(void *)APR_OFFSETOF(oidc_cfg, provider.jwks_uri.uri),
 				RSRC_CONF,
 				"Define the OpenID OP JWKS URL (e.g.: https://localhost:9031/pf/JWKS)"),
+		AP_INIT_TAKE2(OIDCProviderSignedJwksUri,
+				oidc_set_signed_jwks_uri,
+				(void *)APR_OFFSETOF(oidc_cfg, provider.jwks_uri.signed_uri),
+				RSRC_CONF,
+				"Define the OpenID Connect OP Signed JWKS URI and a JWK that can be used to verify the data on that URL."),
 		AP_INIT_ITERATE(OIDCProviderVerifyCertFiles,
 				oidc_set_public_key_files,
 				(void*)APR_OFFSETOF(oidc_cfg, provider.verify_public_keys),
@@ -3229,7 +3244,7 @@ const command_rec oidc_config_cmds[] = {
 				"Define the OpenID Connect scope that is requested from all providers for a specific path/context."),
 		AP_INIT_TAKE1(OIDCJWKSRefreshInterval,
 				oidc_set_jwks_refresh_interval,
-				(void*)APR_OFFSETOF(oidc_cfg, provider.jwks_refresh_interval),
+				(void*)APR_OFFSETOF(oidc_cfg, provider.jwks_uri.refresh_interval),
 				RSRC_CONF,
 				"Duration in seconds after which retrieved JWS should be refreshed."),
 		AP_INIT_TAKE1(OIDCIDTokenIatSlack,
