@@ -702,7 +702,7 @@ const char* oidc_get_redirect_uri(request_rec *r, oidc_cfg *cfg) {
 			&& (redirect_uri[0] == OIDC_CHAR_FORWARD_SLASH)) {
 		// relative redirect uri
 
-		redirect_uri = apr_pstrcat(r->pool, oidc_get_current_url_base(r),
+		redirect_uri = apr_pstrcat(r->pool, oidc_get_current_url_base(r, cfg->x_forwarded_headers),
 				redirect_uri, NULL);
 
 		oidc_debug(r, "determined absolute redirect uri: %s", redirect_uri);
