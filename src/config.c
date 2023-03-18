@@ -2557,7 +2557,6 @@ static int oidc_check_config_error(server_rec *s, const char *config_str) {
 	return HTTP_INTERNAL_SERVER_ERROR;
 }
 
-
 /*
  * check the config required for the OpenID Connect RP role
  */
