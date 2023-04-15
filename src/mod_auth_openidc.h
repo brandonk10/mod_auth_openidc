@@ -382,8 +382,6 @@ typedef struct oidc_cfg {
 
 	/* (optional) default URL for 3rd-party initiated SSO */
 	char *default_sso_url;
-	/* (optional) default URL to go to after logout */
-	char *default_slo_url;
 
 	/* public keys in JWK format, used by parters for encrypting JWTs sent to us */
 	apr_array_header_t *public_keys;
@@ -764,6 +762,7 @@ void *oidc_create_dir_config(apr_pool_t *pool, char *path);
 void *oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD);
 void oidc_register_hooks(apr_pool_t *pool);
 char *oidc_cfg_dir_discover_url(request_rec *r);
+char *oidc_cfg_dir_default_slo_url(request_rec *r);
 char *oidc_cfg_dir_cookie(request_rec *r);
 char *oidc_cfg_dir_redirect_uri(request_rec *r);
 char *oidc_cfg_dir_cookie_path(request_rec *r);
