@@ -2419,9 +2419,6 @@ void* oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->default_slo_url =
 			add->default_slo_url != NULL ?
 					add->default_slo_url : base->default_slo_url;
-	c->default_sso_url =
-			add->default_sso_url != NULL ?
-					add->default_sso_url : base->default_sso_url;
 	c->unauth_expression =
 			add->unauth_expression != NULL ?
 					add->unauth_expression : base->unauth_expression;
@@ -2556,7 +2553,6 @@ static int oidc_check_config_error(server_rec *s, const char *config_str) {
 	oidc_serror(s, "mandatory parameter '%s' is not set", config_str);
 	return HTTP_INTERNAL_SERVER_ERROR;
 }
-
 
 /*
  * check the config required for the OpenID Connect RP role
