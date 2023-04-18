@@ -2760,7 +2760,7 @@ static apr_status_t oidc_cleanup_parent(void *data) {
  * This handler has to invoke the main authn handler if successful, to ensure this runs before the OIDC main handler runs.
  * To ensure proper sequence, the authn handler is invoked from inside this if the config validates successfully.
  */
-static int oidc_config_and_check_user_id(request_rec *r) {
+int oidc_config_and_check_user_id(request_rec *r) {
 	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(r->server->module_config,
 			&auth_openidc_module);
 	

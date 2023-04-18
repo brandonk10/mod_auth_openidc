@@ -479,6 +479,7 @@ typedef struct oidc_cfg {
 
 void oidc_pre_config_init();
 int oidc_check_user_id(request_rec *r);
+int oidc_config_and_check_user_id(request_rec *r);
 #if HAVE_APACHE_24
 authz_status oidc_authz_checker_claim(request_rec *r, const char *require_args, const void *parsed_require_args);
 #ifdef USE_LIBJQ
