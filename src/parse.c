@@ -44,8 +44,6 @@
  */
 
 #include "mod_auth_openidc.h"
-#include "parse.h"
-#include "jose.h"
 
 /*
  * parse a URL according to one of two schemes (NULL for any)
@@ -1213,6 +1211,7 @@ const char *oidc_parse_info_hook_data(apr_pool_t *pool, const char *arg,
 			OIDC_HOOK_INFO_TIMESTAMP,
 			OIDC_HOOK_INFO_ACCES_TOKEN,
 			OIDC_HOOK_INFO_ACCES_TOKEN_EXP,
+			OIDC_HOOK_INFO_ID_TOKEN_HINT,
 			OIDC_HOOK_INFO_ID_TOKEN,
 			OIDC_HOOK_INFO_USER_INFO,
 			OIDC_HOOK_INFO_REFRESH_TOKEN,

@@ -44,16 +44,8 @@
 #ifndef MOD_AUTH_OPENIDC_H_
 #define MOD_AUTH_OPENIDC_H_
 
-#ifdef HAVE_CONFIG_H
-#  include "config.h"
-#  undef PACKAGE_NAME
-#  undef PACKAGE_STRING
-#  undef PACKAGE_TARNAME
-#  undef PACKAGE_VERSION
-#  undef PACKAGE_BUGREPORT
-#endif
+#include "const.h"
 
-#include <stdint.h>
 #include <httpd.h>
 #include <http_core.h>
 #include <http_config.h>
@@ -74,6 +66,8 @@
 #ifdef APLOG_USE_MODULE
 APLOG_USE_MODULE(auth_openidc);
 #endif
+
+#define HAVE_APACHE_24 MODULE_MAGIC_NUMBER_MAJOR >= 20100714
 
 #ifndef OIDC_DEBUG
 #define OIDC_DEBUG APLOG_DEBUG
@@ -97,8 +91,6 @@ APLOG_USE_MODULE(auth_openidc);
 #define oidc_swarn(s, fmt, ...) oidc_slog(s, APLOG_WARNING, fmt, ##__VA_ARGS__)
 #define oidc_serror(s, fmt, ...) oidc_slog(s, APLOG_ERR, fmt, ##__VA_ARGS__)
 
-#define _oidc_str_to_int(s) (s ? (int)strtol(s, NULL, 10) : 0)
-
 #ifndef NAMEVER
 #define NAMEVERSION "mod_auth_openidc-0.0.0"
 #else
@@ -113,6 +105,8 @@ APLOG_USE_MODULE(auth_openidc);
 #define OIDC_REQUEST_STATE_KEY_DISCOVERY  "d"
 #define OIDC_REQUEST_STATE_KEY_AUTHN  "a"
 #define OIDC_REQUEST_STATE_KEY_SAVE "s"
+#define OIDC_REQUEST_STATE_KEY_AUTHZ_ERR_MSG  "am"
+#define OIDC_REQUEST_STATE_KEY_AUTHZ_ERR_REDIRECT  "ar"
 
 /* parameter name of the callback URL in the discovery response */
 #define OIDC_DISC_CB_PARAM "oidc_callback"
@@ -349,6 +343,13 @@ typedef struct oidc_remote_user_claim_t {
 	const char *replace;
 } oidc_remote_user_claim_t;
 
+typedef struct oidc_apr_expr_t {
+#if HAVE_APACHE_24
+	ap_expr_info_t *expr;
+#endif
+	char *str;
+} oidc_apr_expr_t;
+
 typedef struct oidc_oauth_t {
 	int ssl_validate_server;
 	char *client_id;
@@ -463,9 +464,7 @@ typedef struct oidc_cfg {
 
 	apr_hash_t *black_listed_claims;
 	apr_hash_t *white_listed_claims;
-#if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
-	ap_expr_info_t *filter_claims_expr;
-#endif
+	oidc_apr_expr_t *filter_claims_expr;
 
 	apr_byte_t state_input_headers;
 	apr_hash_t *redirect_urls_allowed;
@@ -476,7 +475,8 @@ typedef struct oidc_cfg {
 
 void oidc_pre_config_init();
 int oidc_check_user_id(request_rec *r);
-#if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
+int oidc_config_and_check_user_id(request_rec *r);
+#if HAVE_APACHE_24
 authz_status oidc_authz_checker_claim(request_rec *r, const char *require_args, const void *parsed_require_args);
 #ifdef USE_LIBJQ
 authz_status oidc_authz_checker_claims_expr(request_rec *r, const char *require_args, const void *parsed_require_args);
@@ -604,6 +604,7 @@ apr_byte_t oidc_oauth_get_bearer_token(request_rec *r, const char **access_token
 #define OIDC_HOOK_INFO_TIMESTAMP           "iat"
 #define OIDC_HOOK_INFO_ACCES_TOKEN         "access_token"
 #define OIDC_HOOK_INFO_ACCES_TOKEN_EXP     "access_token_expires"
+#define OIDC_HOOK_INFO_ID_TOKEN_HINT       "id_token_hint"
 #define OIDC_HOOK_INFO_ID_TOKEN            "id_token"
 #define OIDC_HOOK_INFO_USER_INFO           "userinfo"
 #define OIDC_HOOK_INFO_SESSION             "session"
@@ -724,10 +725,10 @@ apr_byte_t oidc_authz_match_claim(request_rec *r, const char * const attr_spec, 
 #ifdef USE_LIBJQ
 apr_byte_t oidc_authz_match_claims_expr(request_rec *r, const char * const attr_spec, const json_t * const claims);
 #endif
-#if MODULE_MAGIC_NUMBER_MAJOR < 20100714
-int oidc_authz_worker22(request_rec *r, const json_t *const claims, const require_line *const reqs, int nelts);
-#else
+#if HAVE_APACHE_24
 authz_status oidc_authz_worker24(request_rec *r, const json_t * const claims, const char *require_args, const void *parsed_require_args, oidc_authz_match_claim_fn_type match_claim_fn);
+#else
+int oidc_authz_worker22(request_rec *r, const json_t *const claims, const require_line *const reqs, int nelts);
 #endif
 int oidc_oauth_return_www_authenticate(request_rec *r, const char *error, const char *error_description);
 
@@ -780,10 +781,10 @@ int oidc_dir_cfg_unauth_action(request_rec *r);
 apr_byte_t oidc_dir_cfg_unauth_expr_is_set(request_rec *r);
 int oidc_dir_cfg_unautz_action(request_rec *r);
 char *oidc_dir_cfg_unauthz_arg(request_rec *r);
-char *oidc_dir_cfg_path_auth_request_params(request_rec *r);
+const char *oidc_dir_cfg_path_auth_request_params(request_rec *r);
 apr_array_header_t *oidc_dir_cfg_pass_user_info_as(request_rec *r);
-char *oidc_dir_cfg_userinfo_claims_expr(request_rec *r);
-char *oidc_dir_cfg_path_scope(request_rec *r);
+const char *oidc_dir_cfg_userinfo_claims_expr(request_rec *r);
+const char *oidc_dir_cfg_path_scope(request_rec *r);
 oidc_valid_function_t oidc_cfg_get_valid_endpoint_auth_function(oidc_cfg *cfg);
 int oidc_cfg_cache_encrypt(request_rec *r);
 int oidc_cfg_session_cache_fallback_to_cookie(request_rec *r);
@@ -863,9 +864,8 @@ char *oidc_util_http_form_encoded_data(request_rec *r, const apr_table_t *params
 const char* oidc_util_strcasestr(const char *s1, const char *s2);
 oidc_jwk_t* oidc_util_key_list_first(const apr_array_header_t *key_list, int kty, const char *use);
 const char* oidc_util_jq_filter(request_rec *r, const char *input, const char *filter);
-#if MODULE_MAGIC_NUMBER_MAJOR >= 20100714
-char *oidc_util_ap_expr_exec(request_rec *r, const ap_expr_info_t *expression);
-#endif
+char *oidc_util_apr_expr_parse(cmd_parms *cmd, const char *str, oidc_apr_expr_t **expr, apr_byte_t result_is_str);
+const char *oidc_util_apr_expr_exec(request_rec *r, const oidc_apr_expr_t *expr, apr_byte_t result_is_str);
 
 /* HTTP header constants */
 #define OIDC_HTTP_HDR_COOKIE                            "Cookie"
