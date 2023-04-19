@@ -1050,7 +1050,7 @@ static apr_byte_t oidc_util_http_call(request_rec *r, const char *url,
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void* )&curlBuffer);
 
 #ifndef LIBCURL_NO_CURLPROTO
-	#if LIBCURL_VERSION_NUM >= 0x078500
+	#if LIBCURL_VERSION_NUM >= 0x075500
 		curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
 		curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
 	#else
@@ -3078,9 +3078,10 @@ oidc_jwk_t* oidc_util_key_list_first(const apr_array_header_t *key_list,
 	oidc_jwk_t *jwk = NULL;
 	for (i = 0; (key_list) && (i < key_list->nelts); i++) {
 		jwk = APR_ARRAY_IDX(key_list, i, oidc_jwk_t *);
-		if ((jwk->kty == kty)
-				&& ((use == NULL) || (jwk->use == NULL)
-						|| (_oidc_strncmp(jwk->use, use, strlen(use)) == 0))) {
+		if ((kty != -1) && (jwk->kty != kty))
+			continue;
+		if (((use == NULL) || (jwk->use == NULL)
+				|| (_oidc_strncmp(jwk->use, use, strlen(use)) == 0))) {
 			rv = jwk;
 			break;
 		}
