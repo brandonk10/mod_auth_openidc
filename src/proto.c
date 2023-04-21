@@ -440,7 +440,7 @@ char* oidc_proto_create_request_object(request_rec *r,
 		if (ejwk->kid != NULL)
 			jwe->header.kid = ejwk->kid;
 
-		if (oidc_jwt_encrypt(r->pool, jwe, ejwk, cser,
+		if (oidc_jwt_encrypt(r->pool, jwe, ejwk, cser, _oidc_strlen(cser) + 1,
 				&serialized_request_object, &err) == FALSE) {
 			oidc_error(r, "encrypting JWT failed: %s",
 					oidc_jose_e2s(r->pool, err));
@@ -962,23 +962,38 @@ void oidc_proto_state_destroy(oidc_proto_state_t *proto_state) {
 	json_decref(proto_state);
 }
 
+apr_byte_t oidc_proto_check_crypto_passphrase(request_rec *r, oidc_cfg *c,
+		const char *action) {
+	if (c->crypto_passphrase == NULL) {
+		oidc_error(r,
+				"cannot %s state cookie because " OIDCCryptoPassphrase " is not set; please check your OIDC Provider configuration as well or avoid using AuthType openid-connect",
+				action);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 oidc_proto_state_t* oidc_proto_state_from_cookie(request_rec *r, oidc_cfg *c,
 		const char *cookieValue) {
+	char *s_payload = NULL;
 	json_t *result = NULL;
-	oidc_util_jwt_verify(r, c->crypto_passphrase, cookieValue, &result, TRUE, TRUE);
+	if (oidc_proto_check_crypto_passphrase(r, c, "parse") == FALSE)
+		return NULL;
+	oidc_util_jwt_verify(r, c->crypto_passphrase, cookieValue, &s_payload,
+			TRUE);
+	oidc_util_decode_json_object(r, s_payload, &result);
 	return result;
 }
 
 char* oidc_proto_state_to_cookie(request_rec *r, oidc_cfg *c,
 		oidc_proto_state_t *proto_state) {
 	char *cookieValue = NULL;
-	if (c->crypto_passphrase != NULL) {
-		oidc_util_jwt_create(r, c->crypto_passphrase, proto_state, &cookieValue,
-				TRUE, TRUE);
-	} else {
-		oidc_error(r,
-				"cannot create a state cookie because " OIDCCryptoPassphrase " is not set; please check your OIDC Provider configuration as well or avoid using AuthType openid-connect");
-	}
+	if (oidc_proto_check_crypto_passphrase(r, c, "create") == FALSE)
+		return NULL;
+	oidc_util_jwt_create(r, c->crypto_passphrase,
+			oidc_util_encode_json_object(r, proto_state, JSON_COMPACT),
+			&cookieValue,
+			TRUE);
 	return cookieValue;
 }
 
@@ -2170,7 +2185,7 @@ static apr_byte_t oidc_user_info_response_validate(request_rec *r,
 	if (provider->userinfo_encrypted_response_alg != NULL) {
 		if (oidc_jwe_decrypt(r->pool, *response,
 				oidc_util_merge_symmetric_key(r->pool, cfg->private_keys, jwk),
-				&payload, &err, TRUE) == FALSE) {
+				&payload, NULL, &err, TRUE) == FALSE) {
 			oidc_error(r, "oidc_jwe_decrypt failed: %s",
 					oidc_jose_e2s(r->pool, err));
 			oidc_jwk_destroy(jwk);

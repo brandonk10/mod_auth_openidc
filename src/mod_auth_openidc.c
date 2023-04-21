@@ -272,6 +272,29 @@ static char* oidc_get_state_cookie_name(request_rec *r, const char *state) {
 }
 
 /*
+ * check if s_json is valid provider metadata
+ */
+static apr_byte_t oidc_provider_parse_and_validate_metadata_str(request_rec *r,
+		oidc_cfg *c, const char *s_json, json_t **j_provider) {
+
+	if (oidc_util_decode_json_object(r, s_json, j_provider) == FALSE) {
+		*j_provider = NULL;
+		return FALSE;
+	}
+
+	/* check to see if it is valid metadata */
+	if (oidc_metadata_provider_is_valid(r, c, *j_provider, NULL) == FALSE) {
+		oidc_warn(r, "cache corruption detected: invalid metadata from url: %s",
+				c->provider.metadata_url);
+		json_decref(*j_provider);
+		*j_provider = NULL;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/*
  * return the static provider configuration, i.e. from a metadata URL or configuration primitives
  */
 static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
@@ -288,7 +311,11 @@ static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
 
 	oidc_cache_get_provider(r, c->provider.metadata_url, &s_json);
 
-	if (s_json == NULL) {
+	if (s_json != NULL)
+		oidc_provider_parse_and_validate_metadata_str(r, c, s_json,
+				&j_provider);
+
+	if (j_provider == NULL) {
 
 		if (oidc_metadata_provider_retrieve(r, c, NULL,
 				c->provider.metadata_url, &j_provider, &s_json) == FALSE) {
@@ -297,20 +324,12 @@ static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
 			return FALSE;
 		}
 
+		if (oidc_provider_parse_and_validate_metadata_str(r, c, s_json,
+				&j_provider) == FALSE)
+			return FALSE;
+
 		oidc_cache_set_provider(r, c->provider.metadata_url, s_json,
 				apr_time_now() + apr_time_from_sec(c->provider_metadata_refresh_interval <= 0 ? OIDC_CACHE_PROVIDER_METADATA_EXPIRY_DEFAULT : c->provider_metadata_refresh_interval));
-
-	} else {
-
-		oidc_util_decode_json_object(r, s_json, &j_provider);
-
-		/* check to see if it is valid metadata */
-		if (oidc_metadata_provider_is_valid(r, c, j_provider, NULL) == FALSE) {
-			oidc_error(r,
-					"cache corruption detected: invalid metadata from url: %s",
-					c->provider.metadata_url);
-			return FALSE;
-		}
 	}
 
 	*provider = oidc_cfg_provider_copy(r->pool, &c->provider);
@@ -1395,7 +1414,7 @@ static apr_byte_t oidc_refresh_access_token_before_expiry(request_rec *r,
 	return TRUE;
 }
 
-#define OIDC_USERINFO_SIGNED_JWT_EXPIRE_DEFAULT 60
+#define OIDC_USERINFO_SIGNED_JWT_EXPIRE_DEFAULT 0
 #define OIDC_USERINFO_SIGNED_JWT_CACHE_TTL_ENVVAR "OIDC_USERINFO_SIGNED_JWT_CACHE_TTL"
 
 static int oidc_userinfo_signed_jwt_cache_ttl(request_rec *r) {
@@ -1675,19 +1694,19 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 	/* copy id_token and claims from session to request state and obtain their values */
 	oidc_copy_tokens_to_request_state(r, session, &s_id_token, &s_claims);
 
-	if ((cfg->pass_idtoken_as & OIDC_PASS_IDTOKEN_AS_CLAIMS)) {
+	if ((oidc_dir_cfg_pass_id_token_as(r) & OIDC_PASS_IDTOKEN_AS_CLAIMS)) {
 		/* set the id_token in the app headers */
 		if (oidc_set_app_claims(r, cfg, s_id_token) == FALSE)
 			return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
-	if ((cfg->pass_idtoken_as & OIDC_PASS_IDTOKEN_AS_PAYLOAD)) {
+	if ((oidc_dir_cfg_pass_id_token_as(r) & OIDC_PASS_IDTOKEN_AS_PAYLOAD)) {
 		/* pass the id_token JSON object to the app in a header or environment variable */
 		oidc_util_set_app_info(r, OIDC_APP_INFO_ID_TOKEN_PAYLOAD, s_id_token,
 				OIDC_DEFAULT_HEADER_PREFIX, pass_headers, pass_envvars, pass_hdr_as);
 	}
 
-	if ((cfg->pass_idtoken_as & OIDC_PASS_IDTOKEN_AS_SERIALIZED)) {
+	if ((oidc_dir_cfg_pass_id_token_as(r) & OIDC_PASS_IDTOKEN_AS_SERIALIZED)) {
 		/* get the compact serialized JWT from the session */
 		s_id_token = oidc_session_get_idtoken(r, session);
 		if (s_id_token) {
