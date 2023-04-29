@@ -697,36 +697,40 @@ static apr_byte_t oidc_metadata_jwks_retrieve_and_cache(request_rec *r,
  * return JWKs for the specified issuer
  */
 apr_byte_t oidc_metadata_jwks_get(request_rec *r, oidc_cfg *cfg,
-		const oidc_jwks_uri_t *jwks_uri, int ssl_validate_server, json_t **j_jwks, apr_byte_t *refresh) {
+		const oidc_jwks_uri_t *jwks_uri, int ssl_validate_server,
+		json_t **j_jwks, apr_byte_t *refresh) {
+	char *value = NULL;
+	const char *url =
+			jwks_uri->signed_uri ? jwks_uri->signed_uri : jwks_uri->uri;
 
-	const char *url = jwks_uri->signed_uri ? jwks_uri->signed_uri : jwks_uri->uri;
-
-	oidc_debug(r, "enter, %sjwks_uri=%s, refresh=%d", jwks_uri->signed_uri ? "signed_" : "", url, *refresh);
+	oidc_debug(r, "enter, %sjwks_uri=%s, refresh=%d",
+			jwks_uri->signed_uri ? "signed_" : "", url, *refresh);
 
 	/* see if we need to do a forced refresh */
 	if (*refresh == TRUE) {
-		oidc_debug(r, "doing a forced refresh of the JWKs from URI \"%s\"", url);
-		if (oidc_metadata_jwks_retrieve_and_cache(r, cfg, jwks_uri, ssl_validate_server,
-				j_jwks) == TRUE)
+		oidc_debug(r, "doing a forced refresh of the JWKs from URI \"%s\"",
+				url);
+		if (oidc_metadata_jwks_retrieve_and_cache(r, cfg, jwks_uri,
+				ssl_validate_server, j_jwks) == TRUE)
 			return TRUE;
-		// else: fallback on any cached JWKs
+		// else: fall back to any cached JWKs
 	}
 
 	/* see if the JWKs is cached */
-	char *value = NULL;
-	oidc_cache_get_jwks(r, oidc_metadata_jwks_cache_key(jwks_uri),
-			&value);
-
-	if (value == NULL) {
-		/* it is non-existing or expired: do a forced refresh */
-		*refresh = TRUE;
-		return oidc_metadata_jwks_retrieve_and_cache(r, cfg, jwks_uri, ssl_validate_server, j_jwks);
+	if ((oidc_cache_get_jwks(r, oidc_metadata_jwks_cache_key(jwks_uri),
+			&value) == TRUE) && (value != NULL)) {
+		/* decode and see if it is not a cached error response somehow */
+		if (oidc_util_decode_json_and_check_error(r, value, j_jwks) == FALSE) {
+			oidc_warn(r, "JSON parsing of cached JWKs data failed");
+			value = NULL;
+		}
 	}
 
-	/* decode and see if it is not a cached error response somehow */
-	if (oidc_util_decode_json_and_check_error(r, value, j_jwks) == FALSE) {
-		oidc_error(r, "JSON parsing of cached JWKs data failed");
-		return FALSE;
+	if (value == NULL) {
+		/* it is non-existing, invalid or expired: do a forced refresh */
+		*refresh = TRUE;
+		return oidc_metadata_jwks_retrieve_and_cache(r, cfg, jwks_uri,
+				ssl_validate_server, j_jwks);
 	}
 
 	return TRUE;
@@ -754,8 +758,10 @@ apr_byte_t oidc_metadata_provider_retrieve(request_rec *r, oidc_cfg *cfg,
 	}
 
 	/* check to see if it is valid metadata */
-	if (oidc_metadata_provider_is_valid(r, cfg, *j_metadata, issuer) == FALSE)
+	if (oidc_metadata_provider_is_valid(r, cfg, *j_metadata, issuer) == FALSE) {
+		json_decref(*j_metadata);
 		return FALSE;
+	}
 
 	/* all OK */
 	return TRUE;

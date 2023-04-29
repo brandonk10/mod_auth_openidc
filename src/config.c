@@ -97,7 +97,7 @@
 /* default duration in seconds after which retrieved JWS should be refreshed */
 #define OIDC_DEFAULT_JWKS_REFRESH_INTERVAL 3600
 /* default max cache size for shm */
-#define OIDC_DEFAULT_CACHE_SHM_SIZE 2000
+#define OIDC_DEFAULT_CACHE_SHM_SIZE 10000
 /* default max cache entry size for shm: # value + # key + # overhead */
 #define OIDC_DEFAULT_CACHE_SHM_ENTRY_SIZE_MAX 16384 + 512 + 17
 /* for issued-at timestamp (iat) checking */
@@ -160,6 +160,8 @@
 #define OIDC_DEFAULT_STORE_ID_TOKEN TRUE
 /* default pass user info as */
 #define OIDC_DEFAULT_PASS_USERINFO_AS OIDC_PASS_USERINFO_AS_CLAIMS_STR
+/* default pass id_token as */
+#define OIDC_DEFAULT_PASS_IDTOKEN_AS OIDC_PASS_IDTOKEN_AS_CLAIMS
 
 #define OIDCProviderMetadataURL                "OIDCProviderMetadataURL"
 #define OIDCProviderIssuer                     "OIDCProviderIssuer"
@@ -309,6 +311,7 @@ typedef struct oidc_dir_cfg {
 	int logout_on_error_refresh;
 	char *state_cookie_prefix;
 	apr_array_header_t *pass_userinfo_as;
+	int pass_idtoken_as;
 } oidc_dir_cfg;
 
 #define OIDC_CONFIG_DIR_RV(cmd, rv) rv != NULL ? apr_psprintf(cmd->pool, "Invalid value for directive '%s': %s", cmd->directive->directive, rv) : NULL
@@ -911,12 +914,11 @@ static const char* oidc_set_private_key_files_enc(cmd_parms *cmd, void *dummy,
 /*
  * define how to pass the id_token/claims in HTTP headers
  */
-static const char* oidc_set_pass_idtoken_as(cmd_parms *cmd, void *dummy,
+static const char* oidc_set_pass_idtoken_as(cmd_parms *cmd, void *m,
 		const char *v1, const char *v2, const char *v3) {
-	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(cmd->server->module_config,
-			&auth_openidc_module);
+	oidc_dir_cfg *dir_cfg = (oidc_dir_cfg*) m;
 	const char *rv = oidc_parse_pass_idtoken_as(cmd->pool, v1, v2, v3,
-			&cfg->pass_idtoken_as);
+			&dir_cfg->pass_idtoken_as);
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
@@ -1378,6 +1380,18 @@ static const char* oidc_set_signed_jwks_uri(cmd_parms *cmd, void *m,
 	return NULL;
 }
 
+static const char* oidc_set_token_revocation_endpoint(cmd_parms *cmd,
+		void *struct_ptr, const char *args) {
+	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(cmd->server->module_config,
+			&auth_openidc_module);
+	char *w = ap_getword_conf(cmd->pool, &args);
+	if (*w == '\0' || *args != 0) {
+		cfg->provider.revocation_endpoint_url = "";
+		return NULL;
+	}
+	return oidc_set_https_slot(cmd, struct_ptr, args);
+}
+
 int oidc_cfg_dir_refresh_access_token_before_expiry(request_rec *r) {
 	oidc_dir_cfg *dir_cfg = ap_get_module_config(r->per_dir_config,
 			&auth_openidc_module);
@@ -1759,7 +1773,6 @@ void* oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
 	c->remote_user_claim.claim_name = OIDC_DEFAULT_CLAIM_REMOTE_USER;
 	c->remote_user_claim.reg_exp = NULL;
 	c->remote_user_claim.replace = NULL;
-	c->pass_idtoken_as = OIDC_PASS_IDTOKEN_AS_CLAIMS;
 	c->cookie_http_only = OIDC_DEFAULT_COOKIE_HTTPONLY;
 	c->cookie_same_site = OIDC_DEFAULT_COOKIE_SAME_SITE;
 
@@ -2049,9 +2062,6 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 			add->remote_user_claim.replace != NULL ?
 					add->remote_user_claim.replace :
 					base->remote_user_claim.replace;
-	c->pass_idtoken_as =
-			add->pass_idtoken_as != OIDC_PASS_IDTOKEN_AS_CLAIMS ?
-					add->pass_idtoken_as : base->pass_idtoken_as;
 	c->cookie_http_only =
 			add->cookie_http_only != OIDC_DEFAULT_COOKIE_HTTPONLY ?
 					add->cookie_http_only : base->cookie_http_only;
@@ -2171,6 +2181,7 @@ void* oidc_create_dir_config(apr_pool_t *pool, char *path) {
 	c->logout_on_error_refresh = OIDC_CONFIG_POS_INT_UNSET;
 	c->state_cookie_prefix = OIDC_CONFIG_STRING_UNSET;
 	c->pass_userinfo_as = NULL;
+	c->pass_idtoken_as = OIDC_CONFIG_POS_INT_UNSET;
 	return (c);
 }
 
@@ -2379,6 +2390,14 @@ apr_array_header_t* oidc_dir_cfg_pass_user_info_as(request_rec *r) {
 			dir_cfg->pass_userinfo_as : pass_userinfo_as_default;
 }
 
+int oidc_dir_cfg_pass_id_token_as(request_rec *r) {
+	oidc_dir_cfg *dir_cfg = ap_get_module_config(r->per_dir_config,
+			&auth_openidc_module);
+	if (dir_cfg->pass_idtoken_as == OIDC_CONFIG_POS_INT_UNSET)
+		return OIDC_DEFAULT_PASS_IDTOKEN_AS;
+	return dir_cfg->pass_idtoken_as;
+}
+
 const char* oidc_dir_cfg_userinfo_claims_expr(request_rec *r) {
 	oidc_dir_cfg *dir_cfg = ap_get_module_config(r->per_dir_config,
 			&auth_openidc_module);
@@ -2474,6 +2493,9 @@ void* oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->pass_userinfo_as =
 			add->pass_userinfo_as != NULL ?
 					add->pass_userinfo_as : base->pass_userinfo_as;
+	c->pass_idtoken_as =
+			add->pass_idtoken_as != OIDC_CONFIG_POS_INT_UNSET ?
+					add->pass_idtoken_as : base->pass_idtoken_as;
 
 	c->refresh_access_token_before_expiry =
 			add->refresh_access_token_before_expiry != OIDC_CONFIG_POS_INT_UNSET ?
@@ -3121,8 +3143,8 @@ const command_rec oidc_config_cmds[] = {
 				(void *)APR_OFFSETOF(oidc_cfg, provider.userinfo_endpoint_url),
 				RSRC_CONF,
 				"Define the OpenID OP UserInfo Endpoint URL (e.g.: https://localhost:9031/idp/userinfo.openid)"),
-		AP_INIT_TAKE1(OIDCProviderRevocationEndpoint,
-				oidc_set_https_slot,
+		AP_INIT_RAW_ARGS(OIDCProviderRevocationEndpoint,
+				oidc_set_token_revocation_endpoint,
 				(void *)APR_OFFSETOF(oidc_cfg, provider.revocation_endpoint_url),
 				RSRC_CONF,
 				"Define the RFC 7009 Token Revocation Endpoint URL (e.g.: https://localhost:9031/as/revoke_token.oauth2)"),
@@ -3366,11 +3388,6 @@ const command_rec oidc_config_cmds[] = {
 				(void*)APR_OFFSETOF(oidc_cfg, remote_user_claim),
 				RSRC_CONF,
 				"The claim that is used when setting the REMOTE_USER variable for OpenID Connect protected paths."),
-		AP_INIT_TAKE123(OIDCPassIDTokenAs,
-				oidc_set_pass_idtoken_as,
-				NULL,
-				RSRC_CONF,
-				"The format in which the id_token is passed in (a) header(s); must be one or more of: claims|payload|serialized"),
 
 		AP_INIT_TAKE1(OIDCOAuthClientID,
 				oidc_set_string_slot,
@@ -3748,6 +3765,12 @@ const command_rec oidc_config_cmds[] = {
 				(void *) APR_OFFSETOF(oidc_cfg, x_forwarded_headers),
 				RSRC_CONF,
 				"Sets the value of the interpreted X-Forwarded-* headers."),
+
+		AP_INIT_TAKE123(OIDCPassIDTokenAs,
+				oidc_set_pass_idtoken_as,
+				NULL,
+				RSRC_CONF|ACCESS_CONF|OR_AUTHCFG,
+				"The format in which the id_token is passed in (a) header(s); must be one or more of: claims|payload|serialized"),
 
 		AP_INIT_ITERATE(OIDCPassUserInfoAs,
 				oidc_set_pass_userinfo_as,

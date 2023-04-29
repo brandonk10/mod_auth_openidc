@@ -123,26 +123,8 @@ int oidc_base64url_decode(apr_pool_t *pool, char **dst, const char *src) {
 	return apr_base64_decode(*dst, dec);
 }
 
-#define OIDC_JWT_NO_COMPRESS_ENV_VAR "OIDC_JWT_NO_COMPRESS"
-#define OIDC_JWT_STRIP_HDR_ENV_VAR "OIDC_JWT_STRIP_HDR"
-
-static apr_byte_t oidc_util_env_var_override_true(request_rec *r,
-		const char *env_var_name, apr_byte_t default_value,
-		apr_byte_t return_when_set) {
-	const char *s = NULL;
-	// avoid compressing/stripping JWTs that need to be compatible with external producers/consumers
-	if (default_value == FALSE)
-		return FALSE;
-	if (r->subprocess_env == NULL)
-		return default_value;
-	s = apr_table_get(r->subprocess_env, env_var_name);
-	return (s != NULL) && (_oidc_strcmp(s, "true") == 0) ?
-			return_when_set : !return_when_set;
-}
-
 static const char* oidc_util_get__oidc_jwt_hdr_dir_a256gcm(request_rec *r,
 		char *input) {
-	json_t *payload = NULL;
 	char *compact_encoded_jwt = NULL;
 	char *p = NULL;
 	static const char *_oidc_jwt_hdr_dir_a256gcm = NULL;
@@ -151,10 +133,8 @@ static const char* oidc_util_get__oidc_jwt_hdr_dir_a256gcm(request_rec *r,
 		return _oidc_jwt_hdr_dir_a256gcm;
 
 	if (input == NULL) {
-		payload = json_object();
-		oidc_util_jwt_create(r, "dummy", payload, &compact_encoded_jwt, FALSE,
-				FALSE);
-		json_decref(payload);
+		oidc_util_jwt_create(r, "needs_non_empty_string", "some_string",
+				&compact_encoded_jwt);
 	} else {
 		compact_encoded_jwt = input;
 	}
@@ -170,15 +150,41 @@ static const char* oidc_util_get__oidc_jwt_hdr_dir_a256gcm(request_rec *r,
 	return _oidc_jwt_hdr_dir_a256gcm;
 }
 
+static apr_byte_t oidc_util_env_var_override(request_rec *r,
+		const char *env_var_name, apr_byte_t return_when_set) {
+	const char *s = NULL;
+	if (r->subprocess_env == NULL)
+		return !return_when_set;
+	s = apr_table_get(r->subprocess_env, env_var_name);
+	return (s != NULL) && (_oidc_strcmp(s, "true") == 0) ?
+			return_when_set : !return_when_set;
+}
+
+#define OIDC_JWT_INTERNAL_NO_COMPRESS_ENV_VAR "OIDC_JWT_INTERNAL_NO_COMPRESS"
+
+static apr_byte_t oidc_util_jwt_internal_compress(request_rec *r) {
+	// avoid compressing JWTs that need to be compatible with external producers/consumers
+	return oidc_util_env_var_override(r, OIDC_JWT_INTERNAL_NO_COMPRESS_ENV_VAR,
+			FALSE);
+}
+
+#define OIDC_JWT_INTERNAL_STRIP_HDR_ENV_VAR "OIDC_JWT_INTERNAL_STRIP_HDR"
+
+static apr_byte_t oidc_util_jwt_internal_strip_header(request_rec *r) {
+	// avoid stripping JWT headers that need to be compatible with external producers/consumers
+	return oidc_util_env_var_override(r, OIDC_JWT_INTERNAL_STRIP_HDR_ENV_VAR,
+			TRUE);
+}
+
 apr_byte_t oidc_util_jwt_create(request_rec *r, const char *secret,
-		json_t *payload, char **compact_encoded_jwt, apr_byte_t strip_header,
-		apr_byte_t compress) {
+		const char *s_payload, char **compact_encoded_jwt) {
 
 	apr_byte_t rv = FALSE;
 	oidc_jose_error_t err;
+	char *cser = NULL;
+	int cser_len = 0;
 
 	oidc_jwk_t *jwk = NULL;
-	oidc_jwt_t *jwt = NULL;
 	oidc_jwt_t *jwe = NULL;
 
 	if (secret == NULL) {
@@ -190,20 +196,16 @@ apr_byte_t oidc_util_jwt_create(request_rec *r, const char *secret,
 			FALSE, &jwk) == FALSE)
 		goto end;
 
-	jwt = oidc_jwt_new(r->pool, TRUE, FALSE);
-	if (jwt == NULL) {
-		oidc_error(r, "creating JWT failed");
-		goto end;
-	}
-
-	jwt->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_HS256);
-	jwt->payload.value.json = payload;
-
-	if (oidc_jwt_sign(r->pool, jwt, jwk,
-			oidc_util_env_var_override_true(r, OIDC_JWT_NO_COMPRESS_ENV_VAR,
-					compress, FALSE), &err) == FALSE) {
-		oidc_error(r, "signing JWT failed: %s", oidc_jose_e2s(r->pool, err));
-		goto end;
+	if (oidc_util_jwt_internal_compress(r)) {
+		if (oidc_jose_compress(r->pool, s_payload, _oidc_strlen(s_payload),
+				&cser, &cser_len, &err) == FALSE) {
+			oidc_error(r, "oidc_jose_compress failed: %s",
+					oidc_jose_e2s(r->pool, err));
+			goto end;
+		}
+	} else {
+		cser = apr_pstrdup(r->pool, s_payload);
+		cser_len = _oidc_strlen(s_payload);
 	}
 
 	jwe = oidc_jwt_new(r->pool, TRUE, FALSE);
@@ -215,15 +217,14 @@ apr_byte_t oidc_util_jwt_create(request_rec *r, const char *secret,
 	jwe->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_DIR);
 	jwe->header.enc = apr_pstrdup(r->pool, CJOSE_HDR_ENC_A256GCM);
 
-	const char *cser = oidc_jwt_serialize(r->pool, jwt, &err);
-	if (oidc_jwt_encrypt(r->pool, jwe, jwk, cser, compact_encoded_jwt,
+	if (oidc_jwt_encrypt(r->pool, jwe, jwk, cser, cser_len, compact_encoded_jwt,
 			&err) == FALSE) {
 		oidc_error(r, "encrypting JWT failed: %s", oidc_jose_e2s(r->pool, err));
 		goto end;
 	}
 
-	if ((compact_encoded_jwt != NULL) && (oidc_util_env_var_override_true(r,
-			OIDC_JWT_STRIP_HDR_ENV_VAR, strip_header, TRUE)))
+	if ((*compact_encoded_jwt != NULL)
+			&& (oidc_util_jwt_internal_strip_header(r)))
 		*compact_encoded_jwt += _oidc_strlen(
 				oidc_util_get__oidc_jwt_hdr_dir_a256gcm(r,
 						*compact_encoded_jwt));
@@ -236,17 +237,12 @@ end:
 		oidc_jwt_destroy(jwe);
 	if (jwk != NULL)
 		oidc_jwk_destroy(jwk);
-	if (jwt != NULL) {
-		jwt->payload.value.json = NULL;
-		oidc_jwt_destroy(jwt);
-	}
 
 	return rv;
 }
 
 apr_byte_t oidc_util_jwt_verify(request_rec *r, const char *secret,
-		const char *compact_encoded_jwt, json_t **result,
-		apr_byte_t stripped_header, apr_byte_t compress) {
+		const char *compact_encoded_jwt, char **s_payload) {
 
 	apr_byte_t rv = FALSE;
 	oidc_jose_error_t err;
@@ -254,14 +250,10 @@ apr_byte_t oidc_util_jwt_verify(request_rec *r, const char *secret,
 	oidc_jwk_t *jwk = NULL;
 	oidc_jwt_t *jwt = NULL;
 
-	if (oidc_util_env_var_override_true(r, OIDC_JWT_STRIP_HDR_ENV_VAR,
-			stripped_header, TRUE))
+	if (oidc_util_jwt_internal_strip_header(r))
 		compact_encoded_jwt = apr_pstrcat(r->pool,
 				oidc_util_get__oidc_jwt_hdr_dir_a256gcm(r, NULL),
 				compact_encoded_jwt, NULL);
-
-	oidc_debug(r, "enter: JWT header=%s",
-			oidc_proto_peek_jwt_header(r, compact_encoded_jwt, NULL));
 
 	if (oidc_util_create_symmetric_key(r, secret, 0, OIDC_JOSE_ALG_SHA256,
 			FALSE, &jwk) == FALSE)
@@ -270,19 +262,35 @@ apr_byte_t oidc_util_jwt_verify(request_rec *r, const char *secret,
 	apr_hash_t *keys = apr_hash_make(r->pool);
 	apr_hash_set(keys, "", APR_HASH_KEY_STRING, jwk);
 
-	if (oidc_jwt_parse(r->pool, compact_encoded_jwt, &jwt, keys,
-			oidc_util_env_var_override_true(r, OIDC_JWT_NO_COMPRESS_ENV_VAR,
-					compress, FALSE), &err) == FALSE) {
-		oidc_error(r, "parsing JWT failed: %s", oidc_jose_e2s(r->pool, err));
+	char *payload = NULL;
+	int payload_len = 0;
+
+	char *plaintext = NULL;
+	int plaintext_len = 0;
+
+	if (oidc_jwe_decrypt(r->pool, compact_encoded_jwt, keys, &plaintext,
+			&plaintext_len, &err, FALSE) == FALSE) {
+		oidc_error(r, "decrypting JWT failed: %s", oidc_jose_e2s(r->pool, err));
 		goto end;
 	}
 
-	if (oidc_jwt_verify(r->pool, jwt, keys, &err) == FALSE) {
-		oidc_error(r, "verifying JWT failed: %s", oidc_jose_e2s(r->pool, err));
-		goto end;
+	if (oidc_util_jwt_internal_compress(r)) {
+
+		if (oidc_jose_uncompress(r->pool, (char*) plaintext, plaintext_len,
+				&payload, &payload_len, &err) == FALSE) {
+			oidc_error(r, "oidc_jose_uncompress failed: %s",
+					oidc_jose_e2s(r->pool, err));
+			goto end;
+		}
+
+	} else {
+
+		payload = plaintext;
+		payload_len = plaintext_len;
+
 	}
 
-	*result = json_deep_copy(jwt->payload.value.json);
+	*s_payload = apr_pstrndup(r->pool, payload, payload_len);
 
 	rv = TRUE;
 
@@ -1050,7 +1058,7 @@ static apr_byte_t oidc_util_http_call(request_rec *r, const char *url,
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void* )&curlBuffer);
 
 #ifndef LIBCURL_NO_CURLPROTO
-	#if LIBCURL_VERSION_NUM >= 0x078500
+	#if LIBCURL_VERSION_NUM >= 0x075500
 		curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
 		curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
 	#else
@@ -3078,9 +3086,10 @@ oidc_jwk_t* oidc_util_key_list_first(const apr_array_header_t *key_list,
 	oidc_jwk_t *jwk = NULL;
 	for (i = 0; (key_list) && (i < key_list->nelts); i++) {
 		jwk = APR_ARRAY_IDX(key_list, i, oidc_jwk_t *);
-		if ((jwk->kty == kty)
-				&& ((use == NULL) || (jwk->use == NULL)
-						|| (_oidc_strncmp(jwk->use, use, strlen(use)) == 0))) {
+		if ((kty != -1) && (jwk->kty != kty))
+			continue;
+		if (((use == NULL) || (jwk->use == NULL)
+				|| (_oidc_strncmp(jwk->use, use, _oidc_strlen(use)) == 0))) {
 			rv = jwk;
 			break;
 		}

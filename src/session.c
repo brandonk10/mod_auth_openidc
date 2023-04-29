@@ -58,8 +58,8 @@ extern module AP_MODULE_DECLARE_DATA auth_openidc_module;
 /* the name of the sid attribute in the session */
 #define OIDC_SESSION_SID_KEY                      "sid"
 
-static apr_byte_t oidc_session_encode(request_rec *r, oidc_cfg *c, oidc_session_t *z,
-		char **s_value, apr_byte_t encrypt) {
+static apr_byte_t oidc_session_encode(request_rec *r, oidc_cfg *c,
+		oidc_session_t *z, char **s_value, apr_byte_t encrypt) {
 
 	if (encrypt == FALSE) {
 		*s_value = oidc_util_encode_json_object(r, z->state, JSON_COMPACT);
@@ -70,24 +70,34 @@ static apr_byte_t oidc_session_encode(request_rec *r, oidc_cfg *c, oidc_session_
 		return FALSE;
 	}
 
-	if (oidc_util_jwt_create(r, c->crypto_passphrase, z->state, s_value, TRUE, TRUE) == FALSE)
+	if (oidc_util_jwt_create(r, c->crypto_passphrase,
+			oidc_util_encode_json_object(r, z->state, JSON_COMPACT),
+			s_value) == FALSE)
 		return FALSE;
 
 	return TRUE;
 }
 
-static apr_byte_t oidc_session_decode(request_rec *r, oidc_cfg *c, oidc_session_t *z,
-		const char *s_json, apr_byte_t encrypt) {
+static apr_byte_t oidc_session_decode(request_rec *r, oidc_cfg *c,
+		oidc_session_t *z, const char *s_json, apr_byte_t encrypt) {
+	char *s_payload = NULL;
 
 	if (encrypt == FALSE) {
 		return oidc_util_decode_json_object(r, s_json, &z->state);
-	}
-
-	if (oidc_util_jwt_verify(r, c->crypto_passphrase, s_json, &z->state, TRUE, TRUE) == FALSE) {
-		oidc_error(r, "could not verify secure JWT: cache value possibly corrupted");
+	} else if (c->crypto_passphrase == NULL) {
+		oidc_error(r,
+				"cannot decrypt session state because " OIDCCryptoPassphrase " is not set");
 		return FALSE;
 	}
-	return TRUE;
+
+	if (oidc_util_jwt_verify(r, c->crypto_passphrase, s_json,
+			&s_payload) == FALSE) {
+		oidc_error(r,
+				"could not verify secure JWT: cache value possibly corrupted");
+		return FALSE;
+	}
+
+	return oidc_util_decode_json_object(r, s_payload, &z->state);
 }
 
 /*
@@ -592,8 +602,10 @@ const char * oidc_session_get_userinfo_jwt(request_rec *r, oidc_session_t *z) {
  */
 void oidc_session_set_idtoken_claims(request_rec *r, oidc_session_t *z,
 		const char *idtoken_claims) {
-	oidc_session_set_filtered_claims(r, z, OIDC_SESSION_KEY_IDTOKEN_CLAIMS,
-			idtoken_claims);
+	if (apr_table_get(r->subprocess_env,
+			"OIDC_DONT_STORE_ID_TOKEN_CLAIMS_IN_SESSION") == NULL)
+		oidc_session_set_filtered_claims(r, z, OIDC_SESSION_KEY_IDTOKEN_CLAIMS,
+				idtoken_claims);
 }
 
 const char * oidc_session_get_idtoken_claims(request_rec *r, oidc_session_t *z) {

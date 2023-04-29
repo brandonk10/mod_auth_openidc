@@ -272,6 +272,27 @@ static char* oidc_get_state_cookie_name(request_rec *r, const char *state) {
 }
 
 /*
+ * check if s_json is valid provider metadata
+ */
+static apr_byte_t oidc_provider_validate_metadata_str(request_rec *r,
+		oidc_cfg *c, const char *s_json, json_t **j_provider) {
+
+	if (oidc_util_decode_json_object(r, s_json, j_provider) == FALSE) {
+		return FALSE;
+	}
+
+	/* check to see if it is valid metadata */
+	if (oidc_metadata_provider_is_valid(r, c, *j_provider, NULL) == FALSE) {
+		oidc_warn(r, "cache corruption detected: invalid metadata from url: %s",
+				c->provider.metadata_url);
+		json_decref(*j_provider);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/*
  * return the static provider configuration, i.e. from a metadata URL or configuration primitives
  */
 static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
@@ -288,7 +309,10 @@ static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
 
 	oidc_cache_get_provider(r, c->provider.metadata_url, &s_json);
 
-	if (s_json == NULL) {
+	if (s_json != NULL)
+		oidc_provider_validate_metadata_str(r, c, s_json, &j_provider);
+
+	if (j_provider == NULL) {
 
 		if (oidc_metadata_provider_retrieve(r, c, NULL,
 				c->provider.metadata_url, &j_provider, &s_json) == FALSE) {
@@ -296,21 +320,14 @@ static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
 					c->provider.metadata_url);
 			return FALSE;
 		}
+		json_decref(j_provider);
+
+		if (oidc_provider_validate_metadata_str(r, c, s_json,
+				&j_provider) == FALSE)
+			return FALSE;
 
 		oidc_cache_set_provider(r, c->provider.metadata_url, s_json,
 				apr_time_now() + apr_time_from_sec(c->provider_metadata_refresh_interval <= 0 ? OIDC_CACHE_PROVIDER_METADATA_EXPIRY_DEFAULT : c->provider_metadata_refresh_interval));
-
-	} else {
-
-		oidc_util_decode_json_object(r, s_json, &j_provider);
-
-		/* check to see if it is valid metadata */
-		if (oidc_metadata_provider_is_valid(r, c, j_provider, NULL) == FALSE) {
-			oidc_error(r,
-					"cache corruption detected: invalid metadata from url: %s",
-					c->provider.metadata_url);
-			return FALSE;
-		}
 	}
 
 	*provider = oidc_cfg_provider_copy(r->pool, &c->provider);
@@ -318,8 +335,7 @@ static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
 	if (oidc_metadata_provider_parse(r, c, j_provider, *provider) == FALSE) {
 		oidc_error(r, "could not parse metadata from url: %s",
 				c->provider.metadata_url);
-		if (j_provider)
-			json_decref(j_provider);
+		json_decref(j_provider);
 		return FALSE;
 	}
 
@@ -493,9 +509,9 @@ static int oidc_request_post_preserved_restore(request_rec *r,
 					"		 sessionStorage.removeItem('mod_auth_openidc_preserve_post_params');\n"
 					"        for (var key in mod_auth_openidc_preserve_post_params) {\n"
 					"          var input = document.createElement(\"input\");\n"
+					"          input.type = \"hidden\";\n"
 					"          input.name = str_decode(key);\n"
 					"          input.value = str_decode(mod_auth_openidc_preserve_post_params[key]);\n"
-					"          input.type = \"hidden\";\n"
 					"          document.forms[0].appendChild(input);\n"
 					"        }\n"
 					"        document.forms[0].action = \"%s\";\n"
@@ -1395,7 +1411,7 @@ static apr_byte_t oidc_refresh_access_token_before_expiry(request_rec *r,
 	return TRUE;
 }
 
-#define OIDC_USERINFO_SIGNED_JWT_EXPIRE_DEFAULT 60
+#define OIDC_USERINFO_SIGNED_JWT_EXPIRE_DEFAULT 0
 #define OIDC_USERINFO_SIGNED_JWT_CACHE_TTL_ENVVAR "OIDC_USERINFO_SIGNED_JWT_CACHE_TTL"
 
 static int oidc_userinfo_signed_jwt_cache_ttl(request_rec *r) {
@@ -1421,12 +1437,12 @@ static apr_byte_t oidc_userinfo_create_signed_jwt(request_rec *r, oidc_cfg *cfg,
 
 	oidc_debug(r, "enter: %s", s_claims);
 
-	jwk = oidc_util_key_list_first(cfg->private_keys, CJOSE_JWK_KTY_RSA,
+	jwk = oidc_util_key_list_first(cfg->private_keys, -1,
 			OIDC_JOSE_JWK_SIG_STR);
 	// TODO: detect at config time
 	if (jwk == NULL) {
 		oidc_error(r,
-				"no private signing keys have been configured to use for private_key_jwt client authentication (" OIDCPrivateKeyFiles ")");
+				"no RSA/EC private signing keys have been configured (in " OIDCPrivateKeyFiles ")");
 		goto end;
 	}
 
@@ -1435,7 +1451,16 @@ static apr_byte_t oidc_userinfo_create_signed_jwt(request_rec *r, oidc_cfg *cfg,
 		goto end;
 
 	jwt->header.kid = apr_pstrdup(r->pool, jwk->kid);
-	jwt->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_RS256);
+
+	if (jwk->kty == CJOSE_JWK_KTY_RSA)
+		jwt->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_RS256);
+	else if (jwk->kty == CJOSE_JWK_KTY_EC)
+		jwt->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_ES256);
+	else {
+		oidc_error(r,
+				"no usable RSA/EC signing keys has been configured (in " OIDCPrivateKeyFiles ")");
+		goto end;
+	}
 
 	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_AUD,
 			json_string(oidc_get_current_url(r, cfg->x_forwarded_headers)));
@@ -1666,19 +1691,19 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 	/* copy id_token and claims from session to request state and obtain their values */
 	oidc_copy_tokens_to_request_state(r, session, &s_id_token, &s_claims);
 
-	if ((cfg->pass_idtoken_as & OIDC_PASS_IDTOKEN_AS_CLAIMS)) {
+	if ((oidc_dir_cfg_pass_id_token_as(r) & OIDC_PASS_IDTOKEN_AS_CLAIMS)) {
 		/* set the id_token in the app headers */
 		if (oidc_set_app_claims(r, cfg, s_id_token) == FALSE)
 			return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
-	if ((cfg->pass_idtoken_as & OIDC_PASS_IDTOKEN_AS_PAYLOAD)) {
+	if ((oidc_dir_cfg_pass_id_token_as(r) & OIDC_PASS_IDTOKEN_AS_PAYLOAD)) {
 		/* pass the id_token JSON object to the app in a header or environment variable */
 		oidc_util_set_app_info(r, OIDC_APP_INFO_ID_TOKEN_PAYLOAD, s_id_token,
 				OIDC_DEFAULT_HEADER_PREFIX, pass_headers, pass_envvars, pass_hdr_as);
 	}
 
-	if ((cfg->pass_idtoken_as & OIDC_PASS_IDTOKEN_AS_SERIALIZED)) {
+	if ((oidc_dir_cfg_pass_id_token_as(r) & OIDC_PASS_IDTOKEN_AS_SERIALIZED)) {
 		/* get the compact serialized JWT from the session */
 		s_id_token = oidc_session_get_idtoken(r, session);
 		if (s_id_token) {
@@ -2957,6 +2982,8 @@ static apr_byte_t oidc_is_back_channel_logout(const char *logout_param_value) {
 			OIDC_BACKCHANNEL_STYLE_LOGOUT_PARAM_VALUE) == 0));
 }
 
+#define OIDC_DONT_REVOKE_TOKENS_BEFORE_LOGOUT_ENVVAR "OIDC_DONT_REVOKE_TOKENS_BEFORE_LOGOUT"
+
 /*
  * revoke refresh token and access token stored in the session if the
  * OP has an RFC 7009 compliant token revocation endpoint
@@ -2976,11 +3003,16 @@ static void oidc_revoke_tokens(request_rec *r, oidc_cfg *c,
 	if (oidc_get_provider_from_session(r, c, session, &provider) == FALSE)
 		goto out;
 
+	if (apr_table_get(r->subprocess_env,
+			OIDC_DONT_REVOKE_TOKENS_BEFORE_LOGOUT_ENVVAR) != NULL)
+		goto out;
+
 	oidc_debug(r, "revocation_endpoint=%s",
 			provider->revocation_endpoint_url ?
 					provider->revocation_endpoint_url : "(null)");
 
-	if (provider->revocation_endpoint_url == NULL)
+	if ((provider->revocation_endpoint_url == NULL)
+			|| (_oidc_strcmp(provider->revocation_endpoint_url, "") == 0))
 		goto out;
 
 	params = apr_table_make(r->pool, 4);
