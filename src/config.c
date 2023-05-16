@@ -643,8 +643,8 @@ static const char* oidc_set_validate_issuer_slot(cmd_parms *cmd,
  */
 oidc_valid_function_t oidc_cfg_get_valid_endpoint_auth_function(oidc_cfg *cfg) {
 	return (cfg->private_keys != NULL) ?
-			oidc_valid_endpoint_auth_method :
-			oidc_valid_endpoint_auth_method_no_private_key;
+			&oidc_valid_endpoint_auth_method :
+			&oidc_valid_endpoint_auth_method_no_private_key;
 }
 
 /*
@@ -3299,7 +3299,7 @@ const command_rec oidc_config_cmds[] = {
 				RSRC_CONF,
 				"Client identifier used in calls to OpenID Connect OP."),
 		AP_INIT_TAKE1(OIDCClientSecret,
-				oidc_set_string_slot,
+				oidc_set_passphrase_slot,
 				(void*)APR_OFFSETOF(oidc_cfg, provider.client_secret),
 				RSRC_CONF,
 				"Client secret used in calls to OpenID Connect OP."),
