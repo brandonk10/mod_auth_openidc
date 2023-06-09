@@ -77,6 +77,18 @@ APLOG_USE_MODULE(auth_openidc);
 #define APLOG_TRACE1 APLOG_DEBUG
 #endif
 
+#ifndef apr_uintptr_t
+#define apr_uintptr_t apr_uint64_t
+#endif
+
+#ifndef APR_UINT32_MAX
+#define APR_UINT32_MAX UINT32_MAX
+#endif
+
+#ifndef APR_INT64_MAX
+#define APR_INT64_MAX INT64_MAX
+#endif
+
 #define oidc_log(r, level, fmt, ...) ap_log_rerror(APLOG_MARK, level, 0, r,"%s: %s", __FUNCTION__, apr_psprintf(r->pool, fmt, ##__VA_ARGS__))
 #define oidc_slog(s, level, fmt, ...) ap_log_error(APLOG_MARK, level, 0, s, "%s: %s", __FUNCTION__, apr_psprintf(s->process->pconf, fmt, ##__VA_ARGS__))
 //#define oidc_log(r, level, fmt, ...) fprintf(stderr, "# %s: %s\n", __FUNCTION__, apr_psprintf(r->pool, fmt, ##__VA_ARGS__))
@@ -100,13 +112,11 @@ APLOG_USE_MODULE(auth_openidc);
 #endif
 
 /* keys for storing info in the request state */
-#define OIDC_REQUEST_STATE_KEY_IDTOKEN "i"
-#define OIDC_REQUEST_STATE_KEY_CLAIMS  "c"
-#define OIDC_REQUEST_STATE_KEY_DISCOVERY  "d"
-#define OIDC_REQUEST_STATE_KEY_AUTHN  "a"
-#define OIDC_REQUEST_STATE_KEY_SAVE "s"
-#define OIDC_REQUEST_STATE_KEY_AUTHZ_ERR_MSG  "am"
-#define OIDC_REQUEST_STATE_KEY_AUTHZ_ERR_REDIRECT  "ar"
+#define OIDC_REQUEST_STATE_KEY_IDTOKEN            "i"
+#define OIDC_REQUEST_STATE_KEY_CLAIMS             "c"
+#define OIDC_REQUEST_STATE_KEY_DISCOVERY          "d"
+#define OIDC_REQUEST_STATE_KEY_AUTHN              "a"
+#define OIDC_REQUEST_STATE_KEY_SAVE               "s"
 
 /* parameter name of the callback URL in the discovery response */
 #define OIDC_DISC_CB_PARAM "oidc_callback"
@@ -719,15 +729,15 @@ apr_byte_t oidc_proto_validate_nonce(request_rec *r, oidc_cfg *cfg, oidc_provide
 apr_byte_t oidc_validate_redirect_url(request_rec *r, oidc_cfg *c, const char *redirect_to_url, apr_byte_t restrict_to_host, char **err_str, char **err_desc);
 
 // oidc_authz.c
-typedef apr_byte_t (*oidc_authz_match_claim_fn_type)(request_rec *, const char * const, const json_t * const);
-apr_byte_t oidc_authz_match_claim(request_rec *r, const char * const attr_spec, const json_t * const claims);
+typedef apr_byte_t (*oidc_authz_match_claim_fn_type)(request_rec *, const char * const, json_t *);
+apr_byte_t oidc_authz_match_claim(request_rec *r, const char * const attr_spec, json_t *claims);
 #ifdef USE_LIBJQ
-apr_byte_t oidc_authz_match_claims_expr(request_rec *r, const char * const attr_spec, const json_t * const claims);
+apr_byte_t oidc_authz_match_claims_expr(request_rec *r, const char * const attr_spec, json_t *claims);
 #endif
 #if HAVE_APACHE_24
-authz_status oidc_authz_worker24(request_rec *r, const json_t * const claims, const char *require_args, const void *parsed_require_args, oidc_authz_match_claim_fn_type match_claim_fn);
+authz_status oidc_authz_worker24(request_rec *r, json_t *claims, const char *require_args, const void *parsed_require_args, oidc_authz_match_claim_fn_type match_claim_fn);
 #else
-int oidc_authz_worker22(request_rec *r, const json_t *const claims, const require_line *const reqs, int nelts);
+int oidc_authz_worker22(request_rec *r, json_t *claims, const require_line *const reqs, int nelts);
 #endif
 int oidc_oauth_return_www_authenticate(request_rec *r, const char *error, const char *error_description);
 
