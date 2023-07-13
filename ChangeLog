@@ -1,3 +1,9 @@
+07/12/2023
+- add a sanity alg/enc check on self-encrypted AES GCM JWTs
+- add `OIDCPassAccessToken Off` option to disable (the default of) passing the access token and its expiry
+  in the OIDC_access_token/OIDC_access_token_expires header/environment variables; thanks @mattias-asander
+- bump to 2.4.14.3rc1
+
 06/05/2023
 - avoid using encryption keys as signing keys for request objects and private_key_jwt token endpoint auth
 - log the first Redis error as a warning before retrying
@@ -433,7 +439,7 @@
 - bump to 2.4.11.1rc1
 
 02/27/2022
-- document Apache 2.4 behavior on OIDCUnAuthzAction 403; see #795; thanks @candlerb
+- document Apache 2.4 behavior on OIDCUnAutzAction 403; see #795; thanks @candlerb
 
 02/04/2022
 - correct ap_hook_insert_filter function signature in stub.c, part 2; closes #784; thanks @stroeder
