@@ -196,6 +196,7 @@ APLOG_USE_MODULE(auth_openidc);
 
 /* the (global) key for the mod_auth_openidc related state that is stored in the request userdata context */
 #define OIDC_USERDATA_KEY "mod_auth_openidc_state"
+#define OIDC_USERDATA_SESSION "mod_auth_openidc_session"
 #define OIDC_USERDATA_POST_PARAMS_KEY "oidc_userdata_post_params"
 
 /* input filter hook name */
