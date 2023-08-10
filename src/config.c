@@ -442,6 +442,8 @@ static const char* oidc_set_url_slot(cmd_parms *cmd, void *ptr, const char *arg)
 	return oidc_set_url_slot_type(cmd, cfg, arg, NULL);
 }
 
+
+
 /*
  * set a relative or absolute URL value in a config rec
  */
@@ -461,6 +463,16 @@ static const char* oidc_set_relative_or_absolute_url_slot_dir_cfg(
 		// absolute uri
 		return oidc_set_url_slot_type(cmd, ptr, arg, NULL);
 	}
+}
+
+/*
+ * set a relative or absolute URL value in the server config
+ */
+static const char* oidc_set_relative_or_absolute_url_slot(cmd_parms *cmd,
+		void *ptr, const char *arg) {
+	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(cmd->server->module_config,
+			&auth_openidc_module);
+	return oidc_set_relative_or_absolute_url_slot_dir_cfg(cmd, cfg, arg);
 }
 
 /*
