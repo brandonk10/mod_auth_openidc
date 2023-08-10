@@ -165,8 +165,10 @@ APLOG_USE_MODULE(auth_openidc);
 #define OIDC_PASS_APP_INFO_AS_BASE64URL 1
 #define OIDC_PASS_APP_INFO_AS_LATIN1    2
 
-/* logout on refresh error before expiry */
-#define OIDC_LOGOUT_ON_ERROR_REFRESH 1
+/* actions to be taken on access token / userinfo refresh error */
+#define OIDC_ON_ERROR_CONTINUE       0
+#define OIDC_ON_ERROR_LOGOUT         1
+#define OIDC_ON_ERROR_AUTHENTICATE   2
 
 #define OIDC_OAUTH_ACCEPT_TOKEN_IN_DEFAULT 0
 /* accept bearer token in header (default) */
@@ -481,6 +483,7 @@ typedef struct oidc_cfg {
 	char *ca_bundle_path;
 	char *logout_x_frame_options;
 	apr_byte_t x_forwarded_headers;
+	int action_on_userinfo_error;
 } oidc_cfg;
 
 void oidc_pre_config_init();
@@ -804,7 +807,7 @@ const char *oidc_parse_pkce_type(apr_pool_t *pool, const char *arg, oidc_proto_p
 const char *oidc_cfg_claim_prefix(request_rec *r);
 int oidc_cfg_max_number_of_state_cookies(oidc_cfg *cfg);
 int oidc_cfg_dir_refresh_access_token_before_expiry(request_rec *r);
-int oidc_cfg_dir_logout_on_error_refresh(request_rec *r);
+int oidc_cfg_dir_action_on_error_refresh(request_rec *r);
 char *oidc_cfg_dir_state_cookie_prefix(request_rec *r);
 int oidc_cfg_delete_oldest_state_cookies(oidc_cfg *cfg);
 oidc_provider_t* oidc_cfg_provider_create(apr_pool_t *pool);
@@ -817,6 +820,7 @@ int oidc_base64url_encode(request_rec *r, char **dst, const char *src, int src_l
 int oidc_base64url_decode(apr_pool_t *pool, char **dst, const char *src);
 const char *oidc_get_current_url_host(request_rec *r, const apr_byte_t x_forwarded_headers);
 char *oidc_get_current_url(request_rec *r, const apr_byte_t x_forwarded_headers);
+const char *oidc_get_absolute_url(request_rec *r, oidc_cfg *cfg, const char *url);
 const char *oidc_get_redirect_uri(request_rec *r, oidc_cfg *c);
 const char *oidc_get_redirect_uri_iss(request_rec *r, oidc_cfg *c, oidc_provider_t *provider);
 char *oidc_url_encode(const request_rec *r, const char *str, const char *charsToEncode);
