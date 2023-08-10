@@ -50,8 +50,6 @@
 
 #include "mod_auth_openidc.h"
 
-#define OIDC_REFRESH_ERROR 2
-
 static int oidc_handle_logout_request(request_rec *r, oidc_cfg *c,
 		oidc_session_t *session, const char *url);
 
@@ -1215,16 +1213,21 @@ static const char* oidc_retrieve_claims_from_userinfo_endpoint(request_rec *r,
  * get (new) claims from the userinfo endpoint
  */
 static apr_byte_t oidc_refresh_claims_from_userinfo_endpoint(request_rec *r,
-		oidc_cfg *cfg, oidc_session_t *session) {
+		oidc_cfg *cfg, oidc_session_t *session, apr_byte_t *needs_save) {
 
+	apr_byte_t rc = TRUE;
 	oidc_provider_t *provider = NULL;
 	const char *claims = NULL;
 	const char *access_token = NULL;
 	char *userinfo_jwt = NULL;
 
+	*needs_save = FALSE;
+
 	/* get the current provider info */
-	if (oidc_get_provider_from_session(r, cfg, session, &provider) == FALSE)
+	if (oidc_get_provider_from_session(r, cfg, session, &provider) == FALSE) {
+		*needs_save = TRUE;
 		return FALSE;
+	}
 
 	/* see if we can do anything here, i.e. we have a userinfo endpoint and a refresh interval is configured */
 	apr_time_t interval = apr_time_from_sec(
@@ -1258,10 +1261,15 @@ static apr_byte_t oidc_refresh_claims_from_userinfo_endpoint(request_rec *r,
 					userinfo_jwt);
 
 			/* indicated something changed */
-			return TRUE;
+			*needs_save = TRUE;
+
+			rc = (claims != NULL);
 		}
 	}
-	return FALSE;
+
+	oidc_debug(r, "return: %d", rc);
+
+	return rc;
 }
 
 /*
@@ -1355,8 +1363,7 @@ static apr_byte_t oidc_session_pass_tokens(request_rec *r, oidc_cfg *cfg,
 }
 
 static apr_byte_t oidc_refresh_access_token_before_expiry(request_rec *r,
-		oidc_cfg *cfg, oidc_session_t *session, int ttl_minimum,
-		int logout_on_error) {
+		oidc_cfg *cfg, oidc_session_t *session, int ttl_minimum) {
 
 	const char *s_access_token_expires = NULL;
 	apr_time_t t_expires = -1;
@@ -1399,12 +1406,8 @@ static apr_byte_t oidc_refresh_access_token_before_expiry(request_rec *r,
 
 	if (oidc_refresh_token_grant(r, cfg, session, provider,
 			NULL, NULL) == FALSE) {
-		oidc_warn(r, "access_token could not be refreshed, logout=%d",
-				logout_on_error & OIDC_LOGOUT_ON_ERROR_REFRESH);
-		if (logout_on_error & OIDC_LOGOUT_ON_ERROR_REFRESH)
-			return OIDC_REFRESH_ERROR;
-		else
-			return FALSE;
+		oidc_warn(r, "access_token could not be refreshed");
+		return FALSE;
 	}
 
 	return TRUE;
@@ -1669,19 +1672,40 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 
 	/* if needed, refresh the access token */
 	rv = oidc_refresh_access_token_before_expiry(r, cfg, session,
-			oidc_cfg_dir_refresh_access_token_before_expiry(r),
-			oidc_cfg_dir_logout_on_error_refresh(r));
-
-	if (rv == OIDC_REFRESH_ERROR) {
-		*needs_save = FALSE;
-		return oidc_handle_logout_request(r, cfg, session, cfg->default_slo_url);
+			oidc_cfg_dir_refresh_access_token_before_expiry(r));
+	if (rv == FALSE) {
+		if (oidc_cfg_dir_action_on_error_refresh(r) == OIDC_ON_ERROR_LOGOUT) {
+			*needs_save = FALSE;
+			return oidc_handle_logout_request(r, cfg, session,
+					oidc_get_absolute_url(r, cfg, cfg->default_slo_url));
+		}
+		if (oidc_cfg_dir_action_on_error_refresh(
+				r) == OIDC_ON_ERROR_AUTHENTICATE) {
+			*needs_save = FALSE;
+			oidc_session_kill(r, session);
+			return oidc_handle_unauthenticated_user(r, cfg);
+		}
 	}
 
 	*needs_save |= rv;
 
 	/* if needed, refresh claims from the user info endpoint */
-	if (oidc_refresh_claims_from_userinfo_endpoint(r, cfg, session) == TRUE)
-		*needs_save = TRUE;
+	rv = oidc_refresh_claims_from_userinfo_endpoint(r, cfg, session, needs_save);
+	if (rv == FALSE) {
+		oidc_debug(r, "action_on_userinfo_error: %d", cfg->action_on_userinfo_error);
+		if (cfg->action_on_userinfo_error == OIDC_ON_ERROR_LOGOUT) {
+			*needs_save = FALSE;
+			return oidc_handle_logout_request(r, cfg, session,
+					oidc_get_absolute_url(r, cfg, cfg->default_slo_url));
+		}
+		if (cfg->action_on_userinfo_error == OIDC_ON_ERROR_AUTHENTICATE) {
+			*needs_save = FALSE;
+			oidc_session_kill(r, session);
+			return oidc_handle_unauthenticated_user(r, cfg);
+		}
+	}
+
+	*needs_save |= rv;
 
 	/* set the user authentication HTTP header if set and required */
 	if ((r->user != NULL) && (authn_header != NULL))
@@ -2136,8 +2160,8 @@ static int oidc_handle_authorization_response(request_rec *r, oidc_cfg *c,
 			oidc_warn(r,
 					"invalid authorization response state; a default SSO URL is set, sending the user there: %s",
 					default_sso_url);
-			oidc_util_hdr_out_location_set(r, default_sso_url);
-			//oidc_util_hdr_err_out_add(r, "Location", default_sso_url));
+			oidc_util_hdr_out_location_set(r,
+					oidc_get_absolute_url(r, c, default_sso_url));
 			return HTTP_MOVED_TEMPORARILY;
 		}
 		oidc_error(r,
@@ -2845,7 +2869,8 @@ static int oidc_handle_discovery_response(request_rec *r, oidc_cfg *c) {
 					"SSO to this module without specifying a \"target_link_uri\" parameter is not possible because " OIDCDefaultURL " is not set.",
 					HTTP_INTERNAL_SERVER_ERROR);
 		}
-		target_link_uri = default_sso_url;
+		target_link_uri = apr_pstrdup(r->pool,
+				oidc_get_absolute_url(r, c, default_sso_url));
 	}
 
 	/* do open redirect prevention, step 1 */
@@ -3411,7 +3436,8 @@ static int oidc_handle_logout(request_rec *r, oidc_cfg *c,
 
 	if ((url == NULL) || (_oidc_strcmp(url, "") == 0)) {
 
-		url = c->default_slo_url;
+		url = apr_pstrdup(r->pool,
+				oidc_get_absolute_url(r, c, c->default_slo_url));
 
 	} else {
 
@@ -3620,7 +3646,8 @@ static int oidc_handle_session_management(request_rec *r, oidc_cfg *c,
 	if (_oidc_strcmp("logout", cmd) == 0) {
 		oidc_debug(r,
 				"[session=logout] calling oidc_handle_logout_request because of session mgmt local logout call.");
-		return oidc_handle_logout_request(r, c, session, c->default_slo_url);
+		return oidc_handle_logout_request(r, c, session,
+				oidc_get_absolute_url(r, c, c->default_slo_url));
 	}
 
 	if (oidc_get_provider_from_session(r, c, session, &provider) == FALSE) {
@@ -3932,8 +3959,11 @@ static int oidc_handle_info_request(request_rec *r, oidc_cfg *c,
 	 * side-effect is that this may refresh the access token if not already done
 	 * note that OIDCUserInfoRefreshInterval should be set to control the refresh policy
 	 */
-	if (b_extend_session)
-		needs_save |= oidc_refresh_claims_from_userinfo_endpoint(r, c, session);
+	if (b_extend_session) {
+		apr_byte_t l_needs_save = FALSE;
+		oidc_refresh_claims_from_userinfo_endpoint(r, c, session, &l_needs_save);
+		needs_save |= l_needs_save;
+	}
 
 	/* include the access token in the session info */
 	if (apr_hash_get(c->info_hook_data, OIDC_HOOK_INFO_ACCES_TOKEN,
@@ -4661,7 +4691,8 @@ int oidc_content_handler(request_rec *r) {
 				OIDC_REDIRECT_URI_REQUEST_INFO)) {
 
 			/* see if a session was retained in the request state */
-			apr_pool_userdata_get((void**) &session, OIDC_USERDATA_SESSION, r->pool);
+			apr_pool_userdata_get((void**) &session, OIDC_USERDATA_SESSION,
+					r->pool);
 
 			/* if no retained session was found, load it from the cache or create a new one*/
 			if (session == NULL)
@@ -4669,7 +4700,7 @@ int oidc_content_handler(request_rec *r) {
 
 			/*
 			 * see if the request state indicates that the (retained)
-			 * session was modified and needs to be updated in the cach
+			 * session was modified and needs to be updated in the cache
 			 */
 			needs_save = (oidc_request_state_get(r, OIDC_REQUEST_STATE_KEY_SAVE)
 					!= NULL);
