@@ -811,7 +811,8 @@ const char *oidc_get_absolute_url(request_rec *r, oidc_cfg *cfg, const char *url
  * determine absolute Redirect URI
  */
 const char* oidc_get_redirect_uri(request_rec *r, oidc_cfg *cfg) {
-	return oidc_get_absolute_url(r, cfg, cfg->redirect_uri);
+	const char *redirect_uri = oidc_get_redirect_uri(r, cfg);
+	return oidc_get_absolute_url(r, cfg, redirect_uri);
 }
 
 /*
