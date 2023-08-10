@@ -796,7 +796,7 @@ char* oidc_get_current_url(request_rec *r, const apr_byte_t x_forwarded_headers)
  * infer a full absolute URL from the (optional) relative one
  */
 const char *oidc_get_absolute_url(request_rec *r, oidc_cfg *cfg, const char *url) {
-	char *redirect_uri = cfg->redirect_uri;
+	const char *redirect_uri = oidc_get_redirect_uri(r, cfg);
 	if ((url != NULL)
 			&& (url[0] == OIDC_CHAR_FORWARD_SLASH)) {
 		url = apr_pstrcat(r->pool, oidc_get_current_url_base(r, cfg->x_forwarded_headers),
