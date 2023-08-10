@@ -164,6 +164,8 @@
 #define OIDC_DEFAULT_PASS_USERINFO_AS OIDC_PASS_USERINFO_AS_CLAIMS_STR
 /* default pass id_token as */
 #define OIDC_DEFAULT_PASS_IDTOKEN_AS OIDC_PASS_IDTOKEN_AS_CLAIMS
+/* default action to be taken on access token refresh error */
+#define OIDC_DEFAULT_ON_ERROR_REFRESH OIDC_ON_ERROR_CONTINUE;
 
 #define OIDCProviderMetadataURL                "OIDCProviderMetadataURL"
 #define OIDCProviderIssuer                     "OIDCProviderIssuer"
@@ -309,7 +311,8 @@ typedef struct oidc_dir_cfg {
 	oidc_apr_expr_t *unauth_expression;
 	oidc_apr_expr_t *userinfo_claims_expr;
 	int refresh_access_token_before_expiry;
-	int logout_on_error_refresh;
+	int action_on_error_refresh;
+	int action_on_userinfo_refresh;
 	char *state_cookie_prefix;
 	apr_array_header_t *pass_userinfo_as;
 	int pass_idtoken_as;
@@ -1165,11 +1168,15 @@ static const char* oidc_set_idtoken_iat_slack(cmd_parms *cmd, void *struct_ptr,
  * set the userinfo refresh interval
  */
 static const char* oidc_set_userinfo_refresh_interval(cmd_parms *cmd,
-		void *struct_ptr, const char *arg) {
+		void *struct_ptr, const char *arg1, const char *arg2) {
 	oidc_cfg *cfg = (oidc_cfg*) ap_get_module_config(cmd->server->module_config,
 			&auth_openidc_module);
-	const char *rv = oidc_parse_userinfo_refresh_interval(cmd->pool, arg,
+	const char *rv = oidc_parse_userinfo_refresh_interval(cmd->pool, arg1,
 			&cfg->provider.userinfo_refresh_interval);
+	if ((rv == NULL) && (arg2)) {
+		rv = oidc_parse_action_on_error_refresh_as(cmd->pool, arg2,
+				&cfg->action_on_userinfo_error);
+	}
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
@@ -1306,8 +1313,8 @@ static const char* oidc_set_refresh_access_token_before_expiry(cmd_parms *cmd,
 				cmd->directive->directive, rv1);
 
 	if (arg2) {
-		const char *rv2 = oidc_parse_logout_on_error_refresh_as(cmd->pool, arg2,
-				&dir_cfg->logout_on_error_refresh);
+		const char *rv2 = oidc_parse_action_on_error_refresh_as(cmd->pool, arg2,
+				&dir_cfg->action_on_error_refresh);
 		return OIDC_CONFIG_DIR_RV(cmd, rv2);
 	}
 
@@ -1401,12 +1408,12 @@ int oidc_cfg_dir_refresh_access_token_before_expiry(request_rec *r) {
 	return dir_cfg->refresh_access_token_before_expiry;
 }
 
-int oidc_cfg_dir_logout_on_error_refresh(request_rec *r) {
+int oidc_cfg_dir_action_on_error_refresh(request_rec *r) {
 	oidc_dir_cfg *dir_cfg = ap_get_module_config(r->per_dir_config,
 			&auth_openidc_module);
-	if (dir_cfg->logout_on_error_refresh == OIDC_CONFIG_POS_INT_UNSET)
-		return 0; // no mask
-	return dir_cfg->logout_on_error_refresh;
+	if (dir_cfg->action_on_error_refresh == OIDC_CONFIG_POS_INT_UNSET)
+		return OIDC_DEFAULT_ON_ERROR_REFRESH;
+	return dir_cfg->action_on_error_refresh;
 }
 
 char* oidc_cfg_dir_state_cookie_prefix(request_rec *r) {
@@ -1807,6 +1814,7 @@ void* oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
 	c->ca_bundle_path = NULL;
 	c->logout_x_frame_options = NULL;
 	c->x_forwarded_headers = OIDC_DEFAULT_X_FORWARDED_HEADERS;
+	c->action_on_userinfo_error = OIDC_ON_ERROR_CONTINUE;
 
 	return c;
 }
@@ -2129,6 +2137,11 @@ void* oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 			add->x_forwarded_headers != OIDC_DEFAULT_X_FORWARDED_HEADERS ?
 					add->x_forwarded_headers : base->x_forwarded_headers;
 
+	c->action_on_userinfo_error =
+			add->action_on_userinfo_error != OIDC_ON_ERROR_CONTINUE ?
+					add->action_on_userinfo_error :
+					base->action_on_userinfo_error;
+
 	return c;
 }
 
@@ -2186,7 +2199,7 @@ void* oidc_create_dir_config(apr_pool_t *pool, char *path) {
 	c->path_scope_expr = NULL;
 	c->userinfo_claims_expr = NULL;
 	c->refresh_access_token_before_expiry = OIDC_CONFIG_POS_INT_UNSET;
-	c->logout_on_error_refresh = OIDC_CONFIG_POS_INT_UNSET;
+	c->action_on_error_refresh = OIDC_CONFIG_POS_INT_UNSET;
 	c->state_cookie_prefix = OIDC_CONFIG_STRING_UNSET;
 	c->pass_userinfo_as = NULL;
 	c->pass_idtoken_as = OIDC_CONFIG_POS_INT_UNSET;
@@ -2503,10 +2516,10 @@ void* oidc_merge_dir_config(apr_pool_t *pool, void *BASE, void *ADD) {
 					add->refresh_access_token_before_expiry :
 					base->refresh_access_token_before_expiry;
 
-	c->logout_on_error_refresh =
-			add->logout_on_error_refresh != OIDC_CONFIG_POS_INT_UNSET ?
-					add->logout_on_error_refresh :
-					base->logout_on_error_refresh;
+	c->action_on_error_refresh =
+			add->action_on_error_refresh != OIDC_CONFIG_POS_INT_UNSET ?
+					add->action_on_error_refresh :
+					base->action_on_error_refresh;
 
 	c->state_cookie_prefix =
 			(_oidc_strcmp(add->state_cookie_prefix, OIDC_CONFIG_STRING_UNSET)
@@ -3341,12 +3354,12 @@ const command_rec oidc_config_cmds[] = {
 				RSRC_CONF | ACCESS_CONF | OR_AUTHCFG,
 				"Define the Redirect URI (e.g.: https://localhost:9031/protected/example/)"),
 		AP_INIT_TAKE1(OIDCDefaultURL,
-				oidc_set_url_slot,
+				oidc_set_relative_or_absolute_url_slot,
 				(void *)APR_OFFSETOF(oidc_cfg, default_sso_url),
 				RSRC_CONF,
 				"Defines the default URL where the user is directed to in case of 3rd-party initiated SSO."),
 		AP_INIT_TAKE1(OIDCDefaultLoggedOutURL,
-				oidc_set_url_slot,
+				oidc_set_relative_or_absolute_url_slot,
 				(void *)APR_OFFSETOF(oidc_cfg, default_slo_url),
 				RSRC_CONF,
 				"Defines the default URL where the user is directed to after logout."),
@@ -3665,7 +3678,7 @@ const command_rec oidc_config_cmds[] = {
 				NULL,
 				RSRC_CONF|ACCESS_CONF|OR_AUTHCFG,
 				"The method in which an OAuth token can be presented; must be one or more of: header|post|query|cookie"),
-		AP_INIT_TAKE1(OIDCUserInfoRefreshInterval,
+		AP_INIT_TAKE12(OIDCUserInfoRefreshInterval,
 				oidc_set_userinfo_refresh_interval,
 				(void*)APR_OFFSETOF(oidc_cfg, provider.userinfo_refresh_interval),
 				RSRC_CONF,
@@ -3735,7 +3748,7 @@ const command_rec oidc_config_cmds[] = {
 				oidc_set_refresh_access_token_before_expiry,
 				(void *)APR_OFFSETOF(oidc_dir_cfg, refresh_access_token_before_expiry),
 				RSRC_CONF|ACCESS_CONF|OR_AUTHCFG,
-				"Ensure the access token is valid for at least <x> seconds by refreshing it if required; must be: <x> [logout_on_error]; the logout_on_error performs a logout on refresh error."),
+				"Ensure the access token is valid for at least <x> seconds by refreshing it if required; must be: <x> [logout_on_error|authenticate_on_error]; the logout_on_error performs a logout on refresh error."),
 
 		AP_INIT_TAKE1(OIDCStateInputHeaders,
 				oidc_set_state_input_headers_as,
