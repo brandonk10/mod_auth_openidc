@@ -1,3 +1,14 @@
+07/25/2023
+- support "authenticate_on_error" 2nd parameter value in OIDCRefreshAccessTokenBeforeExpiry 
+  to reauthenticate the user when refreshing the access token fails
+  see: https://github.com/OpenIDC/mod_auth_openidc/discussions/1084; thanks @xrammit
+- add logout_on_error and authenticate_on_error 2nd parameter option to OIDCUserInfoRefreshInterval
+- bump to 2.4.14.3rc4
+
+07/18/2023
+- allow relative values in OIDCDefaultURL and OIDCDefaultLoggedOutURL
+- bump to 2.4.14.3rc3
+
 07/14/2023
 - fix session updates on userinfo requests; see https://github.com/OpenIDC/mod_auth_openidc/discussions/1077
   this bug was introduced in v2.4.11 with d9fff154ee6ee8a7e4e969dd6a68cbaf18354598
