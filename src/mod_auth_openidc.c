@@ -1397,7 +1397,7 @@ static apr_byte_t oidc_refresh_access_token_before_expiry(request_rec *r,
 			apr_time_sec(t_expires - apr_time_now()));
 
 	if (t_expires > apr_time_now())
-		return FALSE;
+		return TRUE;
 
 	if (oidc_get_provider_from_session(r, cfg, session, &provider) == FALSE)
 		return FALSE;
