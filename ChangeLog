@@ -1,3 +1,8 @@
+09/14/2023
+- fix `OIDCRefreshAccessTokenBeforeExpiry` when using it with `logout_on_error` or `authenticate_on_error`
+  see #1111; thanks @brandonk10
+- bump to 2.4.14.4rc0
+
 09/05/2023
 - release 2.4.14.3
 
