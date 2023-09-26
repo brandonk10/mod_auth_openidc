@@ -273,11 +273,14 @@ static char* oidc_get_state_cookie_name(request_rec *r, const char *state) {
  * check if s_json is valid provider metadata
  */
 static apr_byte_t oidc_provider_validate_metadata_str(request_rec *r,
-		oidc_cfg *c, const char *s_json, json_t **j_provider) {
+		oidc_cfg *c, const char *s_json, json_t **j_provider,
+		apr_byte_t decode_only) {
 
-	if (oidc_util_decode_json_object(r, s_json, j_provider) == FALSE) {
+	if (oidc_util_decode_json_object(r, s_json, j_provider) == FALSE)
 		return FALSE;
-	}
+
+	if (decode_only == TRUE)
+		return TRUE;
 
 	/* check to see if it is valid metadata */
 	if (oidc_metadata_provider_is_valid(r, c, *j_provider, NULL) == FALSE) {
@@ -308,7 +311,7 @@ static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
 	oidc_cache_get_provider(r, c->provider.metadata_url, &s_json);
 
 	if (s_json != NULL)
-		oidc_provider_validate_metadata_str(r, c, s_json, &j_provider);
+		oidc_provider_validate_metadata_str(r, c, s_json, &j_provider, TRUE);
 
 	if (j_provider == NULL) {
 
@@ -320,8 +323,8 @@ static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
 		}
 		json_decref(j_provider);
 
-		if (oidc_provider_validate_metadata_str(r, c, s_json,
-				&j_provider) == FALSE)
+		if (oidc_provider_validate_metadata_str(r, c, s_json, &j_provider,
+				FALSE) == FALSE)
 			return FALSE;
 
 		oidc_cache_set_provider(r, c->provider.metadata_url, s_json,
@@ -418,6 +421,8 @@ static const char* oidc_original_request_method(request_rec *r, oidc_cfg *cfg,
 	return method;
 }
 
+static char *post_preserve_template_contents = NULL;
+
 /*
  * send an OpenID Connect authorization request to the specified provider preserving POST parameters using HTML5 storage
  */
@@ -456,6 +461,13 @@ apr_byte_t oidc_post_preserve_javascript(request_rec *r, const char *location,
 	}
 	json = apr_psprintf(r->pool, "{ %s }", json);
 
+	if (cfg->post_preserve_template != NULL)
+		if (oidc_util_html_send_in_template(r, cfg->post_preserve_template,
+				&post_preserve_template_contents, json,
+				OIDC_POST_PRESERVE_ESCAPE_NONE, location,
+				OIDC_POST_PRESERVE_ESCAPE_JAVASCRIPT, OK) == OK)
+			return TRUE;
+
 	const char *jmethod = "preserveOnLoad";
 	const char *jscript =
 			apr_psprintf(r->pool,
@@ -467,8 +479,9 @@ apr_byte_t oidc_post_preserve_javascript(request_rec *r, const char *location,
 					"    </script>\n", jmethod, json,
 					location ?
 							apr_psprintf(r->pool, "window.location='%s';\n",
-									oidc_util_javascript_escape(r->pool, location)) :
-									"");
+									oidc_util_javascript_escape(r->pool,
+											location)) :
+											"");
 	if (location == NULL) {
 		if (javascript_method)
 			*javascript_method = apr_pstrdup(r->pool, jmethod);
@@ -1064,6 +1077,8 @@ static apr_byte_t oidc_refresh_token_grant(request_rec *r, oidc_cfg *c,
 	char *s_token_type = NULL;
 	char *s_access_token = NULL;
 	char *s_refresh_token = NULL;
+	oidc_jwt_t *id_token_jwt = NULL;
+	oidc_jose_error_t err;
 
 	/* refresh the tokens by calling the token endpoint */
 	if (oidc_proto_refresh_request(r, c, provider, refresh_token, &s_id_token,
@@ -1090,15 +1105,13 @@ static apr_byte_t oidc_refresh_token_grant(request_rec *r, oidc_cfg *c,
 
 	/* if we have a new id_token, store it in the session and update the session max lifetime if required */
 	if (s_id_token != NULL) {
+
 		/* only store the serialized representation when configured so */
 		if (c->store_id_token == TRUE)
 			oidc_session_set_idtoken(r, session, s_id_token);
 
-		oidc_jwt_t *id_token_jwt = NULL;
-		oidc_jose_error_t err;
 		if (oidc_jwt_parse(r->pool, s_id_token, &id_token_jwt, NULL, FALSE,
 				&err) == TRUE) {
-
 			/* store the claims payload in the id_token for later reference */
 			oidc_session_set_idtoken_claims(r, session,
 					id_token_jwt->payload.value.str);
@@ -1121,6 +1134,9 @@ static apr_byte_t oidc_refresh_token_grant(request_rec *r, oidc_cfg *c,
 		} else {
 			oidc_warn(r, "parsing of id_token failed");
 		}
+
+		if (id_token_jwt != NULL)
+			oidc_jwt_destroy(id_token_jwt);
 	}
 
 	return TRUE;
@@ -1221,47 +1237,48 @@ static apr_byte_t oidc_refresh_claims_from_userinfo_endpoint(request_rec *r,
 	const char *access_token = NULL;
 	char *userinfo_jwt = NULL;
 
-	/* get the current provider info */
-	if (oidc_get_provider_from_session(r, cfg, session, &provider) == FALSE) {
-		*needs_save = TRUE;
-		return FALSE;
-	}
+	/* see if we can do anything here, i.e. a refresh interval is configured */
+	apr_time_t interval = oidc_session_get_userinfo_refresh_interval(r,
+			session);
 
-	/* see if we can do anything here, i.e. we have a userinfo endpoint and a refresh interval is configured */
-	apr_time_t interval = apr_time_from_sec(
-			provider->userinfo_refresh_interval);
+	oidc_debug(r, "interval=%" APR_TIME_T_FMT, apr_time_sec(interval));
 
-	oidc_debug(r, "userinfo_endpoint=%s, interval=%d",
-			provider->userinfo_endpoint_url,
-			provider->userinfo_refresh_interval);
+	if (interval > 0) {
 
-	if ((provider->userinfo_endpoint_url != NULL) && (interval > 0)) {
-
-		/* get the last refresh timestamp from the session info */
-		apr_time_t last_refresh = oidc_session_get_userinfo_last_refresh(r,
-				session);
-
-		oidc_debug(r, "refresh needed in: %" APR_TIME_T_FMT " seconds",
-				apr_time_sec(last_refresh + interval - apr_time_now()));
-
-		/* see if we need to refresh again */
-		if (last_refresh + interval < apr_time_now()) {
-
-			/* get the current access token */
-			access_token = oidc_session_get_access_token(r, session);
-
-			/* retrieve the current claims */
-			claims = oidc_retrieve_claims_from_userinfo_endpoint(r, cfg,
-					provider, access_token, session, NULL, &userinfo_jwt);
-
-			/* store claims resolved from userinfo endpoint */
-			oidc_store_userinfo_claims(r, cfg, session, provider, claims,
-					userinfo_jwt);
-
-			/* indicated something changed */
+		/* get the current provider info */
+		if (oidc_get_provider_from_session(r, cfg, session, &provider) == FALSE) {
 			*needs_save = TRUE;
+			return FALSE;
+		}
 
-			rc = (claims != NULL);
+		if (provider->userinfo_endpoint_url != NULL) {
+
+			/* get the last refresh timestamp from the session info */
+			apr_time_t last_refresh = oidc_session_get_userinfo_last_refresh(r,
+					session);
+
+			oidc_debug(r, "refresh needed in: %" APR_TIME_T_FMT " seconds",
+					apr_time_sec(last_refresh + interval - apr_time_now()));
+
+			/* see if we need to refresh again */
+			if (last_refresh + interval < apr_time_now()) {
+
+				/* get the current access token */
+				access_token = oidc_session_get_access_token(r, session);
+
+				/* retrieve the current claims */
+				claims = oidc_retrieve_claims_from_userinfo_endpoint(r, cfg,
+						provider, access_token, session, NULL, &userinfo_jwt);
+
+				/* store claims resolved from userinfo endpoint */
+				oidc_store_userinfo_claims(r, cfg, session, provider, claims,
+						userinfo_jwt);
+
+				/* indicated something changed */
+				*needs_save = TRUE;
+
+				rc = (claims != NULL);
+			}
 		}
 	}
 
@@ -1985,6 +2002,10 @@ static apr_byte_t oidc_save_in_session(request_rec *r, oidc_cfg *c,
 				provider->check_session_iframe);
 	}
 
+	/* store the, possibly, provider specific userinfo_refresh_interval for performance reasons */
+	oidc_session_set_userinfo_refresh_interval(r, session,
+			provider->userinfo_refresh_interval);
+
 	/* store claims resolved from userinfo endpoint */
 	oidc_store_userinfo_claims(r, c, session, provider, claims, userinfo_jwt);
 
@@ -2141,6 +2162,8 @@ static apr_byte_t oidc_handle_browser_back(request_rec *r, const char *r_state,
 	return FALSE;
 }
 
+static char *post_restore_template_contents = NULL;
+
 /*
  * complete the handling of an authorization response by obtaining, parsing and verifying the
  * id_token and storing the authenticated user state in the session
@@ -2294,6 +2317,12 @@ static int oidc_handle_authorization_response(request_rec *r, oidc_cfg *c,
 
 	/* check whether form post data was preserved; if so restore it */
 	if (_oidc_strcmp(original_method, OIDC_METHOD_FORM_POST) == 0) {
+		if (c->post_restore_template != NULL)
+			if (oidc_util_html_send_in_template(r, c->post_restore_template,
+					&post_restore_template_contents, original_url,
+					OIDC_POST_PRESERVE_ESCAPE_JAVASCRIPT, "",
+					OIDC_POST_PRESERVE_ESCAPE_NONE, OK) == OK)
+				return TRUE;
 		return oidc_request_post_preserved_restore(r, original_url);
 	}
 
@@ -3065,7 +3094,7 @@ static void oidc_revoke_tokens(request_rec *r, oidc_cfg *c,
 
 		if (oidc_util_http_post_form(r, provider->revocation_endpoint_url,
 				params, basic_auth, bearer_auth, c->oauth.ssl_validate_server,
-				&response, c->http_timeout_long, c->outgoing_proxy,
+				&response, c->http_timeout_long, &c->outgoing_proxy,
 				oidc_dir_cfg_pass_cookies(r), NULL,
 				NULL, NULL) == FALSE) {
 			oidc_warn(r, "revoking refresh token failed");
@@ -3082,7 +3111,7 @@ static void oidc_revoke_tokens(request_rec *r, oidc_cfg *c,
 
 		if (oidc_util_http_post_form(r, provider->revocation_endpoint_url,
 				params, basic_auth, bearer_auth, c->oauth.ssl_validate_server,
-				&response, c->http_timeout_long, c->outgoing_proxy,
+				&response, c->http_timeout_long, &c->outgoing_proxy,
 				oidc_dir_cfg_pass_cookies(r), NULL,
 				NULL, NULL) == FALSE) {
 			oidc_warn(r, "revoking access token failed");
