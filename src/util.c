@@ -1024,7 +1024,7 @@ static void oidc_util_set_curl_ssl_options(request_rec *r, CURL *curl) {
 static apr_byte_t oidc_util_http_call(request_rec *r, const char *url,
 		const char *data, const char *content_type, const char *basic_auth,
 		const char *bearer_token, int ssl_validate_server, char **response,
-		int timeout, const char *outgoing_proxy,
+		int timeout, const oidc_outgoing_proxy_t *outgoing_proxy,
 		apr_array_header_t *pass_cookies, const char *ssl_cert,
 		const char *ssl_key, const char *ssl_key_pwd) {
 	char curlError[CURL_ERROR_SIZE];
@@ -1037,10 +1037,12 @@ static apr_byte_t oidc_util_http_call(request_rec *r, const char *url,
 
 	/* do some logging about the inputs */
 	oidc_debug(r,
-			"url=%s, data=%s, content_type=%s, basic_auth=%s, bearer_token=%s, ssl_validate_server=%d, timeout=%d, outgoing_proxy=%s, pass_cookies=%pp, ssl_cert=%s, ssl_key=%s, ssl_key_pwd=%s",
+			"url=%s, data=%s, content_type=%s, basic_auth=%s, bearer_token=%s, ssl_validate_server=%d, timeout=%d, outgoing_proxy=%s:%s:%d, pass_cookies=%pp, ssl_cert=%s, ssl_key=%s, ssl_key_pwd=%s",
 			url, data, content_type, basic_auth ? "****" : "null", bearer_token,
-					ssl_validate_server, timeout, outgoing_proxy, pass_cookies,
-					ssl_cert, ssl_key, ssl_key_pwd ? "****" : "(null)");
+					ssl_validate_server, timeout, outgoing_proxy->host_port,
+					outgoing_proxy->username_password ? "****" : "(null)",
+							(int )outgoing_proxy->auth_type, pass_cookies, ssl_cert, ssl_key,
+							ssl_key_pwd ? "****" : "(null)");
 
 	curl = curl_easy_init();
 	if (curl == NULL) {
@@ -1110,8 +1112,14 @@ static apr_byte_t oidc_util_http_call(request_rec *r, const char *url,
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "mod_auth_openidc");
 
 	/* set optional outgoing proxy for the local network */
-	if (outgoing_proxy) {
-		curl_easy_setopt(curl, CURLOPT_PROXY, outgoing_proxy);
+	if (outgoing_proxy->host_port) {
+		curl_easy_setopt(curl, CURLOPT_PROXY, outgoing_proxy->host_port);
+		if (outgoing_proxy->username_password)
+			curl_easy_setopt(curl, CURLOPT_PROXYUSERPWD,
+					outgoing_proxy->username_password);
+		if (outgoing_proxy->auth_type != OIDC_CONFIG_POS_INT_UNSET)
+			curl_easy_setopt(curl, CURLOPT_PROXYAUTH,
+					outgoing_proxy->auth_type);
 	}
 
 	/* see if we need to add token in the Bearer Authorization header */
@@ -1215,7 +1223,7 @@ out:
 apr_byte_t oidc_util_http_get(request_rec *r, const char *url,
 		const apr_table_t *params, const char *basic_auth,
 		const char *bearer_token, int ssl_validate_server, char **response,
-		int timeout, const char *outgoing_proxy,
+		int timeout, const oidc_outgoing_proxy_t *outgoing_proxy,
 		apr_array_header_t *pass_cookies, const char *ssl_cert,
 		const char *ssl_key, const char *ssl_key_pwd) {
 	char *query_url = oidc_util_http_query_encoded_url(r, url, params);
@@ -1230,7 +1238,7 @@ apr_byte_t oidc_util_http_get(request_rec *r, const char *url,
 apr_byte_t oidc_util_http_post_form(request_rec *r, const char *url,
 		const apr_table_t *params, const char *basic_auth,
 		const char *bearer_token, int ssl_validate_server, char **response,
-		int timeout, const char *outgoing_proxy,
+		int timeout, const oidc_outgoing_proxy_t *outgoing_proxy,
 		apr_array_header_t *pass_cookies, const char *ssl_cert,
 		const char *ssl_key, const char *ssl_key_pwd) {
 	char *data = oidc_util_http_form_encoded_data(r, params);
@@ -1246,7 +1254,7 @@ apr_byte_t oidc_util_http_post_form(request_rec *r, const char *url,
 apr_byte_t oidc_util_http_post_json(request_rec *r, const char *url,
 		json_t *json, const char *basic_auth, const char *bearer_token,
 		int ssl_validate_server, char **response, int timeout,
-		const char *outgoing_proxy, apr_array_header_t *pass_cookies,
+		const oidc_outgoing_proxy_t *outgoing_proxy, apr_array_header_t *pass_cookies,
 		const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd) {
 	char *data =
 			json != NULL ?
@@ -1814,6 +1822,50 @@ char* oidc_util_get_full_path(apr_pool_t *pool, const char *abs_or_rel_filename)
 }
 
 /*
+ * escape characters in an HTML/Javascript template
+ */
+static char* oidc_util_template_escape(request_rec *r, const char *arg,
+		int escape) {
+	char *rv = NULL;
+	if (escape == OIDC_POST_PRESERVE_ESCAPE_HTML) {
+		rv = oidc_util_html_escape(r->pool, arg ? arg : "");
+	} else if (escape == OIDC_POST_PRESERVE_ESCAPE_JAVASCRIPT) {
+		rv = oidc_util_javascript_escape(r->pool, arg ? arg : "");
+	} else {
+		rv = apr_pstrdup(r->pool, arg);
+	}
+	return rv;
+}
+
+/*
+ * fill and send a HTML template
+ */
+apr_byte_t oidc_util_html_send_in_template(request_rec *r, const char *filename,
+		char **static_template_content, const char *arg1, int arg1_esc,
+		const char *arg2, int arg2_esc, int status_code) {
+	char *fullname = NULL;
+	char *html = NULL;
+	int rc = status_code;
+	if (*static_template_content == NULL) {
+		fullname = oidc_util_get_full_path(r->pool, filename);
+		// NB: templates go into the server process pool
+		if (oidc_util_file_read(r, fullname, r->server->process->pool,
+				static_template_content) == FALSE) {
+			oidc_error(r, "could not read template: %s", fullname);
+			*static_template_content = NULL;
+		}
+	}
+	if (static_template_content) {
+		html = apr_psprintf(r->pool, *static_template_content,
+				oidc_util_template_escape(r, arg1, arg1_esc),
+				oidc_util_template_escape(r, arg2, arg2_esc));
+		rc = oidc_util_http_send(r, html, _oidc_strlen(html),
+				OIDC_CONTENT_TYPE_TEXT_HTML, status_code);
+	}
+	return rc;
+}
+
+/*
  * send a user-facing error to the browser
  */
 int oidc_util_html_send_error(request_rec *r, const char *html_template,
@@ -1826,26 +1878,10 @@ int oidc_util_html_send_error(request_rec *r, const char *html_template,
 
 		if (_oidc_strcmp(html_template, "deprecated") != 0) {
 
-			if (html_error_template_contents == NULL) {
-				html_template = oidc_util_get_full_path(r->pool, html_template);
-				if (oidc_util_file_read(r, html_template,
-						r->server->process->pool,
-						&html_error_template_contents) == FALSE) {
-					oidc_error(r, "could not read HTML error template: %s",
-							html_template);
-					html_error_template_contents = NULL;
-				}
-			}
-
-			if (html_error_template_contents) {
-				html = apr_psprintf(r->pool, html_error_template_contents,
-						oidc_util_html_escape(r->pool, error ? error : ""),
-						oidc_util_html_escape(r->pool,
-								description ? description : ""));
-
-				rc = oidc_util_http_send(r, html, _oidc_strlen(html),
-						OIDC_CONTENT_TYPE_TEXT_HTML, status_code);
-			}
+			rc = oidc_util_html_send_in_template(r, html_template,
+					&html_error_template_contents, error,
+					OIDC_POST_PRESERVE_ESCAPE_HTML, description,
+					OIDC_POST_PRESERVE_ESCAPE_HTML, status_code);
 
 		} else {
 
@@ -2185,8 +2221,10 @@ static char* oidc_util_utf8_to_latin1(request_rec *r, const char *src) {
 	char *dst = "";
 	unsigned int cp = 0;
 	unsigned char ch;
+	int i = 0;
 	if (src == NULL)
 		return NULL;
+	dst = apr_pcalloc(r->pool, strlen(src) + 1);
 	while (*src != '\0') {
 		ch = (unsigned char) (*src);
 		if (ch <= 0x7f)
@@ -2202,16 +2240,17 @@ static char* oidc_util_utf8_to_latin1(request_rec *r, const char *src) {
 		++src;
 		if (((*src & 0xc0) != 0x80) && (cp <= 0x10ffff)) {
 			if (cp <= 255) {
-				dst = apr_psprintf(r->pool, "%s%c", dst, (unsigned char)cp);
+				dst[i] = (unsigned char) cp;
 			} else {
 				// no encoding possible
-				dst = apr_psprintf(r->pool, "%s%c", dst, '?');
+				dst[i] = '?';
 			}
+			i++;
 		}
 	}
+	dst[i] = '\0';
 	return dst;
 }
-
 
 /*
  * set a HTTP header and/or environment variable to pass information to the application
