@@ -49,8 +49,6 @@ extern module AP_MODULE_DECLARE_DATA auth_openidc_module;
 #define OIDC_SESSION_REMOTE_USER_KEY              "r"
 /* the name of the session expiry attribute in the session */
 #define OIDC_SESSION_EXPIRY_KEY                   "e"
-/* the name of the provided token binding attribute in the session */
-#define OIDC_SESSION_PROVIDED_TOKEN_BINDING_KEY   "ptb"
 /* the name of the session identifier in the session */
 #define OIDC_SESSION_SESSION_ID                   "i"
 /* the name of the sub attribute in the session */
@@ -64,13 +62,13 @@ static apr_byte_t oidc_session_encode(request_rec *r, oidc_cfg *c,
 	if (encrypt == FALSE) {
 		*s_value = oidc_util_encode_json_object(r, z->state, JSON_COMPACT);
 		return (*s_value != NULL);
-	} else if (c->crypto_passphrase == NULL) {
+	} else if (c->crypto_passphrase.secret1 == NULL) {
 		oidc_error(r,
 				"cannot encrypt session state because " OIDCCryptoPassphrase " is not set");
 		return FALSE;
 	}
 
-	if (oidc_util_jwt_create(r, c->crypto_passphrase,
+	if (oidc_util_jwt_create(r, &c->crypto_passphrase,
 			oidc_util_encode_json_object(r, z->state, JSON_COMPACT),
 			s_value) == FALSE)
 		return FALSE;
@@ -84,13 +82,13 @@ static apr_byte_t oidc_session_decode(request_rec *r, oidc_cfg *c,
 
 	if (encrypt == FALSE) {
 		return oidc_util_decode_json_object(r, s_json, &z->state);
-	} else if (c->crypto_passphrase == NULL) {
+	} else if (c->crypto_passphrase.secret1 == NULL) {
 		oidc_error(r,
 				"cannot decrypt session state because " OIDCCryptoPassphrase " is not set");
 		return FALSE;
 	}
 
-	if (oidc_util_jwt_verify(r, c->crypto_passphrase, s_json,
+	if (oidc_util_jwt_verify(r, &c->crypto_passphrase, s_json,
 			&s_payload) == FALSE) {
 		oidc_error(r,
 				"could not verify secure JWT: cache value possibly corrupted");
@@ -273,7 +271,6 @@ static apr_byte_t oidc_session_save_cookie(request_rec *r, oidc_session_t *z, ap
 
 apr_byte_t oidc_session_extract(request_rec *r, oidc_session_t *z) {
 	apr_byte_t rc = FALSE;
-	const char *ses_p_tb_id = NULL, *env_p_tb_id = NULL;
 
 	if (z->state == NULL)
 		goto out;
@@ -289,19 +286,6 @@ apr_byte_t oidc_session_extract(request_rec *r, oidc_session_t *z) {
 		oidc_session_clear(r, z);
 
 		goto out;
-	}
-
-	oidc_session_get(r, z, OIDC_SESSION_PROVIDED_TOKEN_BINDING_KEY,
-			&ses_p_tb_id);
-
-	if (ses_p_tb_id != NULL) {
-		env_p_tb_id = oidc_util_get_provided_token_binding_id(r);
-		if ((env_p_tb_id == NULL)
-				|| (_oidc_strcmp(env_p_tb_id, ses_p_tb_id) != 0)) {
-			oidc_error(r,
-					"the Provided Token Binding ID stored in the session doesn't match the one presented by the user agent");
-			oidc_session_clear(r, z);
-		}
 	}
 
 	oidc_session_get(r, z, OIDC_SESSION_REMOTE_USER_KEY, &z->remote_user);
@@ -353,19 +337,11 @@ apr_byte_t oidc_session_save(request_rec *r, oidc_session_t *z,
 			&auth_openidc_module);
 
 	apr_byte_t rc = FALSE;
-	const char *p_tb_id = oidc_util_get_provided_token_binding_id(r);
 
 	if (z->state != NULL) {
 		oidc_session_set(r, z, OIDC_SESSION_REMOTE_USER_KEY, z->remote_user);
 		json_object_set_new(z->state, OIDC_SESSION_EXPIRY_KEY,
 				json_integer(apr_time_sec(z->expiry)));
-
-		if ((first_time) && (p_tb_id != NULL)) {
-			oidc_debug(r,
-					"Provided Token Binding ID environment variable found; adding its value to the session state");
-			oidc_session_set(r, z, OIDC_SESSION_PROVIDED_TOKEN_BINDING_KEY,
-					p_tb_id);
-		}
 	}
 
 	if (c->session_type == OIDC_SESSION_TYPE_SERVER_CACHE)
