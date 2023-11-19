@@ -1776,7 +1776,7 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 		if (error_code != OIDC_REFRESH_ERROR_PARALLEL_REFRESH) {
 			if (oidc_cfg_dir_action_on_error_refresh(r) == OIDC_ON_ERROR_LOGOUT) {
 				return oidc_handle_logout_request(r, cfg, session,
-						oidc_get_absolute_url(r, cfg, cfg->default_slo_url));
+						oidc_get_absolute_url(r, cfg, default_slo_url));
 			}
 			if (oidc_cfg_dir_action_on_error_refresh(
 					r) == OIDC_ON_ERROR_AUTHENTICATE) {
@@ -1797,7 +1797,7 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 		if (error_code != OIDC_REFRESH_ERROR_PARALLEL_REFRESH) {
 			if (cfg->action_on_userinfo_error == OIDC_ON_ERROR_LOGOUT) {
 				return oidc_handle_logout_request(r, cfg, session,
-						oidc_get_absolute_url(r, cfg, cfg->default_slo_url));
+						oidc_get_absolute_url(r, cfg, default_slo_url));
 			}
 			if (cfg->action_on_userinfo_error == OIDC_ON_ERROR_AUTHENTICATE) {
 				oidc_session_kill(r, session);
