@@ -1,3 +1,44 @@
+11/08/2023
+- improve error message in case of curl timeouts
+- bump to 2.4.15rc4
+
+11/02/2023
+- apply ISO-8859-1 ("latin1") as default encoding mechanism for claim values passed in headers and environment
+  variables to comply with https://www.rfc-editor.org/rfc/rfc5987; see #957; use "OIDCPassClaimsAs <any> none"
+  for backwards compatibility
+- bump to 2.4.15rc3
+
+11/01/2023
+- avoid warnings on cache misses (regression introduced in 2.4.15rc1)
+- bump to 2.4.15rc2
+
+10/31/2023
+- add capability to seamlessly rollover OIDCCryptoPassphrase using a (temporary) 2nd value that holds the old one
+- bump to 2.4.15rc1
+- remove obsolete support for Token Binding https://www.rfc-editor.org/rfc/rfc8471.html (id_token, access_token, session cookie)
+- use only the User-Agent header as input for the state browser fingerprinting by default (no X-Forwarded-For)
+  as cloud environments increasingly use dynamic proxy IPs in front
+- use PKCE S256 by default; disable by configuring "OIDCPKCEMethod none"
+- use SameSite cookies Strict by default; disable by configuring "OIDCCookieSameSite Off"
+ 
+10/30/2023
+- do not apply logout_on_error and authenticate_on_error when a parallel refresh token request is detected
+  see https://github.com/OpenIDC/mod_auth_openidc/discussions/1132; thanks @esunke
+- restore backwards compatibility wrt. allowing parallel refresh token requests by default, and add an
+  option to prevent that (i.e. in case of rolling refresh tokens) using envvar OIDC_PARALLEL_REFRESH_NOT_ALLOWED
+- return HTTP 500 on token refresh errors instead of HTTP 401
+- retry failed outgoing HTTP requests and add options to configure it in OIDCHTTPTimeoutLong/OIDCHTTPTimeoutShort
+- bump to 2.4.15rc0
+  
+10/12/2023
+- release 2.4.14.4
+
+10/11/2023
+- improve behaviour when parallel refresh token grant requests occur on the same Apache server/host
+  and rolling refresh tokens are issued; synchronize using a global refresh token lock and avoid
+  corrupting the session by storing/overwriting an expired refresh token
+- bump to 2.4.14.4rc6
+
 09/22/2023
 - performance: store userinfo refresh interval in session to avoid parsing JSON on each request
 - fix memory leak in oidc_refresh_token_grant: free the parsed id_token that is returned

@@ -49,7 +49,7 @@ apr_byte_t oidc_oauth_metadata_provider_retrieve(request_rec *r, oidc_cfg *cfg,
 
 	/* get provider metadata from the specified URL with the specified parameters */
 	if (oidc_util_http_get(r, url, NULL, NULL, NULL,
-			cfg->oauth.ssl_validate_server, response, cfg->http_timeout_short,
+			cfg->oauth.ssl_validate_server, response, &cfg->http_timeout_short,
 			&cfg->outgoing_proxy, oidc_dir_cfg_pass_cookies(r),
 			NULL, NULL, NULL) == FALSE)
 		return FALSE;
@@ -162,7 +162,7 @@ static apr_byte_t oidc_oauth_validate_access_token(request_rec *r, oidc_cfg *c,
 			OIDC_INTROSPECTION_METHOD_GET) == 0 ?
 			oidc_util_http_get(r, c->oauth.introspection_endpoint_url, params,
 					basic_auth, bearer_auth, c->oauth.ssl_validate_server,
-					response, c->http_timeout_long, &c->outgoing_proxy,
+					response, &c->http_timeout_long, &c->outgoing_proxy,
 					oidc_dir_cfg_pass_cookies(r),
 					oidc_util_get_full_path(r->pool,
 							c->oauth.introspection_endpoint_tls_client_cert),
@@ -173,7 +173,7 @@ static apr_byte_t oidc_oauth_validate_access_token(request_rec *r, oidc_cfg *c,
 			oidc_util_http_post_form(r, c->oauth.introspection_endpoint_url,
 					params, basic_auth, bearer_auth,
 					c->oauth.ssl_validate_server, response,
-					c->http_timeout_long, &c->outgoing_proxy,
+					&c->http_timeout_long, &c->outgoing_proxy,
 					oidc_dir_cfg_pass_cookies(r),
 					oidc_util_get_full_path(r->pool,
 							c->oauth.introspection_endpoint_tls_client_cert),
@@ -458,11 +458,6 @@ static apr_byte_t oidc_oauth_resolve_access_token(request_rec *r, oidc_cfg *c,
 		if (oidc_util_decode_json_and_check_error(r, s_json, &result) == FALSE)
 			return FALSE;
 
-		/* check the token binding ID in the introspection result */
-		if (oidc_util_json_validate_cnf(r, result,
-				c->oauth.access_token_binding_policy) == FALSE)
-			return FALSE;
-
 		json_t *active = json_object_get(result, OIDC_PROTO_ACTIVE);
 		apr_time_t cache_until = apr_time_now() + apr_time_from_sec(60);
 		if (active != NULL) {
@@ -573,7 +568,7 @@ static apr_byte_t oidc_oauth_validate_jwt_access_token(request_rec *r,
 		oidc_cfg *c, const char *access_token, json_t **token, char **response) {
 
 	oidc_debug(r, "enter: JWT access_token header=%s",
-			oidc_proto_peek_jwt_header(r, access_token, NULL, NULL));
+			oidc_proto_peek_jwt_header(r, access_token, NULL, NULL, NULL));
 
 	oidc_jose_error_t err;
 	oidc_jwk_t *jwk = NULL;
@@ -601,8 +596,7 @@ static apr_byte_t oidc_oauth_validate_jwt_access_token(request_rec *r,
 	 * validate the access token JWT by validating the (optional) exp claim
 	 * don't enforce anything around iat since it doesn't make much sense for access tokens
 	 */
-	if (oidc_proto_validate_jwt(r, jwt, NULL, FALSE, FALSE, -1,
-			c->oauth.access_token_binding_policy) == FALSE) {
+	if (oidc_proto_validate_jwt(r, jwt, NULL, FALSE, FALSE, -1) == FALSE) {
 		oidc_jwt_destroy(jwt);
 		return FALSE;
 	}
@@ -618,9 +612,12 @@ static apr_byte_t oidc_oauth_validate_jwt_access_token(request_rec *r,
 	// TODO: we're re-using the OIDC provider JWKs refresh interval here...
 	oidc_jwks_uri_t jwks_uri = { c->oauth.verify_jwks_uri,
 			c->provider.jwks_uri.refresh_interval, NULL, NULL };
-	if (oidc_proto_jwt_verify(r, c, jwt, &jwks_uri, c->oauth.ssl_validate_server, oidc_util_merge_key_sets(r->pool, c->oauth.verify_shared_keys, c->oauth.verify_public_keys), NULL)
-			== FALSE) {
-		oidc_error(r, "JWT access token signature could not be validated, aborting");
+	if (oidc_proto_jwt_verify(r, c, jwt, &jwks_uri,
+			c->oauth.ssl_validate_server,
+			oidc_util_merge_key_sets(r->pool, c->oauth.verify_shared_keys,
+					c->oauth.verify_public_keys), NULL) == FALSE) {
+		oidc_error(r,
+				"JWT access token signature could not be validated, aborting");
 		oidc_jwt_destroy(jwt);
 		return FALSE;
 	}
