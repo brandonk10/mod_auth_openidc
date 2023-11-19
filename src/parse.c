@@ -146,12 +146,10 @@ const char *oidc_valid_cookie_domain(apr_pool_t *pool, const char *arg) {
 /*
  * parse an integer value from a string
  */
-const char *oidc_parse_int(apr_pool_t *pool, const char *arg, int *int_value) {
-	char *endptr = NULL;
-	int v = strtol(arg, &endptr, 10);
-	if ((*arg == '\0') || (*endptr != '\0')) {
+const char* oidc_parse_int(apr_pool_t *pool, const char *arg, int *int_value) {
+	if (*arg == '\0')
 		return apr_psprintf(pool, "invalid integer value: %s", arg);
-	}
+	int v = _oidc_str_to_int(arg);
 	*int_value = v;
 	return NULL;
 }
@@ -443,7 +441,7 @@ const char *oidc_valid_pkce_method(apr_pool_t *pool, const char *arg) {
 	static char *options[] = {
 			OIDC_PKCE_METHOD_PLAIN,
 			OIDC_PKCE_METHOD_S256,
-			OIDC_PKCE_METHOD_REFERRED_TB,
+			OIDC_PKCE_METHOD_NONE,
 			NULL };
 	return oidc_valid_string_option(pool, arg, options);
 }
@@ -1008,6 +1006,33 @@ const char *oidc_parse_set_claims_as(apr_pool_t *pool, const char *arg,
 	return NULL;
 }
 
+#define OIDC_PASS_CLAIMS_ENCODING_NONE_STR        "none"
+#define OIDC_PASS_CLAIMS_ENCODING_LATIN1_STR      "latin1"
+#define OIDC_PASS_CLAIMS_ENCODING_BASE64URL_STR   "base64url"
+
+const char* oidc_parse_pass_claims_as_encoding(apr_pool_t *pool,
+		const char *arg, int *pass_as) {
+	static char *options[] = {
+			OIDC_PASS_CLAIMS_ENCODING_NONE_STR,
+			OIDC_PASS_CLAIMS_ENCODING_LATIN1_STR,
+			OIDC_PASS_CLAIMS_ENCODING_BASE64URL_STR,
+			NULL };
+	const char *rv = oidc_valid_string_option(pool, arg, options);
+	if (rv != NULL)
+		return rv;
+
+	if (_oidc_strcmp(arg, OIDC_PASS_CLAIMS_ENCODING_NONE_STR) == 0) {
+		*pass_as = OIDC_PASS_APP_INFO_AS_NONE;
+	} else if (_oidc_strcmp(arg, OIDC_PASS_CLAIMS_ENCODING_LATIN1_STR) == 0) {
+		*pass_as = OIDC_PASS_APP_INFO_AS_LATIN1;
+	} else if (_oidc_strcmp(arg, OIDC_PASS_CLAIMS_ENCODING_BASE64URL_STR)
+			== 0) {
+		*pass_as = OIDC_PASS_APP_INFO_AS_BASE64URL;
+	}
+
+	return NULL;
+}
+
 #define OIDC_UNAUTH_ACTION_AUTH_STR "auth"
 #define OIDC_UNAUTH_ACTION_PASS_STR "pass"
 #define OIDC_UNAUTH_ACTION_401_STR  "401"
@@ -1236,57 +1261,6 @@ const char *oidc_parse_info_hook_data(apr_pool_t *pool, const char *arg,
 	return NULL;
 }
 
-#define OIDC_TOKEN_BINDING_POLICY_DISABLED_STR "disabled"
-#define OIDC_TOKEN_BINDING_POLICY_OPTIONAL_STR "optional"
-#define OIDC_TOKEN_BINDING_POLICY_REQUIRED_STR "required"
-#define OIDC_TOKEN_BINDING_POLICY_ENFORCED_STR "enforced"
-
-const char *oidc_token_binding_policy2str(apr_pool_t *pool, int v) {
-	if (v == OIDC_TOKEN_BINDING_POLICY_DISABLED)
-		return OIDC_TOKEN_BINDING_POLICY_DISABLED;
-	if (v == OIDC_TOKEN_BINDING_POLICY_OPTIONAL)
-		return OIDC_TOKEN_BINDING_POLICY_OPTIONAL_STR;
-	if (v == OIDC_TOKEN_BINDING_POLICY_REQUIRED)
-		return OIDC_TOKEN_BINDING_POLICY_REQUIRED_STR;
-	if (v == OIDC_TOKEN_BINDING_POLICY_ENFORCED)
-		return OIDC_TOKEN_BINDING_POLICY_ENFORCED_STR;
-	return NULL;
-}
-
-/*
- * check token binding policy string value
- */
-const char *oidc_valid_token_binding_policy(apr_pool_t *pool, const char *arg) {
-	static char *options[] = {
-			OIDC_TOKEN_BINDING_POLICY_DISABLED_STR,
-			OIDC_TOKEN_BINDING_POLICY_OPTIONAL_STR,
-			OIDC_TOKEN_BINDING_POLICY_REQUIRED_STR,
-			OIDC_TOKEN_BINDING_POLICY_ENFORCED_STR,
-			NULL };
-	return oidc_valid_string_option(pool, arg, options);
-}
-
-/*
- * parse token binding policy
- */
-const char *oidc_parse_token_binding_policy(apr_pool_t *pool, const char *arg,
-		int *policy) {
-	const char *rv = oidc_valid_token_binding_policy(pool, arg);
-	if (rv != NULL)
-		return rv;
-
-	if (_oidc_strcmp(arg, OIDC_TOKEN_BINDING_POLICY_DISABLED_STR) == 0)
-		*policy = OIDC_TOKEN_BINDING_POLICY_DISABLED;
-	else if (_oidc_strcmp(arg, OIDC_TOKEN_BINDING_POLICY_OPTIONAL_STR) == 0)
-		*policy = OIDC_TOKEN_BINDING_POLICY_OPTIONAL;
-	else if (_oidc_strcmp(arg, OIDC_TOKEN_BINDING_POLICY_REQUIRED_STR) == 0)
-		*policy = OIDC_TOKEN_BINDING_POLICY_REQUIRED;
-	else if (_oidc_strcmp(arg, OIDC_TOKEN_BINDING_POLICY_ENFORCED_STR) == 0)
-		*policy = OIDC_TOKEN_BINDING_POLICY_ENFORCED;
-
-	return NULL;
-}
-
 #define OIDC_AUTH_REQUEST_METHOD_GET_STR  "GET"
 #define OIDC_AUTH_REQEUST_METHOD_POST_STR "POST"
 
@@ -1414,18 +1388,22 @@ const char* oidc_parse_x_forwarded_headers(apr_pool_t *pool, const char *arg,
 
 #define OIDC_PROXY_AUTH_BASIC          "basic"
 #define OIDC_PROXY_AUTH_DIGEST         "digest"
-#define OIDC_PROXY_AUTH_NEGOTIATE      "negotiate"
 #define OIDC_PROXY_AUTH_NTLM           "ntlm"
 #define OIDC_PROXY_AUTH_ANY            "any"
+#ifdef CURLAUTH_NEGOTIATE
+#define OIDC_PROXY_AUTH_NEGOTIATE      "negotiate"
+#endif
 
 const char* oidc_parse_outgoing_proxy_auth_type(apr_pool_t *pool,
 		const char *arg, unsigned long *auth_type) {
 	static char *options[] = {
 			OIDC_PROXY_AUTH_BASIC,
 			OIDC_PROXY_AUTH_DIGEST,
-			OIDC_PROXY_AUTH_NEGOTIATE,
 			OIDC_PROXY_AUTH_NTLM,
 			OIDC_PROXY_AUTH_ANY,
+#ifdef CURLAUTH_NEGOTIATE
+			OIDC_PROXY_AUTH_NEGOTIATE,
+#endif
 			NULL };
 	const char *rv = oidc_valid_string_option(pool, arg, options);
 	if (rv != NULL)
@@ -1435,12 +1413,14 @@ const char* oidc_parse_outgoing_proxy_auth_type(apr_pool_t *pool,
 		*auth_type = CURLAUTH_BASIC;
 	} else if (_oidc_strcmp(arg, OIDC_PROXY_AUTH_DIGEST) == 0) {
 		*auth_type = CURLAUTH_DIGEST;
-	} else if (_oidc_strcmp(arg, OIDC_PROXY_AUTH_NEGOTIATE) == 0) {
-		*auth_type = CURLAUTH_NEGOTIATE;
 	} else if (_oidc_strcmp(arg, OIDC_PROXY_AUTH_NTLM) == 0) {
 		*auth_type = CURLAUTH_NTLM;
 	} else if (_oidc_strcmp(arg, OIDC_PROXY_AUTH_ANY) == 0) {
 		*auth_type = CURLAUTH_ANY;
+#ifdef CURLAUTH_NEGOTIATE
+	} else if (_oidc_strcmp(arg, OIDC_PROXY_AUTH_NEGOTIATE) == 0) {
+		*auth_type = CURLAUTH_NEGOTIATE;
+#endif
 	}
 
 	return NULL;

@@ -115,8 +115,8 @@ static apr_status_t oidc_proto_generate_random_bytes(request_rec *r,
 /*
  * generate a random string value value of a specified length
  */
-apr_byte_t oidc_proto_generate_random_string(request_rec *r,
-		char **output, int len) {
+apr_byte_t oidc_proto_generate_random_string(request_rec *r, char **output,
+		int len) {
 	unsigned char *bytes = apr_pcalloc(r->pool, len);
 	if (oidc_proto_generate_random_bytes(r, bytes, len) != APR_SUCCESS) {
 		oidc_error(r, "oidc_proto_generate_random_bytes returned an error");
@@ -464,7 +464,7 @@ char* oidc_proto_create_request_object(request_rec *r,
 	json_decref(request_object_config);
 
 	oidc_debug(r, "serialized request object JWT header = \"%s\"",
-			oidc_proto_peek_jwt_header(r, serialized_request_object, NULL, NULL));
+			oidc_proto_peek_jwt_header(r, serialized_request_object, NULL, NULL, NULL));
 	oidc_debug(r, "serialized request object = \"%s\"",
 			serialized_request_object);
 
@@ -537,7 +537,8 @@ static void oidc_proto_add_request_param(request_rec *r,
 		}
 
 		/* ensure parameter variable to have a valid value */
-		if (_oidc_strcmp(request_object_type_str, OIDC_PROTO_REQUEST_OBJECT) == 0) {
+		if (_oidc_strcmp(request_object_type_str, OIDC_PROTO_REQUEST_OBJECT)
+				== 0) {
 			parameter = OIDC_PROTO_REQUEST_OBJECT;
 		} else if (_oidc_strcmp(request_object_type_str, OIDC_PROTO_REQUEST_URI)
 				!= 0) {
@@ -697,7 +698,7 @@ int oidc_proto_authorization_request(request_rec *r,
 		apr_table_setn(params, OIDC_PROTO_NONCE, nonce);
 
 	/* add PKCE code challenge if set */
-	if (code_challenge != NULL) {
+	if ((code_challenge != NULL) && (provider->pkce != NULL)) {
 		apr_table_setn(params, OIDC_PROTO_CODE_CHALLENGE, code_challenge);
 		apr_table_setn(params, OIDC_PROTO_CODE_CHALLENGE_METHOD,
 				provider->pkce->method);
@@ -769,12 +770,6 @@ int oidc_proto_authorization_request(request_rec *r,
 				provider->auth_request_method);
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
-
-	/* add a referred token binding request for the provider if enabled */
-	if ((provider->token_binding_policy > OIDC_TOKEN_BINDING_POLICY_DISABLED)
-			&& (oidc_util_get_provided_token_binding_id(r) != NULL))
-		oidc_util_hdr_err_out_add(r,
-				OIDC_HTTP_HDR_INCLUDE_REFERRED_TOKEN_BINDING_ID, "true");
 
 	/* cleanup */
 	oidc_proto_state_destroy(proto_state);
@@ -877,35 +872,6 @@ static apr_byte_t oidc_proto_pkce_verifier_s256(request_rec *r,
 }
 
 /*
- * PCKE "referred_tb" proto state
- */
-static apr_byte_t oidc_proto_pkce_state_referred_tb(request_rec *r,
-		char **state) {
-	*state = NULL;
-	return TRUE;
-}
-
-/*
- * PCKE "referred_tb" code_challenge
- */
-static apr_byte_t oidc_proto_pkce_challenge_referred_tb(request_rec *r,
-		const char *state, char **code_challenge) {
-	// state should be NULL
-	*code_challenge = OIDC_PKCE_METHOD_REFERRED_TB;
-	return TRUE;
-}
-
-/*
- * PCKE "referred_tb" code_verifier
- */
-static apr_byte_t oidc_proto_pkce_verifier_referred_tb(request_rec *r,
-		const char *state, char **code_verifier) {
-	const char *tb_id = oidc_util_get_provided_token_binding_id(r);
-	*code_verifier = tb_id ? apr_pstrdup(r->pool, tb_id) : NULL;
-	return TRUE;
-}
-
-/*
  * PKCE plain
  */
 oidc_proto_pkce_t oidc_pkce_plain = {
@@ -924,15 +890,6 @@ oidc_proto_pkce_t oidc_pkce_s256 = {
 		oidc_proto_pkce_verifier_s256,
 		oidc_proto_pkce_challenge_s256
 };
-
-/*
- * PKCE referred_tb
- */
-oidc_proto_pkce_t oidc_pkce_referred_tb = {
-		OIDC_PKCE_METHOD_REFERRED_TB,
-		oidc_proto_pkce_state_referred_tb,
-		oidc_proto_pkce_verifier_referred_tb,
-		oidc_proto_pkce_challenge_referred_tb };
 
 #define OIDC_PROTO_STATE_ISSUER          "i"
 #define OIDC_PROTO_STATE_ORIGINAL_URL    "ou"
@@ -966,7 +923,7 @@ void oidc_proto_state_destroy(oidc_proto_state_t *proto_state) {
 
 apr_byte_t oidc_proto_check_crypto_passphrase(request_rec *r, oidc_cfg *c,
 		const char *action) {
-	if (c->crypto_passphrase == NULL) {
+	if (c->crypto_passphrase.secret1 == NULL) {
 		oidc_error(r,
 				"cannot %s state cookie because " OIDCCryptoPassphrase " is not set; please check your OIDC Provider configuration as well or avoid using AuthType openid-connect",
 				action);
@@ -981,7 +938,7 @@ oidc_proto_state_t* oidc_proto_state_from_cookie(request_rec *r, oidc_cfg *c,
 	json_t *result = NULL;
 	if (oidc_proto_check_crypto_passphrase(r, c, "parse") == FALSE)
 		return NULL;
-	oidc_util_jwt_verify(r, c->crypto_passphrase, cookieValue, &s_payload);
+	oidc_util_jwt_verify(r, &c->crypto_passphrase, cookieValue, &s_payload);
 	oidc_util_decode_json_object(r, s_payload, &result);
 	return result;
 }
@@ -991,7 +948,7 @@ char* oidc_proto_state_to_cookie(request_rec *r, oidc_cfg *c,
 	char *cookieValue = NULL;
 	if (oidc_proto_check_crypto_passphrase(r, c, "create") == FALSE)
 		return NULL;
-	oidc_util_jwt_create(r, c->crypto_passphrase,
+	oidc_util_jwt_create(r, &c->crypto_passphrase,
 			oidc_util_encode_json_object(r, proto_state, JSON_COMPACT),
 			&cookieValue);
 	return cookieValue;
@@ -1321,7 +1278,7 @@ static apr_byte_t oidc_proto_validate_exp(request_rec *r, oidc_jwt_t *jwt,
  */
 apr_byte_t oidc_proto_validate_jwt(request_rec *r, oidc_jwt_t *jwt,
 		const char *iss, apr_byte_t exp_is_mandatory,
-		apr_byte_t iat_is_mandatory, int iat_slack, int token_binding_policy) {
+		apr_byte_t iat_is_mandatory, int iat_slack) {
 
 	if (iss != NULL) {
 
@@ -1350,11 +1307,6 @@ apr_byte_t oidc_proto_validate_jwt(request_rec *r, oidc_jwt_t *jwt,
 	if (oidc_proto_validate_iat(r, jwt, iat_is_mandatory, iat_slack) == FALSE)
 		return FALSE;
 
-	/* check the token binding ID in the JWT */
-	if (oidc_util_json_validate_cnf(r, jwt->payload.value.json,
-			token_binding_policy) == FALSE)
-		return FALSE;
-
 	return TRUE;
 }
 
@@ -1380,8 +1332,7 @@ static apr_byte_t oidc_proto_validate_idtoken(request_rec *r,
 	/* validate the ID Token JWT, requiring iss match, and valid exp + iat */
 	if (oidc_proto_validate_jwt(r, jwt,
 			provider->validate_issuer ? provider->issuer : NULL, TRUE, TRUE,
-					provider->idtoken_iat_slack,
-					provider->token_binding_policy) == FALSE)
+					provider->idtoken_iat_slack) == FALSE)
 		return FALSE;
 
 	/* check if the required-by-spec "sub" claim is present */
@@ -1508,13 +1459,14 @@ static apr_byte_t oidc_proto_get_key_from_jwks(request_rec *r, oidc_jwt_t *jwt,
  * get the keys from the (possibly cached) set of JWKs on the jwk_uri that corresponds with the key specified in the header
  */
 apr_byte_t oidc_proto_get_keys_from_jwks_uri(request_rec *r, oidc_cfg *cfg,
-		oidc_jwt_t *jwt, const oidc_jwks_uri_t *jwks_uri, int ssl_validate_server, apr_hash_t *keys,
-		apr_byte_t *force_refresh) {
+		oidc_jwt_t *jwt, const oidc_jwks_uri_t *jwks_uri,
+		int ssl_validate_server, apr_hash_t *keys, apr_byte_t *force_refresh) {
 
 	json_t *j_jwks = NULL;
 
 	/* get the set of JSON Web Keys for this provider (possibly by downloading them from the specified provider->jwk_uri) */
-	oidc_metadata_jwks_get(r, cfg, jwks_uri, ssl_validate_server, &j_jwks, force_refresh);
+	oidc_metadata_jwks_get(r, cfg, jwks_uri, ssl_validate_server, &j_jwks,
+			force_refresh);
 	if (j_jwks == NULL) {
 		oidc_error(r, "could not %s JSON Web Keys",
 				*force_refresh ? "refresh" : "get");
@@ -1542,8 +1494,8 @@ apr_byte_t oidc_proto_get_keys_from_jwks_uri(request_rec *r, oidc_cfg *cfg,
 				"could not find a key in the cached JSON Web Keys, doing a forced refresh in case keys were rolled over");
 		/* get the set of JSON Web Keys forcing a fresh download from the specified JWKs URI */
 		*force_refresh = TRUE;
-		return oidc_proto_get_keys_from_jwks_uri(r, cfg, jwt, jwks_uri, ssl_validate_server, keys,
-				force_refresh);
+		return oidc_proto_get_keys_from_jwks_uri(r, cfg, jwt, jwks_uri,
+				ssl_validate_server, keys, force_refresh);
 	}
 
 	oidc_debug(r,
@@ -1635,7 +1587,7 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg *cfg, oidc_jwt_t *jwt,
  * return the compact-encoded JWT header contents
  */
 char* oidc_proto_peek_jwt_header(request_rec *r,
-		const char *compact_encoded_jwt, char **alg, char **enc) {
+		const char *compact_encoded_jwt, char **alg, char **enc, char **kid) {
 	char *input = NULL, *result = NULL;
 	char *p = strstr(compact_encoded_jwt ? compact_encoded_jwt : "", ".");
 	if (p == NULL) {
@@ -1661,6 +1613,10 @@ char* oidc_proto_peek_jwt_header(request_rec *r,
 				*enc = apr_pstrdup(r->pool,
 						json_string_value(
 								json_object_get(json, CJOSE_HDR_ENC)));
+			if (kid)
+				*kid = apr_pstrdup(r->pool,
+						json_string_value(
+								json_object_get(json, CJOSE_HDR_KID)));
 		}
 		json_decref(json);
 	}
@@ -1676,7 +1632,7 @@ apr_byte_t oidc_proto_parse_idtoken(request_rec *r, oidc_cfg *cfg,
 
 	char *alg = NULL;
 	oidc_debug(r, "enter: id_token header=%s",
-			oidc_proto_peek_jwt_header(r, id_token, &alg, NULL));
+			oidc_proto_peek_jwt_header(r, id_token, &alg, NULL, NULL));
 	apr_hash_t *decryption_keys = NULL;
 
 	char buf[APR_RFC822_DATE_LEN + 1];
@@ -2060,7 +2016,7 @@ static apr_byte_t oidc_proto_token_endpoint_request(request_rec *r,
 	/* send the refresh request to the token endpoint */
 	if (oidc_util_http_post_form(r, provider->token_endpoint_url, params,
 			basic_auth, bearer_auth, provider->ssl_validate_server, &response,
-			cfg->http_timeout_long, &cfg->outgoing_proxy,
+			&cfg->http_timeout_long, &cfg->outgoing_proxy,
 			oidc_dir_cfg_pass_cookies(r),
 			oidc_util_get_full_path(r->pool,
 					provider->token_endpoint_tls_client_cert),
@@ -2177,7 +2133,7 @@ static apr_byte_t oidc_user_info_response_validate(request_rec *r,
 			|| (provider->userinfo_encrypted_response_alg != NULL)
 			|| (provider->userinfo_encrypted_response_enc != NULL)) {
 		oidc_debug(r, "JWT header=%s",
-				oidc_proto_peek_jwt_header(r, *response, &alg, NULL));
+				oidc_proto_peek_jwt_header(r, *response, &alg, NULL, NULL));
 	}
 
 	oidc_jose_error_t err;
@@ -2302,7 +2258,7 @@ static apr_byte_t oidc_proto_resolve_composite_claims(request_rec *r,
 				if ((access_token != NULL) && (endpoint != NULL)) {
 					oidc_util_http_get(r, endpoint,
 							NULL, NULL, access_token, cfg->provider.ssl_validate_server,
-							&s_json, cfg->http_timeout_long,
+							&s_json, &cfg->http_timeout_long,
 							&cfg->outgoing_proxy, oidc_dir_cfg_pass_cookies(r),
 							NULL, NULL, NULL);
 				}
@@ -2368,7 +2324,7 @@ apr_byte_t oidc_proto_resolve_userinfo(request_rec *r, oidc_cfg *cfg,
 	if (provider->userinfo_token_method == OIDC_USER_INFO_TOKEN_METHOD_HEADER) {
 		if (oidc_util_http_get(r, provider->userinfo_endpoint_url,
 				NULL, NULL, access_token, provider->ssl_validate_server, response,
-				cfg->http_timeout_long, &cfg->outgoing_proxy,
+				&cfg->http_timeout_long, &cfg->outgoing_proxy,
 				oidc_dir_cfg_pass_cookies(r), NULL, NULL, NULL) == FALSE)
 			return FALSE;
 	} else if (provider->userinfo_token_method
@@ -2377,7 +2333,7 @@ apr_byte_t oidc_proto_resolve_userinfo(request_rec *r, oidc_cfg *cfg,
 		apr_table_setn(params, OIDC_PROTO_ACCESS_TOKEN, access_token);
 		if (oidc_util_http_post_form(r, provider->userinfo_endpoint_url, params,
 				NULL, NULL, provider->ssl_validate_server, response,
-				cfg->http_timeout_long, &cfg->outgoing_proxy,
+				&cfg->http_timeout_long, &cfg->outgoing_proxy,
 				oidc_dir_cfg_pass_cookies(r), NULL, NULL, NULL) == FALSE)
 			return FALSE;
 	} else {
@@ -2442,7 +2398,7 @@ static apr_byte_t oidc_proto_webfinger_discovery(request_rec *r, oidc_cfg *cfg,
 	char *response = NULL;
 	if (oidc_util_http_get(r, url, params, NULL, NULL,
 			cfg->provider.ssl_validate_server, &response,
-			cfg->http_timeout_short, &cfg->outgoing_proxy,
+			&cfg->http_timeout_short, &cfg->outgoing_proxy,
 			oidc_dir_cfg_pass_cookies(r), NULL, NULL, NULL) == FALSE) {
 		/* errors will have been logged by now */
 		return FALSE;
