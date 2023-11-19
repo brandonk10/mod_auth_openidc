@@ -162,6 +162,7 @@ APLOG_USE_MODULE(auth_openidc);
 /* pass as re-signed JWT including id_token claims */
 #define OIDC_PASS_USERINFO_AS_SIGNED_JWT   4
 
+#define OIDC_PASS_APP_INFO_AS_NONE      0
 #define OIDC_PASS_APP_INFO_AS_BASE64URL 1
 #define OIDC_PASS_APP_INFO_AS_LATIN1    2
 
@@ -267,11 +268,6 @@ APLOG_USE_MODULE(auth_openidc);
 /* https://www.ietf.org/id/draft-ietf-oauth-mtls-12 */
 #define OIDC_TB_CFG_FINGERPRINT_ENV_VAR  "TB_SSL_CLIENT_CERT_FINGERPRINT"
 
-#define OIDC_TOKEN_BINDING_POLICY_DISABLED  0
-#define OIDC_TOKEN_BINDING_POLICY_OPTIONAL  1
-#define OIDC_TOKEN_BINDING_POLICY_REQUIRED  2
-#define OIDC_TOKEN_BINDING_POLICY_ENFORCED  3
-
 #define OIDC_STATE_INPUT_HEADERS_USER_AGENT 1
 #define OIDC_STATE_INPUT_HEADERS_X_FORWARDED_FOR 2
 
@@ -293,7 +289,6 @@ typedef struct oidc_proto_pkce_t {
 
 extern oidc_proto_pkce_t oidc_pkce_plain;
 extern oidc_proto_pkce_t oidc_pkce_s256;
-extern oidc_proto_pkce_t oidc_pkce_referred_tb;
 
 typedef struct oidc_jwks_uri_t {
 	char *uri;
@@ -350,7 +345,6 @@ typedef struct oidc_provider_t {
 	int userinfo_token_method;
 	char *request_object;
 	int auth_request_method;
-	int token_binding_policy;
 
 	int issuer_specific_redirect_uri;
 } oidc_provider_t ;
@@ -389,7 +383,6 @@ typedef struct oidc_oauth_t {
 	apr_hash_t *verify_shared_keys;
 	char *verify_jwks_uri;
 	apr_array_header_t *verify_public_keys;
-	int access_token_binding_policy;
 } oidc_oauth_t;
 
 typedef struct oidc_outgoing_proxy_t {
@@ -397,6 +390,18 @@ typedef struct oidc_outgoing_proxy_t {
 	const char *username_password;
 	unsigned long auth_type;
 } oidc_outgoing_proxy_t;
+
+typedef struct oidc_http_timeout_t {
+	int request_timeout;
+	int connect_timeout;
+	int retries;
+	apr_time_t retry_interval;
+} oidc_http_timeout_t;
+
+typedef struct oidc_crypto_passphrase_t {
+	char *secret1;
+	char *secret2;
+} oidc_crypto_passphrase_t;
 
 typedef struct oidc_cfg {
 	/* indicates whether this is a derived config, merged from a base one */
@@ -466,8 +471,8 @@ typedef struct oidc_cfg {
 #endif
 	int cache_encrypt;
 
-	int http_timeout_long;
-	int http_timeout_short;
+	oidc_http_timeout_t http_timeout_long;
+	oidc_http_timeout_t http_timeout_short;
 	int state_timeout;
 	int max_number_of_state_cookies;
 	int delete_oldest_state_cookies;
@@ -483,7 +488,7 @@ typedef struct oidc_cfg {
 
 	oidc_outgoing_proxy_t outgoing_proxy;
 
-	char *crypto_passphrase;
+	oidc_crypto_passphrase_t crypto_passphrase;
 
 	int provider_metadata_refresh_interval;
 
@@ -499,6 +504,7 @@ typedef struct oidc_cfg {
 	char *logout_x_frame_options;
 	apr_byte_t x_forwarded_headers;
 	int action_on_userinfo_error;
+	oidc_cache_mutex_t *refresh_mutex;
 } oidc_cfg;
 
 void oidc_pre_config_init();
@@ -619,9 +625,6 @@ apr_byte_t oidc_oauth_get_bearer_token(request_rec *r, const char **access_token
 #define OIDC_CLAIM_C_HASH          "c_hash"
 #define OIDC_CLAIM_RFP             "rfp"
 #define OIDC_CLAIM_TARGET_LINK_URI "target_link_uri"
-#define OIDC_CLAIM_CNF             "cnf"
-#define OIDC_CLAIM_CNF_TBH         "tbh"
-#define OIDC_CLAIM_CNF_X5T_S256    "x5t#S256"
 #define OIDC_CLAIM_SID             "sid"
 #define OIDC_CLAIM_EVENTS          "events"
 
@@ -715,7 +718,7 @@ void oidc_proto_state_set_timestamp_now(oidc_proto_state_t *proto_state);
 
 apr_byte_t oidc_proto_token_endpoint_auth(request_rec *r, oidc_cfg *cfg, const char *token_endpoint_auth, const char *client_id, const char *client_secret, const apr_array_header_t *client_keys, const char *audience, apr_table_t *params, const char *bearer_access_token, char **basic_auth_str, char **bearer_auth_str);
 
-char *oidc_proto_peek_jwt_header(request_rec *r, const char *jwt, char **alg, char **enc);
+char *oidc_proto_peek_jwt_header(request_rec *r, const char *jwt, char **alg, char **enc, char **kid);
 int oidc_proto_authorization_request(request_rec *r, struct oidc_provider_t *provider, const char *login_hint, const char *redirect_uri, const char *state, oidc_proto_state_t *proto_state, const char *id_token_hint, const char *code_challenge, const char *auth_request_params, const char *path_scope);
 apr_byte_t oidc_proto_is_post_authorization_response(request_rec *r, oidc_cfg *cfg);
 apr_byte_t oidc_proto_is_redirect_authorization_response(request_rec *r, oidc_cfg *cfg);
@@ -729,7 +732,7 @@ apr_array_header_t *oidc_proto_supported_flows(apr_pool_t *pool);
 apr_byte_t oidc_proto_flow_is_supported(apr_pool_t *pool, const char *flow);
 apr_byte_t oidc_proto_validate_authorization_response(request_rec *r, const char *response_type, const char *requested_response_mode, char **code, char **id_token, char **access_token, char **token_type, const char *used_response_mode);
 apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg *cfg, oidc_jwt_t *jwt, const oidc_jwks_uri_t *jwks_uri, int ssl_validate_server, apr_hash_t *symmetric_keys, const char *alg);
-apr_byte_t oidc_proto_validate_jwt(request_rec *r, oidc_jwt_t *jwt, const char *iss, apr_byte_t exp_is_mandatory, apr_byte_t iat_is_mandatory, int iat_slack, int token_binding_policy);
+apr_byte_t oidc_proto_validate_jwt(request_rec *r, oidc_jwt_t *jwt, const char *iss, apr_byte_t exp_is_mandatory, apr_byte_t iat_is_mandatory, int iat_slack);
 apr_byte_t oidc_proto_generate_nonce(request_rec *r, char **nonce, int len);
 apr_byte_t oidc_proto_validate_aud_and_azp(request_rec *r, oidc_cfg *cfg, oidc_provider_t *provider, oidc_jwt_payload_t *id_token_payload);
 
@@ -844,9 +847,9 @@ char *oidc_normalize_header_name(const request_rec *r, const char *str);
 apr_byte_t oidc_util_request_is_secure(request_rec *r, const oidc_cfg *c);
 void oidc_util_set_cookie(request_rec *r, const char *cookieName, const char *cookieValue, apr_time_t expires, const char *ext);
 char *oidc_util_get_cookie(request_rec *r, const char *cookieName);
-apr_byte_t oidc_util_http_get(request_rec *r, const char *url, const apr_table_t *params, const char *basic_auth, const char *bearer_token, int ssl_validate_server, char **response, int timeout, const oidc_outgoing_proxy_t *outgoing_proxy, apr_array_header_t *pass_cookies, const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd);
-apr_byte_t oidc_util_http_post_form(request_rec *r, const char *url, const apr_table_t *params, const char *basic_auth, const char *bearer_token, int ssl_validate_server, char **response, int timeout, const oidc_outgoing_proxy_t *outgoing_proxy, apr_array_header_t *pass_cookies, const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd);
-apr_byte_t oidc_util_http_post_json(request_rec *r, const char *url, json_t *data, const char *basic_auth, const char *bearer_token, int ssl_validate_server, char **response, int timeout, const oidc_outgoing_proxy_t *outgoing_proxy, apr_array_header_t *pass_cookies, const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd);
+apr_byte_t oidc_util_http_get(request_rec *r, const char *url, const apr_table_t *params, const char *basic_auth, const char *bearer_token, int ssl_validate_server, char **response, oidc_http_timeout_t *http_timeout, const oidc_outgoing_proxy_t *outgoing_proxy, apr_array_header_t *pass_cookies, const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd);
+apr_byte_t oidc_util_http_post_form(request_rec *r, const char *url, const apr_table_t *params, const char *basic_auth, const char *bearer_token, int ssl_validate_server, char **response, oidc_http_timeout_t *http_timeout, const oidc_outgoing_proxy_t *outgoing_proxy, apr_array_header_t *pass_cookies, const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd);
+apr_byte_t oidc_util_http_post_json(request_rec *r, const char *url, json_t *data, const char *basic_auth, const char *bearer_token, int ssl_validate_server, char **response, oidc_http_timeout_t *http_timeout, const oidc_outgoing_proxy_t *outgoing_proxy, apr_array_header_t *pass_cookies, const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd);
 apr_byte_t oidc_util_request_matches_url(request_rec *r, const char *url);
 apr_byte_t oidc_util_request_has_parameter(request_rec *r, const char* param);
 apr_byte_t oidc_util_get_request_parameter(request_rec *r, char *name, char **value);
@@ -882,13 +885,12 @@ apr_byte_t oidc_util_regexp_first_match(apr_pool_t *pool, const char *input, con
 apr_byte_t oidc_util_json_merge(request_rec *r, json_t *src, json_t *dst);
 int oidc_util_cookie_domain_valid(const char *hostname, char *cookie_domain);
 apr_byte_t oidc_util_hash_string_and_base64url_encode(request_rec *r, const char *openssl_hash_algo, const char *input, char **output);
-apr_byte_t oidc_util_jwt_create(request_rec *r, const char *secret, const char *s_payload, char **compact_encoded_jwt);
-apr_byte_t oidc_util_jwt_verify(request_rec *r, const char *secret, const char *compact_encoded_jwt, char **s_payload);
+apr_byte_t oidc_util_jwt_create(request_rec *r, const oidc_crypto_passphrase_t *passphrase, const char *s_payload, char **compact_encoded_jwt);
+apr_byte_t oidc_util_jwt_verify(request_rec *r, const oidc_crypto_passphrase_t *passphrase, const char *compact_encoded_jwt, char **s_payload);
 char *oidc_util_get_chunked_cookie(request_rec *r, const char *cookieName, int cookie_chunk_size);
 void oidc_util_set_chunked_cookie(request_rec *r, const char *cookieName, const char *cookieValue, apr_time_t expires, int chunkSize, const char *ext);
 apr_byte_t oidc_util_create_symmetric_key(request_rec *r, const char *client_secret, unsigned int r_key_len, const char *hash_algo, apr_byte_t set_kid, oidc_jwk_t **jwk);
 apr_hash_t * oidc_util_merge_symmetric_key(apr_pool_t *pool, const apr_array_header_t *keys, oidc_jwk_t *jwk);
-const char *oidc_util_get_provided_token_binding_id(const request_rec *r);
 char *oidc_util_http_query_encoded_url(request_rec *r, const char *url, const apr_table_t *params);
 char *oidc_util_get_full_path(apr_pool_t *pool, const char *abs_or_rel_filename);
 apr_byte_t oidc_enabled(request_rec *r);
@@ -923,7 +925,6 @@ const char *oidc_util_apr_expr_exec(request_rec *r, const oidc_apr_expr_t *expr,
 #define OIDC_HTTP_HDR_EXPIRES                           "Expires"
 #define OIDC_HTTP_HDR_X_FRAME_OPTIONS                   "X-Frame-Options"
 #define OIDC_HTTP_HDR_WWW_AUTHENTICATE                  "WWW-Authenticate"
-#define OIDC_HTTP_HDR_INCLUDE_REFERRED_TOKEN_BINDING_ID "Include-Referred-Token-Binding-ID"
 
 #define OIDC_HTTP_HDR_VAL_XML_HTTP_REQUEST "XMLHttpRequest"
 #define OIDC_HTTP_HDR_VAL_NAVIGATE         "navigate"
@@ -950,7 +951,6 @@ void oidc_util_hdr_out_location_set(const request_rec *r, const char *value);
 const char *oidc_util_hdr_out_location_get(const request_rec *r);
 void oidc_util_hdr_err_out_add(const request_rec *r, const char *name, const char *value);
 apr_byte_t oidc_util_hdr_in_accept_contains(const request_rec *r, const char *needle);
-apr_byte_t oidc_util_json_validate_cnf(request_rec *r, json_t *jwt, int token_binding_policy);
 apr_byte_t oidc_util_html_send_in_template(request_rec *r, const char *filename, char **static_template_content, const char *arg1, int arg1_esc, const char *arg2, int arg2_esc, int status_code);
 
 // oidc_metadata.c
