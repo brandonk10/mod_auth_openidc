@@ -197,6 +197,47 @@ const char *oidc_cfg_parse_int_min_max(apr_pool_t *pool, const char *arg, int *i
 }
 
 /*
+ * parse a timeout string via ap_timeout_parameter_parse into an
+ * apr_interval_time_t if it is in a valid min/max range
+ */
+const char *oidc_cfg_parse_timeout_min_max(apr_pool_t *pool, const char *arg, apr_interval_time_t *timeout_value,
+					   apr_interval_time_t min_value, apr_interval_time_t max_value) {
+#if AP_MODULE_MAGIC_AT_LEAST(20080920, 2)
+	apr_interval_time_t timeout;
+#else
+	char *endptr;
+	apr_int64_t timeout;
+#endif
+
+#if AP_MODULE_MAGIC_AT_LEAST(20080920, 2)
+	if (ap_timeout_parameter_parse(arg, &timeout, "s") != APR_SUCCESS) {
+		return apr_psprintf(pool, "not a valid timeout parameter: %s", arg);
+	}
+#else
+	timeout = apr_strtoi64(arg, &endptr, 10);
+	if (errno != 0 || *endptr != '\0') {
+		return apr_psprintf(pool, "not a valid timeout parameter: %s", arg);
+	}
+	timeout = apr_time_from_sec(timeout);
+#endif
+
+	if (timeout < min_value) {
+		return apr_psprintf(pool,
+				    "timeout value %" APR_TIME_T_FMT
+				    " is smaller than the minimum allowed value %" APR_TIME_T_FMT,
+				    timeout, min_value);
+	}
+	if (timeout > max_value) {
+		return apr_psprintf(pool,
+				    "timeout value %" APR_TIME_T_FMT
+				    " is greater than the maximum allowed value %" APR_TIME_T_FMT,
+				    timeout, max_value);
+	}
+	*timeout_value = (int)timeout;
+	return NULL;
+}
+
+/*
  * check if a string is a valid URL starting with either scheme1 or scheme2 (if not NULL)
  */
 static const char *oidc_cfg_parse_is_valid_url_scheme(apr_pool_t *pool, const char *arg, const char *scheme1,
