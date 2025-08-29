@@ -273,7 +273,7 @@ apr_byte_t oidc_util_url_cur_is_secure(request_rec *r, oidc_cfg_t *c) {
  * return absolute Redirect URI
  */
 const char *oidc_util_url_redirect_uri(request_rec *r, oidc_cfg_t *cfg) {
-	return oidc_util_url_abs(r, cfg, oidc_cfg_redirect_uri_get(cfg));
+	return oidc_util_url_abs(r, cfg, oidc_cfg_dir_redirect_uri_get(r));
 }
 
 /*

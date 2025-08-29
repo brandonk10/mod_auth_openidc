@@ -467,7 +467,7 @@ int oidc_logout(request_rec *r, oidc_cfg_t *c, oidc_session_t *session) {
 
 	if ((url == NULL) || (_oidc_strcmp(url, "") == 0)) {
 
-		url = apr_pstrdup(r->pool, oidc_util_url_abs(r, c, oidc_cfg_default_slo_url_get(c)));
+		url = apr_pstrdup(r->pool, oidc_util_url_abs(r, c, oidc_cfg_dir_default_slo_url_get(r)));
 
 	} else {
 

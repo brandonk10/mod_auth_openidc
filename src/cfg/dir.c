@@ -49,6 +49,12 @@
  * directory related configuration
  */
 struct oidc_dir_cfg_t {
+        /* the redirect URI as configured with the OpenID Connect OP's that we talk to */
+        char *redirect_uri;
+        /* (optional) default URL for 3rd-party initiated SSO */
+        char *default_sso_url;
+        /* (optional) default URL to go to after logout */
+        char *default_slo_url;
 	char *discover_url;
 	char *cookie_path;
 	char *cookie;
@@ -464,6 +470,15 @@ OIDC_CFG_DIR_MEMBER_FUNC_STR(state_cookie_prefix, const char *, OIDC_DEFAULT_STA
 OIDC_CFG_DIR_MEMBER_FUNC_PTR(discover_url, const char *,
 			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->discover_url), NULL)
 
+OIDC_CFG_DIR_MEMBER_FUNC_PTR(redirect_uri, const char *,
+			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->redirect_uri), NULL)
+
+OIDC_CFG_DIR_MEMBER_FUNC_PTR(default_slo_url, const char *,
+			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->default_slo_url), NULL)
+
+OIDC_CFG_DIR_MEMBER_FUNC_PTR(default_sso_url, const char *,
+			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->default_sso_url), NULL)
+
 /* default name of the session cookie */
 #define OIDC_DEFAULT_COOKIE "mod_auth_openidc_session"
 OIDC_CFG_DIR_MEMBER_FUNC_STR(cookie, const char *, OIDC_DEFAULT_COOKIE)
@@ -654,6 +669,9 @@ void *oidc_cfg_dir_config_merge(apr_pool_t *pool, void *BASE, void *ADD) {
 	oidc_dir_cfg_t *c = apr_pcalloc(pool, sizeof(oidc_dir_cfg_t));
 	oidc_dir_cfg_t *base = BASE;
 	oidc_dir_cfg_t *add = ADD;
+        c->redirect_uri = add->redirect_uri != NULL ? add->redirect_uri : base->redirect_uri;
+        c->default_sso_url = add->default_sso_url != NULL ? add->default_sso_url : base->default_sso_url;
+        c->default_slo_url = add->default_slo_url != NULL ? add->default_slo_url : base->default_slo_url;
 	c->discover_url = add->discover_url != NULL ? add->discover_url : base->discover_url;
 	c->cookie = add->cookie != NULL ? add->cookie : base->cookie;
 	c->cookie_path = add->cookie_path != NULL ? add->cookie_path : base->cookie_path;

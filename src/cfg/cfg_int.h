@@ -115,15 +115,8 @@ struct oidc_cfg_cache_t {
 
 struct oidc_cfg_t {
 
-	/* the redirect URI as configured with the OpenID Connect OP's that we talk to */
-	char *redirect_uri;
 	/* secret key(s) used for encryption */
 	oidc_crypto_passphrase_t crypto_passphrase;
-
-	/* (optional) default URL for 3rd-party initiated SSO */
-	char *default_sso_url;
-	/* (optional) default URL to go to after logout */
-	char *default_slo_url;
 
 	/* Javascript template to preserve POST data */
 	char *post_preserve_template;
