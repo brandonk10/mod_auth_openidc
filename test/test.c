@@ -1892,9 +1892,9 @@ static request_rec *test_setup(apr_pool_t *pool) {
 							 "https://idp.example.com/authorize");
 	oidc_cfg_provider_client_id_set(pool, oidc_cfg_provider_get(cfg), "client_id");
 
-	cfg->redirect_uri = "https://www.example.com/protected/";
 
 	oidc_dir_cfg_t *d_cfg = oidc_cfg_dir_config_create(request->pool, NULL);
+	d_cfg->redirect_uri = "https://www.example.com/protected/";
 
 	// coverity[suspicious_sizeof]
 	request->server->module_config = apr_pcalloc(request->pool, sizeof(void *) * kEls);
