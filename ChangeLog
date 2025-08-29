@@ -1,3 +1,31 @@
+08/27/2025
+- improve Redis (and Metrics) performance on process MPMs by using
+  apr_thread_mutex_t (instead of apr_proc_mutex_t) for locking; see #1340
+
+08/22/2025
+- test: make test_cfg oidc_cmd_cache_memcache_ttl_set 180 work on Apache 2.2 
+- bump to 2.4.18.1dev
+
+08/21/2025
+- add Valgrind target to Makefile and to Github Build action
+- release 2.4.18
+
+08/20/2025
+- revise test/check and code coverage functions
+- revise autoconf/automake, split over subdirs now
+- add tests for memcache TTL
+- fix check OIDC_CONFIG_POS_TIMEOUT_UNSET for memcache TTL getter; #1345
+- bump to 2.4.18dev
+
+08/18/2025
+- fix parsing the value set via OIDCMemCacheConnectionsTTL and interpret it in
+  seconds correctly now (instead of microseconds); see #1345; thanks @rpluem
+
+08/15/2025
+- use the server process pool for static variable allocation rather than the pconf pool
+  to prevents possible segmentation faults after (graceful) restarting the same process
+- bump to 2.4.17.3dev
+
 07/28/2025
 - release 2.4.17.2
 
@@ -5,7 +33,7 @@
 - fix regression in 2.4.17 for processing unauthenticated requests that generate HTML
   content, e.g. `OIDCProviderAuthRequestMethod POST` and `OIDCPreservePost On`
   when protected with `Require claim` statements rather than just `Require valid-user`.
- 
+
 07/15/2025
 - support the use of Elliptic Curve keys for private_key_jwt authentication at
   the token- and introspection endpoints and make the signing algorithm configurable
