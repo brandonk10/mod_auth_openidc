@@ -119,7 +119,7 @@ static int TST_RC;
 		return message;
 
 struct oidc_dir_cfg_t {
-        /* the redirect URI as configured with the OpenID Connect OP's that we >
+        /* the redirect URI as configured with the OpenID Connect OP's that we */
         char *redirect_uri;
         /* (optional) default URL for 3rd-party initiated SSO */
         char *default_sso_url;
