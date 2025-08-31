@@ -52,43 +52,6 @@
 #include <apr_base64.h>
 #include <openssl/pem.h>
 
-struct oidc_dir_cfg_t {
-        /* the redirect URI as configured with the OpenID Connect OP's that we */
-        char *redirect_uri;
-        /* (optional) default URL for 3rd-party initiated SSO */
-        char *default_sso_url;
-        /* (optional) default URL to go to after logout */
-        char *default_slo_url;
-        char *discover_url;
-        char *cookie_path;
-        char *cookie;
-        char *authn_header;
-        int unauth_action;
-        int unautz_action;
-        char *unauthz_arg;
-        apr_array_header_t *pass_cookies;
-        apr_array_header_t *strip_cookies;
-        int pass_info_in;
-        int pass_info_encoding;
-        int oauth_accept_token_in;
-        apr_hash_t *oauth_accept_token_options;
-     int oauth_token_introspect_interval;
-        int preserve_post;
-        int pass_access_token;
-        int pass_refresh_token;
-        oidc_apr_expr_t *path_auth_request_expr;
-        oidc_apr_expr_t *path_scope_expr;
-        oidc_apr_expr_t *unauth_expression;
-        oidc_apr_expr_t *userinfo_claims_expr;
-        int refresh_access_token_before_expiry;
-        int action_on_error_refresh;
-        int action_on_userinfo_refresh;
-        char *state_cookie_prefix;
-        apr_array_header_t *pass_userinfo_as;
-        int pass_idtoken_as;
-};
-
-
 int usage(int argc, char **argv, const char *msg) {
 	fprintf(stderr, "Usage: %s %s\n", argv[0],
 		msg ? msg
