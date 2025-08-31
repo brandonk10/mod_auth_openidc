@@ -1417,7 +1417,7 @@ static int oidc_check_config_error(server_rec *s, const char *config_str) {
 static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg_t *c) {
 
 	apr_uri_t r_uri;
-	apr_byte_t redirect_uri_is_relative;
+	//apr_byte_t redirect_uri_is_relative;
 
 	if ((oidc_cfg_metadata_dir_get(c) == NULL) &&
 	    (oidc_cfg_provider_issuer_get(oidc_cfg_provider_get(c)) == NULL) &&
@@ -1472,10 +1472,10 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg_t *c) {
 //	}
 
 	if (oidc_cfg_cookie_domain_get(c) != NULL) {
-		if (redirect_uri_is_relative) {
+		/*if (redirect_uri_is_relative) {
 			oidc_swarn(s, "if the configured " OIDCRedirectURI " is relative, " OIDCCookieDomain
 				      " SHOULD be empty");
-		} else if (!oidc_util_cookie_domain_valid(r_uri.hostname, oidc_cfg_cookie_domain_get(c))) {
+		} else*/ if (!oidc_util_cookie_domain_valid(r_uri.hostname, oidc_cfg_cookie_domain_get(c))) {
 			oidc_serror(s,
 				    "the domain (%s) configured in " OIDCCookieDomain
 				    " does not match the URL hostname (%s) of the configured " OIDCRedirectURI
