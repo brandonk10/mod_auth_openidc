@@ -49,7 +49,13 @@
 START_TEST(test_util_base64url_encode) {
 	int len = -1;
 	char *dst = NULL;
-	const char *src = "test";
+	const char *src = NULL;
+
+	len = oidc_util_base64url_encode(oidc_test_request_get(), &dst, NULL, 0, 1);
+	ck_assert_ptr_null(dst);
+	ck_assert_int_eq(len, -1);
+
+	src = "test";
 	len = oidc_util_base64url_encode(oidc_test_request_get(), &dst, src, _oidc_strlen(src), 1);
 	ck_assert_msg(dst != NULL, "dst value is NULL");
 	ck_assert_int_eq(len, 6);
@@ -69,6 +75,16 @@ START_TEST(test_util_base64_decode) {
 	const char *input = "dGVzdA==";
 	char *output = NULL;
 	int len = -1;
+
+	rv = oidc_util_base64_decode(oidc_test_pool_get(), NULL, &output, &len);
+	ck_assert_ptr_nonnull(rv);
+	ck_assert_ptr_null(output);
+	ck_assert_int_eq(len, -1);
+
+	rv = oidc_util_base64_decode(oidc_test_pool_get(), "\\", &output, &len);
+	ck_assert_ptr_nonnull(rv);
+	ck_assert_int_eq(len, 0);
+
 	rv = oidc_util_base64_decode(oidc_test_pool_get(), input, &output, &len);
 	ck_assert_msg(rv == NULL, "return value is not NULL");
 	ck_assert_int_eq(len, 4);
@@ -78,12 +94,200 @@ END_TEST
 
 START_TEST(test_util_base64url_decode) {
 	int len = -1;
-	char *src = "dGVzdA==";
+	char *src = "c3ViamVjdHM_X2Q9MQ-Tl5u,";
 	char *dst = NULL;
 	len = oidc_util_base64url_decode(oidc_test_pool_get(), &dst, src);
 	ck_assert_msg(dst != NULL, "dst value is NULL");
-	ck_assert_int_eq(len, 4);
-	ck_assert_str_eq(dst, "test");
+	ck_assert_int_eq(len, 17);
+	// TODO: need binary compare
+	// ck_assert_str_eq(dst, "subjects?_d=1���");
+}
+END_TEST
+
+START_TEST(test_util_appinfo_set) {
+	apr_byte_t rc = FALSE;
+	json_t *claims = NULL;
+	request_rec *r = oidc_test_request_get();
+
+	rc = oidc_util_json_decode_object(r,
+					  "{"
+					  "\"simple\":\"hans\","
+					  "\"name\": \"GÜnther\","
+					  "\"dagger\": \"D†gÿger\","
+					  "\"anarr\" : [ false, \"hans\", \"piet\", true, {} ],"
+					  "\"names\" : [ \"hans\", \"piet\" ],"
+					  "\"abool\": true,"
+					  "\"anint\": 5,"
+					  "\"lint\": 111111111111111,"
+					  "\"areal\": 1.5,"
+					  "\"anobj\" : { \"hans\": \"piet\", \"abool\": false },"
+					  "\"anull\": null"
+					  "}",
+					  &claims);
+	ck_assert_int_eq(rc, TRUE);
+
+	oidc_util_appinfo_set_all(r, NULL, "OIDC_CLAIM_", ",", OIDC_APPINFO_PASS_HEADERS, OIDC_APPINFO_ENCODING_NONE);
+
+	oidc_util_appinfo_set_all(r, claims, "OIDC_CLAIM_", ",", OIDC_APPINFO_PASS_HEADERS, OIDC_APPINFO_ENCODING_NONE);
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_simple"), "hans");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_name"), "G\u00DCnther");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_dagger"), "D\u2020gÿger");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_anarr"), "0,hans,piet,1");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_names"), "hans,piet");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_abool"), "1");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_anint"), "5");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_lint"), "111111111111111");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_areal"), "1.5");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_anobj"), "{\"hans\":\"piet\",\"abool\":false}");
+
+	ck_assert_ptr_null(apr_table_get(r->headers_in, "OIDC_CLAIM_anull"));
+	ck_assert_ptr_null(apr_table_get(r->subprocess_env, "OIDC_CLAIM_names"));
+
+	oidc_util_appinfo_set_all(r, claims, "MYPREFIX_", "#", OIDC_APPINFO_PASS_HEADERS | OIDC_APPINFO_PASS_ENVVARS,
+				  OIDC_APPINFO_ENCODING_NONE);
+	ck_assert_str_eq(apr_table_get(r->headers_in, "MYPREFIX_simple"), "hans");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "MYPREFIX_name"), "G\u00DCnther");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "MYPREFIX_dagger"), "D\u2020gÿger");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "MYPREFIX_anarr"), "0#hans#piet#1");
+
+	ck_assert_ptr_null(apr_table_get(r->subprocess_env, "OIDC_CLAIM_names"));
+	ck_assert_str_eq(apr_table_get(r->subprocess_env, "MYPREFIX_anarr"), "0#hans#piet#1");
+
+	oidc_util_appinfo_set_all(r, claims, "OIDC_CLAIM_", ",", OIDC_APPINFO_PASS_HEADERS,
+				  OIDC_APPINFO_ENCODING_BASE64URL);
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_simple"), "aGFucw");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_name"), "R8OcbnRoZXI");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_dagger"), "ROKAoGfDv2dlcg");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_anarr"), "MCxoYW5zLHBpZXQsMQ");
+
+	oidc_util_appinfo_set_all(r, claims, "OIDC_CLAIM_", ",", OIDC_APPINFO_PASS_HEADERS,
+				  OIDC_APPINFO_ENCODING_LATIN1);
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_simple"), "hans");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_name"), "G\xDCnther");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_dagger"), "D?g\xFFger");
+
+	json_decref(claims);
+}
+END_TEST
+
+START_TEST(test_util_expr_substitute) {
+	apr_byte_t rc = FALSE;
+	apr_pool_t *pool = oidc_test_pool_get();
+	const char *input = "match 292 numbers";
+	const char *regexp = "^.* ([0-9]+).*$";
+	const char *replace = "$1";
+	char *output = NULL;
+	char *error_str = NULL;
+
+	rc = oidc_util_regexp_substitute(pool, input, "$$$$$**@@", replace, &output, &error_str);
+	ck_assert_msg(rc == FALSE, "oidc_util_regexp_substitute returned TRUE");
+	ck_assert_ptr_nonnull(error_str);
+
+	error_str = NULL;
+	rc = oidc_util_regexp_substitute(
+	    pool,
+	    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	    regexp, replace, &output, &error_str);
+	ck_assert_msg(rc == FALSE, "oidc_util_regexp_substitute returned TRUE");
+	ck_assert_ptr_nonnull(error_str);
+
+	error_str = NULL;
+	rc = oidc_util_regexp_substitute(pool, "", "", "", &output, &error_str);
+	ck_assert_msg(rc == FALSE, "oidc_util_regexp_substitute returned TRUE");
+	ck_assert_ptr_nonnull(error_str);
+
+	error_str = NULL;
+	rc = oidc_util_regexp_substitute(pool, input, regexp, replace, &output, &error_str);
+	ck_assert_msg(rc == TRUE, "oidc_util_regexp_substitute returned FALSE");
+	ck_assert_ptr_null(error_str);
+	ck_assert_str_eq(output, "292");
+}
+END_TEST
+
+START_TEST(test_util_expr_first_match) {
+	apr_byte_t rc = FALSE;
+	apr_pool_t *pool = oidc_test_pool_get();
+	const char *input = "12345 hello";
+	const char *regexp = "^([0-9]+)\\s+([a-z]+)$";
+	;
+	char *output = NULL;
+	char *error_str = NULL;
+
+	rc = oidc_util_regexp_first_match(pool, input, "$$$$$**@@", &output, &error_str);
+	ck_assert_msg(rc == FALSE, "oidc_util_regexp_first_match returned TRUE");
+	ck_assert_ptr_nonnull(error_str);
+
+	error_str = NULL;
+	rc = oidc_util_regexp_first_match(pool, "abc", regexp, &output, &error_str);
+	ck_assert_msg(rc == FALSE, "oidc_util_regexp_first_match returned TRUE");
+	ck_assert_ptr_nonnull(error_str);
+
+	error_str = NULL;
+	rc = oidc_util_regexp_first_match(pool, "abc abc", regexp, &output, &error_str);
+	ck_assert_msg(rc == FALSE, "oidc_util_regexp_first_match returned TRUE");
+	ck_assert_ptr_nonnull(error_str);
+
+	error_str = NULL;
+	rc = oidc_util_regexp_first_match(pool, input, regexp, &output, &error_str);
+	ck_assert_msg(rc == TRUE, "oidc_util_regexp_first_match returned FALSE");
+	ck_assert_ptr_null(error_str);
+	ck_assert_str_eq(output, "12345");
+}
+END_TEST
+
+START_TEST(test_util_expr_parse) {
+	char *rv = NULL;
+	cmd_parms *cmd = oidc_test_cmd_get("");
+	oidc_apr_expr_t *expr = NULL;
+
+	// NB: stub only
+
+	expr = NULL;
+	rv = oidc_util_apr_expr_parse(cmd, NULL, &expr, FALSE);
+	ck_assert_ptr_null(rv);
+	ck_assert_ptr_null(expr);
+
+	//	expr = NULL;
+	//	rv = oidc_util_apr_expr_parse(cmd, "% ||| true)", &expr, FALSE);
+	//	ck_assert_ptr_nonnull(rv);
+	//	ck_assert_ptr_null(expr);
+
+	expr = NULL;
+	rv = oidc_util_apr_expr_parse(cmd, "", &expr, TRUE);
+	ck_assert_ptr_null(rv);
+	ck_assert_ptr_nonnull(expr);
+}
+END_TEST
+
+START_TEST(test_util_expr_exec) {
+	const char *result = NULL;
+	char *rv = NULL;
+	cmd_parms *cmd = oidc_test_cmd_get("");
+	request_rec *r = oidc_test_request_get();
+	oidc_apr_expr_t *expr = NULL;
+
+	// NB: stub only
+	expr = NULL;
+	rv = oidc_util_apr_expr_parse(cmd, "true", &expr, FALSE);
+	ck_assert_ptr_null(rv);
+	ck_assert_ptr_nonnull(expr);
+
+	// NB: stub only
+	result = oidc_util_apr_expr_exec(r, expr, TRUE);
+	ck_assert_ptr_nonnull(result);
+	ck_assert_str_eq(result, "stub.c");
+
+	// NB: stub only
+	result = oidc_util_apr_expr_exec(r, expr, FALSE);
+	ck_assert_ptr_null(result);
+
+	// NB: stub only
+	expr = NULL;
+	rv = oidc_util_apr_expr_parse(cmd, "#", &expr, FALSE);
+	ck_assert_ptr_nonnull(rv);
+	ck_assert_ptr_null(expr);
 }
 END_TEST
 
@@ -95,7 +299,14 @@ int main(void) {
 	tcase_add_test(core, test_util_base64_decode);
 	tcase_add_test(core, test_util_base64url_decode);
 
-	Suite *s = suite_create("metadata");
+	tcase_add_test(core, test_util_appinfo_set);
+
+	tcase_add_test(core, test_util_expr_substitute);
+	tcase_add_test(core, test_util_expr_first_match);
+	tcase_add_test(core, test_util_expr_parse);
+	tcase_add_test(core, test_util_expr_exec);
+
+	Suite *s = suite_create("util");
 	suite_add_tcase(s, core);
 
 	return oidc_test_suite_run(s);
