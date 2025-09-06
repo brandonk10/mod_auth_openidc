@@ -1492,17 +1492,16 @@ static int oidc_check_dir_level_config_error(request_rec *r) {
 		if (redirect_uri_is_relative) {
 			oidc_swarn(s, "if the configured " OIDCRedirectURI " is relative, " OIDCCookieDomain
 				      " SHOULD be empty");
-		} else
-		if (!oidc_util_cookie_domain_valid(r_uri.hostname, oidc_cfg_cookie_domain_get(c))) {
+		} else if (!oidc_util_cookie_domain_valid(r_uri.hostname, oidc_cfg_cookie_domain_get(c))) {
 			oidc_serror(s,
 				    "the domain (%s) configured in " OIDCCookieDomain
 				    " does not match the URL hostname (%s) of the configured " OIDCRedirectURI
 				    " (%s): setting \"state\" and \"session\" cookies will not work!",
-				    				    oidc_cfg_cookie_domain_get(c), r_uri.hostname,
-				    oidc_cfg_dir_redirect_uri_get(r));
+    				    oidc_cfg_cookie_domain_get(c), r_uri.hostname, oidc_cfg_dir_redirect_uri_get(r));
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 	}
+
 	return OK;
 }
 
