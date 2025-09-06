@@ -45,39 +45,6 @@
 #include "cfg/parse.h"
 #include "util/util.h"
 
-/*
- * directory related configuration
- */
-struct oidc_dir_cfg_t {
-	char *discover_url;
-	char *cookie_path;
-	char *cookie;
-	char *authn_header;
-	int unauth_action;
-	int unautz_action;
-	char *unauthz_arg;
-	apr_array_header_t *pass_cookies;
-	apr_array_header_t *strip_cookies;
-	int pass_info_in;
-	int pass_info_encoding;
-	int oauth_accept_token_in;
-	apr_hash_t *oauth_accept_token_options;
-	int oauth_token_introspect_interval;
-	int preserve_post;
-	int pass_access_token;
-	int pass_refresh_token;
-	oidc_apr_expr_t *path_auth_request_expr;
-	oidc_apr_expr_t *path_scope_expr;
-	oidc_apr_expr_t *unauth_expression;
-	oidc_apr_expr_t *userinfo_claims_expr;
-	int refresh_access_token_before_expiry;
-	int action_on_error_refresh;
-	int action_on_userinfo_refresh;
-	char *state_cookie_prefix;
-	apr_array_header_t *pass_userinfo_as;
-	int pass_idtoken_as;
-};
-
 #define OIDC_PASS_ID_TOKEN_AS_CLAIMS_STR "claims"
 #define OIDC_PASS_IDTOKEN_AS_PAYLOAD_STR "payload"
 #define OIDC_PASS_IDTOKEN_AS_SERIALIZED_STR "serialized"
@@ -464,6 +431,15 @@ OIDC_CFG_DIR_MEMBER_FUNC_STR(state_cookie_prefix, const char *, OIDC_DEFAULT_STA
 OIDC_CFG_DIR_MEMBER_FUNC_PTR(discover_url, const char *,
 			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->discover_url), NULL)
 
+OIDC_CFG_DIR_MEMBER_FUNC_PTR(redirect_uri, const char *,
+			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->redirect_uri), NULL)
+
+OIDC_CFG_DIR_MEMBER_FUNC_PTR(default_slo_url, const char *,
+			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->default_slo_url), NULL)
+
+OIDC_CFG_DIR_MEMBER_FUNC_PTR(default_sso_url, const char *,
+			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->default_sso_url), NULL)
+
 /* default name of the session cookie */
 #define OIDC_DEFAULT_COOKIE "mod_auth_openidc_session"
 OIDC_CFG_DIR_MEMBER_FUNC_STR(cookie, const char *, OIDC_DEFAULT_COOKIE)
@@ -654,6 +630,9 @@ void *oidc_cfg_dir_config_merge(apr_pool_t *pool, void *BASE, void *ADD) {
 	oidc_dir_cfg_t *c = apr_pcalloc(pool, sizeof(oidc_dir_cfg_t));
 	oidc_dir_cfg_t *base = BASE;
 	oidc_dir_cfg_t *add = ADD;
+        c->redirect_uri = add->redirect_uri != NULL ? add->redirect_uri : base->redirect_uri;
+        c->default_sso_url = add->default_sso_url != NULL ? add->default_sso_url : base->default_sso_url;
+        c->default_slo_url = add->default_slo_url != NULL ? add->default_slo_url : base->default_slo_url;
 	c->discover_url = add->discover_url != NULL ? add->discover_url : base->discover_url;
 	c->cookie = add->cookie != NULL ? add->cookie : base->cookie;
 	c->cookie_path = add->cookie_path != NULL ? add->cookie_path : base->cookie_path;

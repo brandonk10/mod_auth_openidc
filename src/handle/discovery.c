@@ -340,14 +340,14 @@ int oidc_discovery_response(request_rec *r, oidc_cfg_t *c) {
 		   login_hint, user);
 
 	if (target_link_uri == NULL) {
-		if (oidc_cfg_default_sso_url_get(c) == NULL) {
+		if (oidc_cfg_dir_default_sso_url_get(r) == NULL) {
 			return oidc_util_html_send_error(r, "Invalid Request",
 							 "SSO to this module without specifying a \"target_link_uri\" "
 							 "parameter is not possible because " OIDCDefaultURL
 							 " is not set.",
 							 HTTP_INTERNAL_SERVER_ERROR);
 		}
-		target_link_uri = apr_pstrdup(r->pool, oidc_util_url_abs(r, c, oidc_cfg_default_sso_url_get(c)));
+		target_link_uri = apr_pstrdup(r->pool, oidc_util_url_abs(r, c, oidc_cfg_dir_default_sso_url_get(r)));
 	}
 
 	/* do open redirect prevention, step 1 */

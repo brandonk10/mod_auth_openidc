@@ -647,10 +647,6 @@ OIDC_CFG_MEMBER_FUNCS_HASHTABLE(redirect_urls_allowed)
                                                                                                                        \
 	OIDC_CFG_MEMBER_FUNC_GET(member, const char *)
 
-OIDC_CFG_MEMBER_FUNCS_ABS_OR_REL_URI(redirect_uri)
-OIDC_CFG_MEMBER_FUNCS_ABS_OR_REL_URI(default_sso_url)
-OIDC_CFG_MEMBER_FUNCS_ABS_OR_REL_URI(default_slo_url)
-
 /*
  * destroy a server config record and its members
  */
@@ -672,9 +668,6 @@ void *oidc_cfg_server_create(apr_pool_t *pool, server_rec *svr) {
 
 	c->merged = FALSE;
 
-	c->redirect_uri = NULL;
-	c->default_sso_url = NULL;
-	c->default_slo_url = NULL;
 	c->public_keys = NULL;
 	c->private_keys = NULL;
 
@@ -762,9 +755,6 @@ void *oidc_cfg_server_merge(apr_pool_t *pool, void *BASE, void *ADD) {
 	oidc_cfg_oauth_merge(pool, c->oauth, base->oauth, add->oauth);
 	oidc_cfg_cache_merge_server_config(c, base, add);
 
-	c->redirect_uri = add->redirect_uri != NULL ? add->redirect_uri : base->redirect_uri;
-	c->default_sso_url = add->default_sso_url != NULL ? add->default_sso_url : base->default_sso_url;
-	c->default_slo_url = add->default_slo_url != NULL ? add->default_slo_url : base->default_slo_url;
 	c->public_keys = oidc_jwk_list_copy(pool, add->public_keys != NULL ? add->public_keys : base->public_keys);
 	c->private_keys = oidc_jwk_list_copy(pool, add->private_keys != NULL ? add->private_keys : base->private_keys);
 

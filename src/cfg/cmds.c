@@ -79,21 +79,6 @@ const command_rec oidc_cfg_cmds[] = {
 		"The	AP_INIT_TAKE1,qualified names of the files that contain the RSA/EC private keys that can be used to decrypt content sent to us by the OP."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE1,
-		OIDCRedirectURI,
-		redirect_uri,
-		"Define the Redirect URI (e.g.: https://localhost:9031/protected/example/)"),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCDefaultURL,
-		default_sso_url,
-		"Defines the default URL where the user is directed to in case of 3rd-party initiated SSO."),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCDefaultLoggedOutURL,
-		default_slo_url,
-		"Defines the default URL where the user is directed to after logout."),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
 		OIDCCookieDomain,
 		cookie_domain,
 		"Specify domain element for OIDC session cookie."),
@@ -694,6 +679,22 @@ const command_rec oidc_cfg_cmds[] = {
 		"The JWKs URL on which the Authorization publishes the keys used to sign its JWT access tokens."),
 
 	// dir
+
+	OIDC_CFG_CMD_DIR(
+		AP_INIT_TAKE1,
+		OIDCRedirectURI,
+		redirect_uri,
+		"Define the Redirect URI (e.g.: https://localhost:9031/protected/example/)"),
+	OIDC_CFG_CMD_DIR(
+		AP_INIT_TAKE1,
+		OIDCDefaultURL,
+		default_sso_url,
+		"Defines the default URL where the user is directed to in case of 3rd-party initiated SSO."),
+	OIDC_CFG_CMD_DIR(
+		AP_INIT_TAKE1,
+		OIDCDefaultLoggedOutURL,
+		default_slo_url,
+		"Defines the default URL where the user is directed to after logout."),
 
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_TAKE1,

@@ -129,6 +129,9 @@ typedef enum {
 	OIDC_CMD_DIR_MEMBER_FUNC_DECL(member, ##__VA_ARGS__)                                                           \
 	OIDC_CFG_DIR_MEMBER_FUNC_GET_DECL(member, type)
 
+OIDC_CFG_DIR_MEMBER_FUNCS(redirect_uri, const char *)
+OIDC_CFG_DIR_MEMBER_FUNCS(default_sso_url, const char *)
+OIDC_CFG_DIR_MEMBER_FUNCS(default_slo_url, const char *)
 OIDC_CFG_DIR_MEMBER_FUNCS(pass_userinfo_as, const apr_array_header_t *)
 OIDC_CFG_DIR_MEMBER_FUNCS(accept_oauth_token_in, int)
 OIDC_CFG_DIR_MEMBER_FUNCS(preserve_post, int)

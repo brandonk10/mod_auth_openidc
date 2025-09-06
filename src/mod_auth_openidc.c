@@ -742,7 +742,7 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg_t *cfg, oidc_se
 			OIDC_METRICS_COUNTER_INC(r, cfg, OM_SESSION_ERROR_REFRESH_ACCESS_TOKEN);
 			if (oidc_cfg_dir_action_on_error_refresh_get(r) == OIDC_ON_ERROR_LOGOUT) {
 				return oidc_logout_request(r, cfg, session,
-							   oidc_util_url_abs(r, cfg, oidc_cfg_default_slo_url_get(cfg)),
+							   oidc_util_url_abs(r, cfg, oidc_cfg_dir_default_slo_url_get(r)),
 							   FALSE);
 			}
 			if (oidc_cfg_dir_action_on_error_refresh_get(r) == OIDC_ON_ERROR_AUTH) {
@@ -760,7 +760,7 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg_t *cfg, oidc_se
 			OIDC_METRICS_COUNTER_INC(r, cfg, OM_SESSION_ERROR_REFRESH_USERINFO);
 			if (oidc_cfg_action_on_userinfo_error_get(cfg) == OIDC_ON_ERROR_LOGOUT) {
 				return oidc_logout_request(r, cfg, session,
-							   oidc_util_url_abs(r, cfg, oidc_cfg_default_slo_url_get(cfg)),
+							   oidc_util_url_abs(r, cfg, oidc_cfg_dir_default_slo_url_get(r)),
 							   FALSE);
 			}
 			if (oidc_cfg_action_on_userinfo_error_get(cfg) == OIDC_ON_ERROR_AUTH) {
@@ -1328,11 +1328,13 @@ static int oidc_check_mixed_userid_oauth(request_rec *r, oidc_cfg_t *c) {
 	return oidc_check_userid_openidc(r, c);
 }
 
+static int oidc_check_dir_level_config_error(request_rec *r);
+
 int oidc_fixups(request_rec *r) {
 	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 	if (oidc_enabled(r) == TRUE) {
 		OIDC_METRICS_TIMING_REQUEST_ADD(r, c, OM_MOD_AUTH_OPENIDC);
-		return OK;
+		return oidc_check_dir_level_config_error(r);
 	}
 	return DECLINED;
 }
@@ -1417,7 +1419,6 @@ static int oidc_check_config_error(server_rec *s, const char *config_str) {
 static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg_t *c) {
 
 	apr_uri_t r_uri;
-	apr_byte_t redirect_uri_is_relative;
 
 	if ((oidc_cfg_metadata_dir_get(c) == NULL) &&
 	    (oidc_cfg_provider_issuer_get(oidc_cfg_provider_get(c)) == NULL) &&
@@ -1426,10 +1427,6 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg_t *c) {
 			       "' must be set");
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
-
-	if (oidc_cfg_redirect_uri_get(c) == NULL)
-		return oidc_check_config_error(s, OIDCRedirectURI);
-	redirect_uri_is_relative = (oidc_cfg_redirect_uri_get(c)[0] == OIDC_CHAR_FORWARD_SLASH);
 
 	if (oidc_cfg_crypto_passphrase_secret1_get(c) == NULL)
 		return oidc_check_config_error(s, OIDCCryptoPassphrase);
@@ -1460,7 +1457,28 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg_t *c) {
 		}
 	}
 
-	apr_uri_parse(s->process->pconf, oidc_cfg_redirect_uri_get(c), &r_uri);
+	if (oidc_proto_profile_dpop_mode_get(oidc_cfg_provider_get(c)) != OIDC_DPOP_MODE_OFF) {
+		if (oidc_util_key_list_first(oidc_cfg_private_keys_get(c), -1, OIDC_JOSE_JWK_SIG_STR) == NULL) {
+			oidc_serror(s, "'" OIDCDPoPMode "' is configured but the required signing keys have not been "
+				       "provided in '" OIDCPrivateKeyFiles "'/'" OIDCPublicKeyFiles "'");
+			return HTTP_INTERNAL_SERVER_ERROR;
+		}
+	}
+
+	return OK;
+}
+
+static int oidc_check_dir_level_config_error(request_rec *r) {
+	apr_byte_t redirect_uri_is_relative;
+	apr_uri_t r_uri;
+	server_rec *s = r->server;
+	oidc_cfg_t *c = ap_get_module_config(s->module_config, &auth_openidc_module);
+
+	if (oidc_cfg_dir_redirect_uri_get(r) == NULL)
+		return oidc_check_config_error(s, OIDCRedirectURI);
+
+	redirect_uri_is_relative = (oidc_cfg_dir_redirect_uri_get(r)[0] == OIDC_CHAR_FORWARD_SLASH);
+	apr_uri_parse(s->process->pconf, oidc_cfg_dir_redirect_uri_get(r), &r_uri);
 	if (!redirect_uri_is_relative) {
 		if (_oidc_strnatcasecmp(r_uri.scheme, "https") != 0) {
 			oidc_swarn(s,
@@ -1480,15 +1498,7 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg_t *c) {
 				    "the domain (%s) configured in " OIDCCookieDomain
 				    " does not match the URL hostname (%s) of the configured " OIDCRedirectURI
 				    " (%s): setting \"state\" and \"session\" cookies will not work!",
-				    oidc_cfg_cookie_domain_get(c), r_uri.hostname, oidc_cfg_redirect_uri_get(c));
-			return HTTP_INTERNAL_SERVER_ERROR;
-		}
-	}
-
-	if (oidc_proto_profile_dpop_mode_get(oidc_cfg_provider_get(c)) != OIDC_DPOP_MODE_OFF) {
-		if (oidc_util_key_list_first(oidc_cfg_private_keys_get(c), -1, OIDC_JOSE_JWK_SIG_STR) == NULL) {
-			oidc_serror(s, "'" OIDCDPoPMode "' is configured but the required signing keys have not been "
-				       "provided in '" OIDCPrivateKeyFiles "'/'" OIDCPublicKeyFiles "'");
+				    oidc_cfg_cookie_domain_get(c), r_uri.hostname, oidc_cfg_dir_redirect_uri_get(r));
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 	}

@@ -385,7 +385,7 @@ static apr_byte_t oidc_response_proto_state_restore(request_rec *r, oidc_cfg_t *
 	/* check that the timestamp is not beyond the valid interval */
 	if (apr_time_now() > ts + apr_time_from_sec(oidc_cfg_state_timeout_get(c))) {
 		oidc_error(r, "state has expired");
-		if ((oidc_cfg_default_sso_url_get(c) == NULL) ||
+		if ((oidc_cfg_dir_default_sso_url_get(r) == NULL) ||
 		    (apr_table_get(r->subprocess_env, "OIDC_NO_DEFAULT_URL_ON_STATE_TIMEOUT") != NULL)) {
 			oidc_util_html_send_error(
 			    r, "Invalid Authentication Response",
@@ -559,12 +559,12 @@ static int oidc_response_process(request_rec *r, oidc_cfg_t *c, oidc_session_t *
 	/* match the returned state parameter against the state stored in the browser */
 	if (oidc_response_match_state(r, c, apr_table_get(params, OIDC_PROTO_STATE), &provider, &proto_state) ==
 	    FALSE) {
-		if (oidc_cfg_default_sso_url_get(c) != NULL) {
+		if (oidc_cfg_dir_default_sso_url_get(r) != NULL) {
 			oidc_warn(r,
 				  "invalid authorization response state; a default SSO URL is set, sending the user "
 				  "there: %s",
-				  oidc_cfg_default_sso_url_get(c));
-			oidc_http_hdr_out_location_set(r, oidc_util_url_abs(r, c, oidc_cfg_default_sso_url_get(c)));
+				  oidc_cfg_dir_default_sso_url_get(r));
+			oidc_http_hdr_out_location_set(r, oidc_util_url_abs(r, c, oidc_cfg_dir_default_sso_url_get(r)));
 			OIDC_METRICS_COUNTER_INC(r, c, OM_AUTHN_RESPONSE_ERROR_STATE_MISMATCH);
 			return HTTP_MOVED_TEMPORARILY;
 		}
