@@ -1458,10 +1458,21 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg_t *c) {
 		}
 	}
 
+	apr_uri_parse(s->process->pconf, oidc_cfg_redirect_uri_get(c), &r_uri);
+	if (!redirect_uri_is_relative) {
+		if (_oidc_strnatcasecmp(r_uri.scheme, "https") != 0) {
+			oidc_swarn(s,
+				   "the URL scheme (%s) of the configured " OIDCRedirectURI
+				   " SHOULD be \"https\" for security reasons (moreover: some Providers may reject "
+				   "non-HTTPS URLs)",
+				   r_uri.scheme);
+		}
+	}
+
 	if (oidc_proto_profile_dpop_mode_get(oidc_cfg_provider_get(c)) != OIDC_DPOP_MODE_OFF) {
 		if (oidc_util_key_list_first(oidc_cfg_private_keys_get(c), -1, OIDC_JOSE_JWK_SIG_STR) == NULL) {
 			oidc_serror(s, "'" OIDCDPoPMode "' is configured but the required signing keys have not been "
-			               "provided in '" OIDCPrivateKeyFiles "'/'" OIDCPublicKeyFiles "'");
+				       "provided in '" OIDCPrivateKeyFiles "'/'" OIDCPublicKeyFiles "'");
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 	}
@@ -1497,7 +1508,7 @@ static int oidc_check_dir_level_config_error(request_rec *r) {
 				    "the domain (%s) configured in " OIDCCookieDomain
 				    " does not match the URL hostname (%s) of the configured " OIDCRedirectURI
 				    " (%s): setting \"state\" and \"session\" cookies will not work!",
-    				    oidc_cfg_cookie_domain_get(c), r_uri.hostname, oidc_cfg_dir_redirect_uri_get(r));
+				    oidc_cfg_cookie_domain_get(c), r_uri.hostname, oidc_cfg_dir_redirect_uri_get(r));
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 	}
