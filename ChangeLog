@@ -1,3 +1,22 @@
+10/3/2025
+- redis: use SET..EX %d instead of deprecated SETEX
+- session: remove expired session from cache with `oidc_session_kill` instead of just clearing it
+- bump to 2.4.18.2dev
+
+10/01/2025
+- release 2.4.18.1
+
+09/29/2025
+- refresh: turn debug printouts in config errors into warnings; see #1349; thanks@CrazyWolf13
+- shm: use _oidc_strcpy instead of _oidc_strncpy to avoid segfaults on some platforms; see #1353
+  regression since 2.4.16.7, found on Amazon Linux 2023
+
+09/27/2025
+- logout: when revoking tokens at the revocation endpoint with client_secret_jwt or
+  private_key_jwt, use the revocation endpoint as "aud" value (instead of the token endpoint
+  that was used before), unless environment variable OIDC_TOKEN_REVOCATION_AUD is set to
+  "token" (or another literal aud value)
+
 09/13/2025
 - redis: apply global (server-wide) locking when system(!) environment variable
   OIDC_REDIS_MUTEX_GLOBAL is set, for backwards compatibility, through:
