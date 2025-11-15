@@ -42,20 +42,24 @@ test_CFLAGS = ${AM_CFLAGS} -fPIC
 
 if HAVE_CHECK
 
-TESTS += test_jose
-test_jose_CFLAGS = @CHECK_CFLAGS@ ${AM_CFLAGS}
-test_jose_LDADD = @CHECK_LIBS@ ${LDADD}
-test_jose_SOURCES = test_jose.c helper.c stub.c
+noinst_LTLIBRARIES = libtest.la
 
-TESTS += test_util
-test_util_CFLAGS = @CHECK_CFLAGS@ ${AM_CFLAGS}
-test_util_LDADD = @CHECK_LIBS@ ${LDADD}
-test_util_SOURCES = test_util.c helper.c stub.c
+libtest_la_CFLAGS = ${AM_CFLAGS} -fPIC
 
-TESTS += test_cfg
-test_cfg_CFLAGS = @CHECK_CFLAGS@ ${AM_CFLAGS}
-test_cfg_LDADD = @CHECK_LIBS@ ${LDADD}
-test_cfg_SOURCES = test_cfg.c helper.c stub.c
+libtest_la_SOURCES = \
+	helper.c \
+	stub.c
+
+AM_CFLAGS += @CHECK_CFLAGS@
+LDADD += libtest.la @CHECK_LIBS@
+
+TESTS += \
+	test_cfg \
+	test_util \
+	test_jose \
+	test_http \
+	test_cache \
+	test_proto
 
 endif
 
@@ -75,7 +79,7 @@ clean-local:
 	rm -f *.gcno
 
 ${TESTS:%=%.valgrind}: ${TESTS}
-	CK_FORK=no valgrind --error-exitcode=1 --show-leak-kinds=definite --read-inline-info=yes --keep-debuginfo=yes ./$$(basename $@ .valgrind)
+	CK_FORK=no valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=definite --read-inline-info=yes --keep-debuginfo=yes ./$$(basename $@ .valgrind)
 
 valgrind: ${TESTS:%=%.valgrind}
 

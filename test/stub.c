@@ -129,8 +129,25 @@ AP_DECLARE(char *) ap_getword_nulls(apr_pool_t *p, const char **line, char stop)
 	return "";
 }
 
-AP_DECLARE(char *) ap_getword_white(apr_pool_t *p, const char **line) {
-	return 0;
+AP_DECLARE(char *) ap_getword_white(apr_pool_t *atrans, const char **line) {
+	const char *pos = *line;
+	int len;
+	char *res;
+
+	while (!apr_isspace(*pos) && *pos) {
+		++pos;
+	}
+
+	len = pos - *line;
+	res = apr_pstrmemdup(atrans, *line, len);
+
+	while (apr_isspace(*pos)) {
+		++pos;
+	}
+
+	*line = pos;
+
+	return res;
 }
 
 AP_DECLARE(int) ap_hook_check_user_id(request_rec *r) {
@@ -271,7 +288,7 @@ AP_DECLARE(int) ap_setup_client_block(request_rec *r, int read_policy) {
 }
 
 AP_DECLARE(int) ap_should_client_block(request_rec *r) {
-	return 0;
+	return 1;
 }
 
 AP_DECLARE(int) ap_unescape_url(char *url) {
