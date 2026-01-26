@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -41,8 +41,9 @@
  *
  **************************************************************************/
 
-#include "helper.h"
+#include "check_util.h"
 #include "mod_auth_openidc.h"
+#include "util.h"
 #include "util/util.h"
 
 // base64
@@ -119,7 +120,7 @@ START_TEST(test_util_appinfo_set) {
 					  "\"names\" : [ \"hans\", \"piet\" ],"
 					  "\"abool\": true,"
 					  "\"anint\": 5,"
-					  "\"lint\": 111111111111111,"
+					  "\"lint\": 1111111111,"
 					  "\"areal\": 1.5,"
 					  "\"anobj\" : { \"hans\": \"piet\", \"abool\": false },"
 					  "\"anull\": null"
@@ -137,7 +138,7 @@ START_TEST(test_util_appinfo_set) {
 	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_names"), "hans,piet");
 	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_abool"), "1");
 	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_anint"), "5");
-	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_lint"), "111111111111111");
+	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_lint"), "1111111111");
 	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_areal"), "1.5");
 	ck_assert_str_eq(apr_table_get(r->headers_in, "OIDC_CLAIM_anobj"), "{\"hans\":\"piet\",\"abool\":false}");
 
@@ -278,29 +279,16 @@ START_TEST(test_util_expr_exec) {
 	// NB: stub only
 	result = oidc_util_apr_expr_exec(r, expr, TRUE);
 	ck_assert_ptr_nonnull(result);
-#if HAVE_APACHE_24
 	ck_assert_str_eq(result, "stub.c");
-#else
-	ck_assert_str_eq(result, "true");
-#endif
 	// NB: stub only
 	result = oidc_util_apr_expr_exec(r, expr, FALSE);
-#if HAVE_APACHE_24
 	ck_assert_ptr_null(result);
-#else
-	ck_assert_str_eq(result, "true");
-#endif
 
 	// NB: stub only
 	expr = NULL;
 	rv = oidc_util_apr_expr_parse(cmd, "#", &expr, FALSE);
-#if HAVE_APACHE_24
 	ck_assert_ptr_nonnull(rv);
 	ck_assert_ptr_null(expr);
-#else
-	ck_assert_ptr_null(rv);
-	ck_assert_ptr_nonnull(expr);
-#endif
 }
 END_TEST
 
@@ -403,18 +391,18 @@ END_TEST
 
 START_TEST(test_util_jq) {
 	request_rec *r = oidc_test_request_get();
+	json_t *json = NULL;
+	oidc_util_json_decode_object(r, "{ \"jan\": \"jan\", \"piet\": \"piet\" }", &json);
 #ifdef USE_LIBJQ
 	ck_assert_str_eq(oidc_util_jq_filter(r, NULL, "."), "{}");
-	ck_assert_str_eq(oidc_util_jq_filter(r, "{ \"jan\": \"jan\", \"piet\": \"piet\" }", NULL),
-			 "{ \"jan\": \"jan\", \"piet\": \"piet\" }");
-	ck_assert_str_eq(oidc_util_jq_filter(r, "{ \"jan\": \"jan\", \"piet\": \"piet\" }", "bogus"),
-			 "{ \"jan\": \"jan\", \"piet\": \"piet\" }");
-	ck_assert_str_eq(oidc_util_jq_filter(r, "{ \"jan\": \"jan\", \"piet\": \"piet\" }", ".jan"), "\"jan\"");
-	ck_assert_str_eq(oidc_util_jq_filter(r, "{ \"jan\": \"jan\", \"piet\": \"piet\" }", ".jan"), "\"jan\"");
+	ck_assert_str_eq(oidc_util_jq_filter(r, json, NULL), "{\"jan\":\"jan\",\"piet\":\"piet\"}");
+	ck_assert_str_eq(oidc_util_jq_filter(r, json, ".bogus"), "null");
+	ck_assert_str_eq(oidc_util_jq_filter(r, json, "bogus"), "{\"jan\":\"jan\",\"piet\":\"piet\"}");
+	ck_assert_str_eq(oidc_util_jq_filter(r, json, ".jan"), "\"jan\"");
 #else
-	ck_assert_str_eq(oidc_util_jq_filter(r, "{ \"jan\": \"jan\", \"piet\": \"piet\" }", ".jan"),
-			 "{ \"jan\": \"jan\", \"piet\": \"piet\" }");
+	ck_assert_str_eq(oidc_util_jq_filter(r, json, ".jan"), "{\"jan\":\"jan\",\"piet\":\"piet\"}");
 #endif
+	json_decref(json);
 }
 END_TEST
 
@@ -622,10 +610,10 @@ START_TEST(test_util_random) {
 	ck_assert_msg(oidc_util_rand_str(r, &s, 12) == TRUE, "oidc_util_rand_str returned FALSE");
 	ck_assert_int_eq(_oidc_strlen(s), 16);
 
-	s = oidc_util_rand_hex_str(r, 8);
+	s = oidc_util_rand_hex_str(r, r->pool, 8);
 	ck_assert_ptr_nonnull(s);
 	ck_assert_int_eq(_oidc_strlen(s), 16);
-	s = oidc_util_rand_hex_str(r, 16);
+	s = oidc_util_rand_hex_str(r, r->pool, 16);
 	ck_assert_ptr_nonnull(s);
 	ck_assert_int_eq(_oidc_strlen(s), 32);
 }
@@ -799,7 +787,7 @@ START_TEST(test_util_hex_and_hash) {
 	char *hex = NULL;
 	char *out = NULL;
 
-	hex = oidc_util_hex_encode(r, bytes, 2);
+	hex = oidc_util_hex_encode(r->pool, bytes, 2);
 	ck_assert_ptr_nonnull(hex);
 	ck_assert_str_eq(hex, "ab01");
 

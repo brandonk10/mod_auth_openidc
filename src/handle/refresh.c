@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -273,7 +273,7 @@ process:
 
 		if (oidc_jwt_parse(r->pool, s_id_token, &id_token_jwt, NULL, FALSE, &err) == TRUE) {
 			/* store the claims payload in the id_token for later reference */
-			oidc_session_set_idtoken_claims(r, session, id_token_jwt->payload.value.str);
+			oidc_session_set_idtoken_claims(r, session, id_token_jwt->payload.value.json);
 
 			if (oidc_cfg_provider_session_max_duration_get(provider) == 0) {
 				/* update the session expiry to match the expiry of the id_token */

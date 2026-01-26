@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -83,7 +83,7 @@ int oidc_util_html_send_in_template(request_rec *r, const char *filename, char *
 				    const char *arg1, int arg1_esc, const char *arg2, int arg2_esc);
 
 // jq.c
-const char *oidc_util_jq_filter(request_rec *r, const char *input, const char *filter);
+const char *oidc_util_jq_filter(request_rec *r, json_t *json, const char *filter);
 
 // json.c
 char *oidc_util_json_encode(apr_pool_t *pool, json_t *json, size_t flags);
@@ -117,7 +117,7 @@ oidc_jwk_t *oidc_util_key_list_first(const apr_array_header_t *key_list, int kty
 // random.c
 unsigned int oidc_util_rand_int(unsigned int mod);
 apr_byte_t oidc_util_rand_str(request_rec *r, char **output, int len);
-char *oidc_util_rand_hex_str(request_rec *r, int len);
+char *oidc_util_rand_hex_str(request_rec *r, apr_pool_t *pool, int len);
 
 // url.c
 const char *oidc_util_url_cur_host(request_rec *r, oidc_hdr_x_forwarded_t x_forwarded_headers);
@@ -131,7 +131,7 @@ apr_byte_t oidc_util_url_has_parameter(request_rec *r, const char *param);
 apr_byte_t oidc_util_url_parameter_get(request_rec *r, char *name, char **value);
 
 // util.c
-char *oidc_util_hex_encode(request_rec *r, const unsigned char *bytes, unsigned int len);
+char *oidc_util_hex_encode(apr_pool_t *pool, const unsigned char *bytes, unsigned int len);
 apr_byte_t oidc_util_hash_string_and_base64url_encode(request_rec *r, const char *openssl_hash_algo, const char *input,
 						      char **output);
 int oidc_util_strnenvcmp(const char *a, const char *b, int len);

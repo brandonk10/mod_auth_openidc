@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -80,21 +80,25 @@ char *oidc_cache_status2str(apr_pool_t *p, apr_status_t statcode) {
 	return apr_pstrdup(p, buf);
 }
 
-static apr_byte_t oidc_cache_mutex_global_create(server_rec *s, oidc_cache_mutex_t *m, const char *type) {
+/*
+ * create a server-wide mutex
+ */
+static apr_byte_t oidc_cache_mutex_global_create(apr_pool_t *pool, server_rec *s, oidc_cache_mutex_t *m,
+						 const char *type) {
 
 	apr_status_t rv = APR_SUCCESS;
 	const char *dir;
 
 	/* construct the mutex filename */
-	rv = apr_temp_dir_get(&dir, s->process->pool);
+	rv = apr_temp_dir_get(&dir, pool);
 	if (rv != APR_SUCCESS) {
 		oidc_serror(s, "apr_temp_dir_get failed: could not find a temp dir: %s",
-			    oidc_cache_status2str(s->process->pool, rv));
+			    oidc_cache_status2str(pool, rv));
 		return FALSE;
 	}
 
 	m->mutex_filename =
-	    apr_psprintf(s->process->pool, "%s/mod_auth_openidc_%s_mutex.%ld.%pp", dir, type, (long int)getpid(), s);
+	    apr_psprintf(pool, "%s/mod_auth_openidc_%s_mutex.%ld.%pp", dir, type, (long int)getpid(), s);
 
 	/* set the lock type */
 	apr_lockmech_e mech =
@@ -107,25 +111,60 @@ static apr_byte_t oidc_cache_mutex_global_create(server_rec *s, oidc_cache_mutex
 #endif
 	    ;
 
+	// TODO: need to allocate this on the server process pool to avoid crashes on
+	//       oidc_cache_mutex_unlock at shutdown time on graceful restarts
+	//       and test/helper.c shutdown; is it because libapr cleaned it up before us?
+
+	/*
+	 * ==54== Invalid read of size 4
+	 * ==54==    at 0x4A1C1D0: sem_post@@GLIBC_2.34 (sem_post.c:35)
+	 * ==54==    by 0x49626F7: ??? (in /usr/lib/x86_64-linux-gnu/libapr-1.so.0.7.5)
+	 * ==54==    by 0x4962065: apr_global_mutex_unlock (in /usr/lib/x86_64-linux-gnu/libapr-1.so.0.7.5)
+	 * ==54==    by 0x5A40F9B: oidc_cache_mutex_unlock (common.c:259)
+	 * ==54==    by 0x5A3FF51: oidc_cache_shm_destroy (shm.c:334)
+	 * ==54==    by 0x5A33F53: oidc_cfg_server_destroy (cfg.c:700)
+	 * ==54==    by 0x4964A4D: apr_pool_destroy (in /usr/lib/x86_64-linux-gnu/libapr-1.so.0.7.5)
+	 * ==54==    by 0x4964A2C: apr_pool_destroy (in /usr/lib/x86_64-linux-gnu/libapr-1.so.0.7.5)
+	 * ==54==    by 0x142767: ??? (in /usr/sbin/apache2)
+	 * ==54==    by 0x14223A: main (in /usr/sbin/apache2)
+	 * ==54==  Address 0x5abb008 is not stack'd, malloc'd or (recently) free'd
+	 */
+
+	// could it be related  to the remaining valgrind report on possibly lost memory: ?
+
+	/*
+	 * ==73== 24 bytes in 1 blocks are possibly lost in loss record 39 of 176
+	 * ==73==    at 0x4844818: malloc (vg_replace_malloc.c:446)
+	 * ==73==    by 0x4A91765: __tsearch (tsearch.c:337)
+	 * ==73==    by 0x4A91765: tsearch (tsearch.c:290)
+	 * ==73==    by 0x4A1C4E5: __sem_check_add_mapping (sem_routines.c:121)
+	 * ==73==    by 0x4A1C1A0: sem_open@@GLIBC_2.34 (sem_open.c:195)
+	 * ==73==    by 0x49622BF: ??? (in /usr/lib/x86_64-linux-gnu/libapr-1.so.0.7.5)
+	 * ==73==    by 0x49633D9: apr_proc_mutex_create (in /usr/lib/x86_64-linux-gnu/libapr-1.so.0.7.5)
+	 * ==73==    by 0x4961E8C: apr_global_mutex_create (in /usr/lib/x86_64-linux-gnu/libapr-1.so.0.7.5)
+	 * ==73==    by 0x5A27AD3: oidc_cache_mutex_global_create (common.c:116)
+	 * ==73==    by 0x5A27AD3: oidc_cache_mutex_post_config (common.c:144)
+	 * ==73==    by 0x5A2750D: oidc_cache_shm_post_config (shm.c:111)
+	 * ==73==    by 0x5A1D66E: oidc_cfg_post_config (cfg.c:1009)
+	 * ==73==    by 0x5A15F9C: oidc_post_config (mod_auth_openidc.c:1762)
+	 * ==73==    by 0x16B2C3: ap_run_post_config (in /usr/sbin/apache2)
+	 */
+
 	/* create the mutex lock */
 	rv = apr_global_mutex_create(&m->gmutex, (const char *)m->mutex_filename, mech, s->process->pool);
 
 	if (rv != APR_SUCCESS) {
 		oidc_serror(s, "apr_global_mutex_create failed to create mutex (%d) on file %s: %s (%d)", mech,
-			    m->mutex_filename, oidc_cache_status2str(s->process->pool, rv), rv);
+			    m->mutex_filename, oidc_cache_status2str(pool, rv), rv);
 		return FALSE;
 	}
 
 	/* need this on Linux */
 #ifdef AP_NEED_SET_MUTEX_PERMS
-#if MODULE_MAGIC_NUMBER_MAJOR >= 20081201
 	rv = ap_unixd_set_global_mutex_perms(m->gmutex);
-#else
-	rv = unixd_set_global_mutex_perms(m->gmutex);
-#endif
 	if (rv != APR_SUCCESS) {
 		oidc_serror(s, "unixd_set_global_mutex_perms failed; could not set permissions: %s (%d)",
-			    oidc_cache_status2str(s->process->pool, rv), rv);
+			    oidc_cache_status2str(pool, rv), rv);
 		return FALSE;
 	}
 #endif
@@ -135,21 +174,29 @@ static apr_byte_t oidc_cache_mutex_global_create(server_rec *s, oidc_cache_mutex
 	return TRUE;
 }
 
-apr_byte_t oidc_cache_mutex_post_config(server_rec *s, oidc_cache_mutex_t *m, const char *type) {
-
+/*
+ * initialize a server- or process-wide mutex
+ */
+apr_byte_t oidc_cache_mutex_post_config(apr_pool_t *pool, server_rec *s, oidc_cache_mutex_t *m, const char *type) {
+	apr_byte_t rc = TRUE;
 	apr_status_t rv = APR_SUCCESS;
 
-	if (m->is_global)
-		return oidc_cache_mutex_global_create(s, m, type);
-
-	rv = apr_thread_mutex_create(&m->tmutex, APR_THREAD_MUTEX_DEFAULT, s->process->pool);
-	if (rv != APR_SUCCESS) {
-		oidc_serror(s, "apr_thread_mutex_create failed: %s (%d)", oidc_cache_status2str(s->process->pool, rv),
-			    rv);
-		return FALSE;
+	if (m->is_global) {
+		rc = oidc_cache_mutex_global_create(pool, s, m, type);
+		goto end;
 	}
 
-	return TRUE;
+	// NB: see note above at apr_global_mutex_create on the use of s->process->pool
+	rv = apr_thread_mutex_create(&m->tmutex, APR_THREAD_MUTEX_DEFAULT, s->process->pool);
+	if (rv != APR_SUCCESS) {
+		oidc_serror(s, "apr_thread_mutex_create failed: %s (%d)", oidc_cache_status2str(pool, rv), rv);
+		rc = FALSE;
+		goto end;
+	}
+
+end:
+
+	return rc;
 }
 
 /*
@@ -252,7 +299,7 @@ static inline apr_byte_t oidc_cache_crypto_encrypt(request_rec *r, const char *p
 /*
  * AES GCM decrypt using the crypto passphrase as symmetric key
  */
-static inline apr_byte_t oidc_cache_crypto_decrypt(request_rec *r, const char *cache_value, char *secret,
+static inline apr_byte_t oidc_cache_crypto_decrypt(request_rec *r, const char *cache_value, const char *secret,
 						   char **plaintext) {
 	oidc_crypto_passphrase_t passphrase;
 	passphrase.secret1 = secret;
@@ -313,12 +360,12 @@ apr_byte_t oidc_cache_get(request_rec *r, const char *section, const char *key, 
 	char *msg = NULL;
 	const char *s_key = NULL;
 	char *cache_value = NULL;
-	char *s_secret = NULL;
+	const char *s_secret = NULL;
 	const char *s_section = oidc_cache_section_get(r, section);
 
 	oidc_debug(r, "enter: %s (section=%s, decrypt=%d, type=%s)", key, s_section, encrypted, cfg->cache.impl->name);
 
-	s_secret = cfg->crypto_passphrase.secret1;
+	s_secret = oidc_cfg_crypto_passphrase_secret1_get(cfg);
 	if (oidc_cache_get_key(r, key, s_secret, encrypted, &s_key) == FALSE)
 		goto end;
 
@@ -329,9 +376,9 @@ apr_byte_t oidc_cache_get(request_rec *r, const char *section, const char *key, 
 		goto end;
 
 	/* see if it is any good */
-	if ((cache_value == NULL) && (encrypted == 1) && (cfg->crypto_passphrase.secret2 != NULL)) {
+	if ((cache_value == NULL) && (encrypted == 1) && (oidc_cfg_crypto_passphrase_secret2_get(cfg) != NULL)) {
 		oidc_debug(r, "2nd try with previous passphrase");
-		s_secret = cfg->crypto_passphrase.secret2;
+		s_secret = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 		if (oidc_cache_get_key(r, key, s_secret, encrypted, &s_key) == FALSE)
 			goto end;
 		if (cfg->cache.impl->get(r, s_section, s_key, &cache_value) == FALSE)
@@ -389,12 +436,12 @@ apr_byte_t oidc_cache_set(request_rec *r, const char *section, const char *key, 
 		   value ? (int)_oidc_strlen(value) : 0, encrypted, apr_time_sec(expiry - apr_time_now()),
 		   cfg->cache.impl->name);
 
-	if (oidc_cache_get_key(r, key, cfg->crypto_passphrase.secret1, encrypted, &s_key) == FALSE)
+	if (oidc_cache_get_key(r, key, oidc_cfg_crypto_passphrase_secret1_get(cfg), encrypted, &s_key) == FALSE)
 		goto end;
 
 	/* see if we need to encrypt */
 	if ((encrypted == 1) && (value != NULL)) {
-		if (oidc_cache_crypto_encrypt(r, value, &cfg->crypto_passphrase, &encoded) == FALSE)
+		if (oidc_cache_crypto_encrypt(r, value, oidc_cfg_crypto_passphrase_get(cfg), &encoded) == FALSE)
 			goto end;
 		value = encoded;
 	}

@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -44,7 +44,8 @@
 #include "cfg/cache.h"
 #include "cfg/cfg_int.h"
 #include "cfg/provider.h"
-#include "helper.h"
+#include "check_util.h"
+#include "util.h"
 #include "util/util.h"
 
 START_TEST(test_cache_mutex_and_status2str) {
@@ -55,7 +56,7 @@ START_TEST(test_cache_mutex_and_status2str) {
 	oidc_cache_mutex_t *m = oidc_cache_mutex_create(pool, FALSE);
 	ck_assert_ptr_nonnull(m);
 
-	ck_assert_int_eq(oidc_cache_mutex_post_config(r->server, m, "test"), TRUE);
+	ck_assert_int_eq(oidc_cache_mutex_post_config(pool, r->server, m, "test"), TRUE);
 	/* lock/unlock should succeed */
 	ck_assert_int_eq(oidc_cache_mutex_lock(pool, r->server, m), TRUE);
 	ck_assert_int_eq(oidc_cache_mutex_unlock(pool, r->server, m), TRUE);
@@ -143,7 +144,7 @@ START_TEST(test_cache_mutex_global_and_child_init) {
 	ck_assert_ptr_nonnull(m);
 
 	/* post_config should create the global mutex */
-	ck_assert_int_eq(oidc_cache_mutex_post_config(r->server, m, "gtest"), TRUE);
+	ck_assert_int_eq(oidc_cache_mutex_post_config(pool, r->server, m, "gtest"), TRUE);
 
 	/* lock/unlock should succeed for global mutex */
 	ck_assert_int_eq(oidc_cache_mutex_lock(pool, r->server, m), TRUE);
@@ -169,14 +170,19 @@ START_TEST(test_cache_encrypt_no_secret) {
 
 	/* get cfg and temporarily remove the secret to simulate missing passphrase */
 	oidc_cfg_t *cfg = oidc_test_cfg_get();
-	const char *old_secret = cfg->crypto_passphrase.secret1;
+	const char *old_secret = oidc_cfg_crypto_passphrase_secret1_get(cfg);
 	cfg->crypto_passphrase.secret1 = NULL;
 	cfg->cache.encrypt = 1;
 
-	/* set should fail when encryption is on but no secret is set */
+	/* fail when value is too short and compression fails */
 	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "nokey", "v", expiry), FALSE);
 
-	/* get should also fail */
+	/* fail when encryption is on but no secret is set (long enough value to compress) */
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "nokey",
+					"vadadfsssssssssssssssssssssssssssssssssssssssssssssssssssssssss", expiry),
+			 FALSE);
+
+	/* fail because no secret is set */
 	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "nokey", &value), FALSE);
 
 	/* restore secret */
@@ -199,8 +205,8 @@ START_TEST(test_cache_second_passphrase_retry) {
 
 	/* prepare cfg and secrets */
 	oidc_cfg_t *cfg = oidc_test_cfg_get();
-	const char *old_s1 = cfg->crypto_passphrase.secret1;
-	const char *old_s2 = cfg->crypto_passphrase.secret2;
+	const char *old_s1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
+	const char *old_s2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	int old_encrypt = cfg->cache.encrypt;
 
 	/* set initial secret and ensure encryption is enabled */
@@ -270,8 +276,8 @@ START_TEST(test_cache_secret1_empty_secret2_fallback) {
 
 	/* prepare cfg and secrets */
 	oidc_cfg_t *cfg = oidc_test_cfg_get();
-	const char *old_s1 = cfg->crypto_passphrase.secret1;
-	const char *old_s2 = cfg->crypto_passphrase.secret2;
+	const char *old_s1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
+	const char *old_s2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	int old_encrypt = cfg->cache.encrypt;
 
 	/* set initial secret and ensure encryption is enabled */
@@ -337,8 +343,8 @@ START_TEST(test_cache_compression_enabled_set_get) {
 	/* verify encryption+compression works by trying to create a JWT with the current cfg secret */
 	oidc_cfg_t *cfg = oidc_test_cfg_get();
 	oidc_crypto_passphrase_t passphrase;
-	passphrase.secret1 = cfg->crypto_passphrase.secret1;
-	passphrase.secret2 = cfg->crypto_passphrase.secret2;
+	passphrase.secret1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
+	passphrase.secret2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	char *encoded = NULL;
 	apr_byte_t forced_no_compress = FALSE;
 	if (!oidc_util_jwt_create(r, &passphrase, "probe", &encoded)) {
@@ -368,8 +374,8 @@ START_TEST(test_cache_compression_enabled_second_passphrase) {
 
 	/* prepare cfg and secrets */
 	oidc_cfg_t *cfg = oidc_test_cfg_get();
-	const char *old_s1 = cfg->crypto_passphrase.secret1;
-	const char *old_s2 = cfg->crypto_passphrase.secret2;
+	const char *old_s1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
+	const char *old_s2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	int old_encrypt = cfg->cache.encrypt;
 
 	/* set initial secret and ensure encryption is enabled */
@@ -379,8 +385,8 @@ START_TEST(test_cache_compression_enabled_second_passphrase) {
 
 	/* verify encryption+compression works for this cfg; fall back to no-compress if not */
 	oidc_crypto_passphrase_t passphrase;
-	passphrase.secret1 = cfg->crypto_passphrase.secret1;
-	passphrase.secret2 = cfg->crypto_passphrase.secret2;
+	passphrase.secret1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
+	passphrase.secret2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	char *encoded = NULL;
 	apr_byte_t forced_no_compress = FALSE;
 	if (!oidc_util_jwt_create(r, &passphrase, "probe", &encoded)) {
@@ -428,8 +434,8 @@ START_TEST(test_cache_compression_enabled_empty_secret2_fallback) {
 
 	/* prepare cfg and secrets */
 	oidc_cfg_t *cfg = oidc_test_cfg_get();
-	const char *old_s1 = cfg->crypto_passphrase.secret1;
-	const char *old_s2 = cfg->crypto_passphrase.secret2;
+	const char *old_s1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
+	const char *old_s2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	int old_encrypt = cfg->cache.encrypt;
 
 	cfg->crypto_passphrase.secret1 = "cmp_origsecret012345678901234567";
@@ -438,8 +444,8 @@ START_TEST(test_cache_compression_enabled_empty_secret2_fallback) {
 
 	/* verify encryption+compression works; fall back to no-compress if not */
 	oidc_crypto_passphrase_t passphrase2;
-	passphrase2.secret1 = cfg->crypto_passphrase.secret1;
-	passphrase2.secret2 = cfg->crypto_passphrase.secret2;
+	passphrase2.secret1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
+	passphrase2.secret2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	char *encoded2 = NULL;
 	apr_byte_t forced_no_compress = FALSE;
 	if (!oidc_util_jwt_create(r, &passphrase2, "probe", &encoded2)) {

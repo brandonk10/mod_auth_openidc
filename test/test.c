@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -51,6 +51,8 @@
 #include "util/util.h"
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+
+#include "util.h"
 
 static int test_nr_run = 0;
 static char TST_ERR_MSG[4096];
@@ -125,170 +127,6 @@ static char *_jwk_parse(apr_pool_t *pool, const char *s, oidc_jwk_t **jwk, oidc_
 	TST_ASSERT_ERR("oidc_jwk_parse", k != NULL, pool, (*err));
 	*jwk = k;
 	json_decref(json);
-	return 0;
-}
-
-static char *test_private_key_parse(apr_pool_t *pool) {
-	oidc_jose_error_t err = {{'\0'}, 0, {'\0'}, {'\0'}};
-	BIO *input = NULL;
-	oidc_jwk_t *jwk = NULL;
-	int isPrivateKey = 1;
-	int result;
-	char *json = NULL;
-
-	const char rsaPrivateKeyFile[512];
-	const char ecPrivateKeyFile[512];
-
-	char *dir = getenv("srcdir") ? getenv("srcdir") : ".";
-	snprintf((char *)rsaPrivateKeyFile, 512, "%s/%s", dir, "/private.pem");
-	snprintf((char *)ecPrivateKeyFile, 512, "%s/%s", dir, "/ecpriv.key");
-
-	input = BIO_new(BIO_s_file());
-	TST_ASSERT_ERR("test_private_key_parse_BIO_new_RSA_private_key", input != NULL, pool, err);
-
-	TST_ASSERT_ERR("test_private_key_parse_BIOread_filename_RSA_private_key",
-		       result = BIO_read_filename(input, rsaPrivateKeyFile), pool, err);
-
-	TST_ASSERT_ERR("oidc_jwk_pem_bio_to_jwk", oidc_jwk_pem_bio_to_jwk(pool, input, NULL, &jwk, isPrivateKey, &err),
-		       pool, err);
-	BIO_free(input);
-
-	TST_ASSERT_ERR("oidc_jwk_to_json with RSA private key", oidc_jwk_to_json(pool, jwk, &json, &err), pool, err);
-	TST_ASSERT_STR(
-	    "oidc_jwk_to_json with RSA private key output test", json,
-	    "{\"kty\":\"RSA\",\"kid\":\"IbLjLR7-C1q0-ypkueZxGIJwBQNaLg46DZMpnPW1kps\",\"e\":\"AQAB\",\"n\":"
-	    "\"iGeTXbfV5bMppx7o7qMLCuVIKqbBa_qOzBiNNpe0K8rjg7-1z9GCuSlqbZtM0_5BQ6bGonnSPD--"
-	    "PowhFdivS4WNA33O0Kl1tQ0wdH3TOnwueIO9ahfW4q0BGFvMObneK-tjwiNMj1l-cZt8pvuS-3LtTWIzC-"
-	    "hTZM4caUmy5olm5PVdmru6C6V5rxkbYBPITFSzl5mpuo_C6RV_MYRwAh60ghs2OEvIWDrJkZnYaF7sjHC9j-"
-	    "4kfcM5oY7Zhg8KuHyloudYNzlqjVAPd0MbkLkh1pa8fmHsnN6cgfXYtFK7Z8WjYDUAhTH1JjZCVSFN55A-51dgD4cQNzieLEEkJw\","
-	    "\"d\":\"Xc9d-kZERQVC0Dzh1b0sCwJE75Bf1fMr4hHAjJsovjV641ElqRdd4Borp9X2sJVcLTq1wWgmvmjYXgvhdTTg2f-"
-	    "vS4dqhPcGjM3VVUhzzPU6wIdZ7W0XzC1PY4E-ozTBJ1Nr-EhujuftnhRhVjYOkAAqU94FXVsaf2mBAKg-"
-	    "8WzrWx2MeWjfLcE79DmSL9Iw2areKVRGlKddIIPnHb-Mw9HB7ZCyVTC1v5sqhQPy6qPo8XHdQju_EYRlIOMksU8kcb20R_ezib_"
-	    "rHuVwJVlTNk6MvFUIj4ayXdX13Qy4kTBRiQM7pumPaypEE4CrAfTWP0AYnEwz_FGluOpMZNzoAQ\"}");
-	oidc_jwk_destroy(jwk);
-
-	input = BIO_new(BIO_s_file());
-	TST_ASSERT_ERR("test_private_key_parse_BIO_new_EC_private_key", input != NULL, pool, err);
-
-	TST_ASSERT_ERR("test_private_key_parse_BIOread_filename_EC_private_key",
-		       result = BIO_read_filename(input, ecPrivateKeyFile), pool, err);
-
-	TST_ASSERT_ERR("oidc_jwk_pem_bio_to_jwk", oidc_jwk_pem_bio_to_jwk(pool, input, NULL, &jwk, isPrivateKey, &err),
-		       pool, err);
-	BIO_free(input);
-
-	TST_ASSERT_ERR("oidc_jwk_to_json with EC private key", oidc_jwk_to_json(pool, jwk, &json, &err), pool, err);
-	TST_ASSERT_STR(
-	    "oidc_jwk_to_json with EC private key output test", json,
-	    "{\"kty\":\"EC\",\"kid\":\"-THDTumMGazABrYTb8xJoYOK2OPiWmho3D-nPC1dSYg\",\"crv\":\"P-521\",\"x\":"
-	    "\"AR6Eh9VhdLEA-rm5WR0_T0LjKysJuBkSoXaR8GjphHvoOTrljcACRsVlTES9FMkbxbNEs4JdxPgPJl9G-e9WEJTe\",\"y\":"
-	    "\"AammgflZaJuSdycK_ccUXkSXjNQd8NsqJuv9LFpk5Ys1OAiirWm6uktXG8ALNSxSffcurBq8zqZyZ141dV6qSzKQ\",\"d\":"
-	    "\"AKFwyWAZ2FiTTEofXXOC6I2GBPQeEyCnsVzo075hCOcebYgLpzSj8xWfkTqxsUq8FF5cxlKS3jym3qgsuV0Eb0wd\"}");
-	oidc_jwk_destroy(jwk);
-
-	return 0;
-}
-
-static char *test_public_key_parse(apr_pool_t *pool) {
-
-	oidc_jose_error_t err = {{'\0'}, 0, {'\0'}, {'\0'}};
-	oidc_jwk_t *jwk, *jwkCert = NULL;
-
-	BIO *input, *inputCert = NULL;
-	char *json = NULL;
-
-	int isPrivateKey = 0;
-	int result;
-
-	const char publicKeyFile[512];
-	const char certificateFile[512];
-	const char ecCertificateFile[512];
-	char *dir = getenv("srcdir") ? getenv("srcdir") : ".";
-	snprintf((char *)publicKeyFile, 512, "%s/%s", dir, "/public.pem");
-	snprintf((char *)certificateFile, 512, "%s/%s", dir, "/certificate.pem");
-	snprintf((char *)ecCertificateFile, 512, "%s/%s", dir, "/eccert.pem");
-
-	input = BIO_new(BIO_s_file());
-	TST_ASSERT_ERR("test_public_key_parse_BIO_new_public_key", input != NULL, pool, err);
-
-	TST_ASSERT_ERR("test_public_key_parse_BIOread_filename_public_key",
-		       result = BIO_read_filename(input, publicKeyFile), pool, err);
-
-	TST_ASSERT_ERR("oidc_jwk_pem_bio_to_jwk", oidc_jwk_pem_bio_to_jwk(pool, input, NULL, &jwk, isPrivateKey, &err),
-		       pool, err);
-	BIO_free(input);
-
-	inputCert = BIO_new(BIO_s_file());
-	TST_ASSERT_ERR("test_public_key_parse_BIO_new_certificate", inputCert != NULL, pool, err);
-
-	TST_ASSERT_ERR("test_public_key_parse_BIOread_filename_certificate",
-		       BIO_read_filename(inputCert, certificateFile), pool, err);
-
-	TST_ASSERT_ERR("oidc_jwk_pem_bio_to_jwk",
-		       oidc_jwk_pem_bio_to_jwk(pool, inputCert, NULL, &jwkCert, isPrivateKey, &err), pool, err);
-	BIO_free(inputCert);
-
-	TST_ASSERT_ERR("oidc_jwk_to_json with public key", oidc_jwk_to_json(pool, jwk, &json, &err), pool, err);
-	TST_ASSERT_STR(
-	    "oidc_jwk_to_json with public key output test", json,
-	    "{\"kty\":\"RSA\",\"kid\":\"IbLjLR7-C1q0-ypkueZxGIJwBQNaLg46DZMpnPW1kps\",\"e\":\"AQAB\",\"n\":"
-	    "\"iGeTXbfV5bMppx7o7qMLCuVIKqbBa_qOzBiNNpe0K8rjg7-1z9GCuSlqbZtM0_5BQ6bGonnSPD--"
-	    "PowhFdivS4WNA33O0Kl1tQ0wdH3TOnwueIO9ahfW4q0BGFvMObneK-tjwiNMj1l-cZt8pvuS-3LtTWIzC-"
-	    "hTZM4caUmy5olm5PVdmru6C6V5rxkbYBPITFSzl5mpuo_C6RV_MYRwAh60ghs2OEvIWDrJkZnYaF7sjHC9j-"
-	    "4kfcM5oY7Zhg8KuHyloudYNzlqjVAPd0MbkLkh1pa8fmHsnN6cgfXYtFK7Z8WjYDUAhTH1JjZCVSFN55A-51dgD4cQNzieLEEkJw\"}");
-	oidc_jwk_destroy(jwk);
-
-	TST_ASSERT_ERR("oidc_jwk_to_json with certificate", oidc_jwk_to_json(pool, jwkCert, &json, &err), pool, err);
-	TST_ASSERT_STR("oidc_jwk_to_json with certificate output test", json,
-		       "{\"kty\":\"RSA\",\"kid\":\"IbLjLR7-C1q0-ypkueZxGIJwBQNaLg46DZMpnPW1kps\",\"e\":\"AQAB\",\"n\":"
-		       "\"iGeTXbfV5bMppx7o7qMLCuVIKqbBa_qOzBiNNpe0K8rjg7-1z9GCuSlqbZtM0_5BQ6bGonnSPD--"
-		       "PowhFdivS4WNA33O0Kl1tQ0wdH3TOnwueIO9ahfW4q0BGFvMObneK-tjwiNMj1l-cZt8pvuS-3LtTWIzC-"
-		       "hTZM4caUmy5olm5PVdmru6C6V5rxkbYBPITFSzl5mpuo_C6RV_MYRwAh60ghs2OEvIWDrJkZnYaF7sjHC9j-"
-		       "4kfcM5oY7Zhg8KuHyloudYNzlqjVAPd0MbkLkh1pa8fmHsnN6cgfXYtFK7Z8WjYDUAhTH1JjZCVSFN55A-"
-		       "51dgD4cQNzieLEEkJw\",\"x5c\":[\"MIICnTCCAYUCBgFuk1+"
-		       "FLDANBgkqhkiG9w0BAQsFADASMRAwDgYDVQQDDAd2aW5jZW50MB4XDTE5MTEyMjEzNDcyMVoXDTI5MTEyMjEzNDkwMVowEj"
-		       "EQMA4GA1UEAwwHdmluY2VudDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAIhnk1231eWzKace6O6jCwrlSCqmw"
-		       "Wv6jswYjTaXtCvK44O/tc/Rgrkpam2bTNP+QUOmxqJ50jw/"
-		       "vj6MIRXYr0uFjQN9ztCpdbUNMHR90zp8LniDvWoX1uKtARhbzDm53ivrY8IjTI9ZfnGbfKb7kvty7U1iMwvoU2TOHGlJsua"
-		       "JZuT1XZq7ugulea8ZG2ATyExUs5eZqbqPwukVfzGEcAIetIIbNjhLyFg6yZGZ2Ghe7IxwvY/"
-		       "uJH3DOaGO2YYPCrh8paLnWDc5ao1QD3dDG5C5IdaWvH5h7JzenIH12LRSu2fFo2A1AIUx9SY2QlUhTeeQPudXYA+"
-		       "HEDc4nixBJCcCAwEAATANBgkqhkiG9w0BAQsFAAOCAQEAfAo40il4qw7DfOkke0p1ZFAgLQQS3J5hYNDSRvVv+vxkk9o/"
-		       "N++zTMoHbfcDcU5BdVH6Qsr/12PXPX7Ur5WYDq+bWGAK3MAaGtZlmycFeVhoVRfab4TUWUy43H3VyFUNqjGRAVJ/"
-		       "VD1RW3fJ18KrQTN2fcKSd88Jqt5TvjROKghq95+8BQtlhrR/"
-		       "sQVrjgYwc+eU9ljWI56MQXbpHstl9IewMXnusSPxKRTbutjaxzKaoXRTUncPL6ga0SSxOTdKksM4ZYpPnq0B93silb+"
-		       "0qs8aJraGzjAmLE30opfufP+roth19VJxAfYsW5mgAmXP9kEAF+iWB8FB4/"
-		       "Q4noNG8Q==\"],\"x5t#S256\":\"hMVJ55Mqi4uAQIztPKUmL2MSfy6iN1Lr3J1CNGAIBms\",\"x5t\":\"0oN6Bx-"
-		       "eh6VAmNw1I7o3Dd9JPwE\"}");
-	oidc_jwk_destroy(jwkCert);
-
-	inputCert = BIO_new(BIO_s_file());
-	TST_ASSERT_ERR("test_public_key_parse_BIO_new_EC_certificate", inputCert != NULL, pool, err);
-
-	TST_ASSERT_ERR("test_public_key_parse_BIOread_filename_EC_certificate",
-		       BIO_read_filename(inputCert, ecCertificateFile), pool, err);
-
-	TST_ASSERT_ERR("oidc_jwk_pem_bio_to_jwk",
-		       oidc_jwk_pem_bio_to_jwk(pool, inputCert, NULL, &jwkCert, isPrivateKey, &err), pool, err);
-	BIO_free(inputCert);
-
-	TST_ASSERT_ERR("oidc_jwk_to_json with EC certificate", oidc_jwk_to_json(pool, jwkCert, &json, &err), pool, err);
-	TST_ASSERT_STR(
-	    "oidc_jwk_to_json with EC certificate output test", json,
-	    "{\"kty\":\"EC\",\"kid\":\"-THDTumMGazABrYTb8xJoYOK2OPiWmho3D-nPC1dSYg\",\"crv\":\"P-521\",\"x\":"
-	    "\"AR6Eh9VhdLEA-rm5WR0_T0LjKysJuBkSoXaR8GjphHvoOTrljcACRsVlTES9FMkbxbNEs4JdxPgPJl9G-e9WEJTe\",\"y\":"
-	    "\"AammgflZaJuSdycK_ccUXkSXjNQd8NsqJuv9LFpk5Ys1OAiirWm6uktXG8ALNSxSffcurBq8zqZyZ141dV6qSzKQ\",\"x5c\":["
-	    "\"MIICBDCCAWagAwIBAgIUdYpkXaCal7IwjHix3n1PP9/"
-	    "O6OcwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTIzMDMyMzIwNDU1MFoXDTMzMDMyMDIwNDU1MFowFDESMBAGA1UEA"
-	    "wwJbG9jYWxob3N0MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQBHoSH1WF0sQD6ublZHT9PQuMrKwm4GRKhdpHwaOmEe+"
-	    "g5OuWNwAJGxWVMRL0UyRvFs0Szgl3E+A8mX0b571YQlN4BqaaB+Vlom5J3Jwr9xxReRJeM1B3w2yom6/"
-	    "0sWmTlizU4CKKtabq6S1cbwAs1LFJ99y6sGrzOpnJnXjV1XqpLMpCjUzBRMB0GA1UdDgQWBBTKfLLXyRVQpnXFf19Bs7eXRPlRmzAfBgNV"
-	    "HSMEGDAWgBTKfLLXyRVQpnXFf19Bs7eXRPlRmzAPBgNVHRMBAf8EBTADAQH/"
-	    "MAoGCCqGSM49BAMCA4GLADCBhwJBGkoifMDYwsSLSmnnVdFftqTwxrjdgrtPMRzetz/w/"
-	    "D9KkM4Mlufgv5jBXuWcEiP9ray2ZgAGhdkvoOfsc8g1l6ICQgEJ+"
-	    "9R5K2WKlDTEydmiHiSYQHSVyS61PFskm537AqrLVSRu80Sezu2W4m8IF2UbbRZiUPaHPIx9Xe3GdpqIEmPFfA==\"],\"x5t#S256\":"
-	    "\"yCl_u4GL5GrTkf8xvqdF2aixUIhjDdsMFhLUz7O6gVA\",\"x5t\":\"waxmjjAAhxGY5XvH6ufxVxwYGDw\"}");
-	oidc_jwk_destroy(jwkCert);
-
 	return 0;
 }
 
@@ -964,8 +802,6 @@ static char *test_jwt_decrypt_gcm(apr_pool_t *pool) {
 
 #endif
 
-#if HAVE_APACHE_24
-
 static char *test_authz_worker(request_rec *r) {
 	authz_status rc;
 	char *require_args = NULL;
@@ -1171,8 +1007,6 @@ static char *test_authz_worker(request_rec *r) {
 
 	return 0;
 }
-
-#endif
 
 static char *test_decode_json_object(request_rec *r) {
 	apr_byte_t rc = FALSE;
@@ -1389,8 +1223,6 @@ static char *test_check_cookie_domain(request_rec *r) {
 
 static char *all_tests(apr_pool_t *pool, request_rec *r) {
 	char *message;
-	TST_RUN(test_private_key_parse, pool);
-	TST_RUN(test_public_key_parse, pool);
 
 	TST_RUN(test_jwt_parse, pool);
 	TST_RUN(test_plaintext_jwt_parse, pool);
@@ -1416,104 +1248,27 @@ static char *all_tests(apr_pool_t *pool, request_rec *r) {
 	TST_RUN(test_is_auth_capable_request, r);
 	TST_RUN(test_open_redirect, r);
 
-#if HAVE_APACHE_24
 	TST_RUN(test_authz_worker, r);
-#endif
 
 	TST_RUN(test_check_cookie_domain, r);
 
 	return 0;
 }
 
-static request_rec *test_setup(apr_pool_t *pool) {
-	const unsigned int kIdx = 0;
-	const unsigned int kEls = kIdx + 1;
-	request_rec *request = (request_rec *)apr_pcalloc(pool, sizeof(request_rec));
-
-	request->pool = pool;
-	request->subprocess_env = apr_table_make(request->pool, 0);
-
-	request->headers_in = apr_table_make(request->pool, 0);
-	request->headers_out = apr_table_make(request->pool, 0);
-	request->err_headers_out = apr_table_make(request->pool, 0);
-
-	apr_table_set(request->headers_in, "Host", "www.example.com");
-	apr_table_set(request->headers_in, "OIDC_foo", "some-value");
-	apr_table_set(request->headers_in, "Cookie",
-		      "foo=bar; "
-		      "mod_auth_openidc_session"
-		      "=0123456789abcdef; baz=zot");
-
-	request->server = apr_pcalloc(request->pool, sizeof(struct server_rec));
-	request->server->process = apr_pcalloc(request->pool, sizeof(struct process_rec));
-	request->server->process->pool = request->pool;
-	request->server->process->pconf = request->pool;
-	request->connection = apr_pcalloc(request->pool, sizeof(struct conn_rec));
-	request->connection->bucket_alloc = apr_bucket_alloc_create(request->pool);
-	request->connection->local_addr = apr_pcalloc(request->pool, sizeof(apr_sockaddr_t));
-
-	apr_pool_userdata_set("https", "scheme", NULL, request->pool);
-	request->server->server_hostname = "www.example.com";
-	request->connection->local_addr->port = 443;
-	request->unparsed_uri = "/bla?foo=bar&param1=value1";
-	request->args = "foo=bar&param1=value1";
-	apr_uri_parse(request->pool, "https://www.example.com/bla?foo=bar&param1=value1", &request->parsed_uri);
-
-	auth_openidc_module.module_index = kIdx;
-	oidc_cfg_t *cfg = oidc_cfg_server_create(request->pool, request->server);
-
-	oidc_cfg_provider_issuer_set(pool, oidc_cfg_provider_get(cfg), "https://idp.example.com");
-	oidc_cfg_provider_authorization_endpoint_url_set(pool, oidc_cfg_provider_get(cfg),
-							 "https://idp.example.com/authorize");
-	oidc_cfg_provider_client_id_set(pool, oidc_cfg_provider_get(cfg), "client_id");
-
-
-	oidc_dir_cfg_t *d_cfg = oidc_cfg_dir_config_create(request->pool, NULL);
-	d_cfg->redirect_uri = "https://www.example.com/protected/";
-
-	// coverity[suspicious_sizeof]
-	request->server->module_config = apr_pcalloc(request->pool, sizeof(void *) * kEls);
-	// coverity[suspicious_sizeof]
-	request->per_dir_config = apr_pcalloc(request->pool, sizeof(void *) * kEls);
-	ap_set_module_config(request->server->module_config, &auth_openidc_module, cfg);
-	ap_set_module_config(request->per_dir_config, &auth_openidc_module, d_cfg);
-
-	cfg->crypto_passphrase.secret1 = "12345678901234567890123456789012";
-	cfg->cache.impl = &oidc_cache_shm;
-	cfg->cache.cfg = NULL;
-	cfg->cache.shm_size_max = 500;
-	cfg->cache.shm_entry_size_max = 16384 + 255 + 17;
-	cfg->cache.encrypt = 1;
-	if (cfg->cache.impl->post_config(request->server) != OK) {
-		printf("cfg->cache.impl->post_config failed!\n");
-		exit(-1);
-	}
-
-	return request;
-}
-
 int main(int argc, char **argv, char **env) {
-	if (apr_app_initialize(&argc, (const char *const **)argv, (const char *const **)env) != APR_SUCCESS) {
-		printf("apr_app_initialize failed\n");
-		return -1;
-	}
 
-	oidc_pre_config_init();
+	oidc_test_setup();
 
-	apr_pool_t *pool = NULL;
-	apr_pool_create(&pool, NULL);
-	request_rec *r = test_setup(pool);
+	request_rec *r = oidc_test_request_get();
 
-	char *result = all_tests(pool, r);
+	char *result = all_tests(oidc_test_pool_get(), r);
 	if (result != 0) {
 		printf("Failed: %s\n", result);
 	} else {
 		printf("All %d tests passed!\n", test_nr_run);
 	}
 
-	EVP_cleanup();
-	apr_pool_destroy(pool);
-	apr_terminate();
+	oidc_test_teardown();
 
 	return result != 0;
 }

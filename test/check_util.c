@@ -38,15 +38,19 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
- */
+ *
+ **************************************************************************/
 
-#ifndef _MOD_AUTH_OPENIDC_STATE_H_
-#define _MOD_AUTH_OPENIDC_STATE_H_
+#include "check_util.h"
+#include <openssl/evp.h>
 
-#include "cfg/cfg.h"
+int oidc_test_suite_run(Suite *s) {
+	int n_failed = 0;
 
-char *oidc_state_cookie_name(request_rec *r, const char *state);
-char *oidc_state_browser_fingerprint(request_rec *r, oidc_cfg_t *c, const char *nonce);
-int oidc_state_cookies_clean_expired(request_rec *r, oidc_cfg_t *c, const char *currentCookieName, int delete_oldest);
+	SRunner *sr = srunner_create(s);
+	srunner_run_all(sr, CK_VERBOSE);
+	n_failed = srunner_ntests_failed(sr);
+	srunner_free(sr);
 
-#endif /* _MOD_AUTH_OPENIDC_STATE_H_ */
+	return (n_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}

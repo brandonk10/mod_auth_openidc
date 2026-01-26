@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -299,8 +299,6 @@ const char *oidc_cmd_oauth_verify_shared_keys_set(cmd_parms *cmd, void *struct_p
 	char *use = NULL;
 
 	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);
-	int offset = (int)(long)cmd->info;
-	apr_hash_t **shared_keys = (apr_hash_t **)((char *)cfg + offset);
 
 	char *kid = NULL, *secret = NULL;
 	int key_len = 0;
@@ -314,11 +312,11 @@ const char *oidc_cmd_oauth_verify_shared_keys_set(cmd_parms *cmd, void *struct_p
 				    secret, oidc_jose_e2s(cmd->pool, err));
 	}
 
-	if (*shared_keys == NULL)
-		*shared_keys = apr_hash_make(cmd->pool);
+	if (cfg->oauth->verify_shared_keys == NULL)
+		cfg->oauth->verify_shared_keys = apr_hash_make(cmd->pool);
 	if (use)
 		jwk->use = apr_pstrdup(cmd->pool, use);
-	apr_hash_set(*shared_keys, jwk->kid, APR_HASH_KEY_STRING, jwk);
+	apr_hash_set(cfg->oauth->verify_shared_keys, jwk->kid, APR_HASH_KEY_STRING, jwk);
 
 	return NULL;
 }
@@ -416,6 +414,10 @@ void oidc_cfg_oauth_merge(apr_pool_t *pool, oidc_oauth_t *dst, const oidc_oauth_
 }
 
 void oidc_cfg_oauth_destroy(oidc_oauth_t *o) {
+	if (o == NULL)
+		return;
 	oidc_jwk_list_destroy(o->verify_public_keys);
+	o->verify_public_keys = NULL;
 	oidc_jwk_list_destroy_hash(o->verify_shared_keys);
+	o->verify_shared_keys = NULL;
 }

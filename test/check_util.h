@@ -40,13 +40,33 @@
  * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
-#ifndef _MOD_AUTH_OPENIDC_STATE_H_
-#define _MOD_AUTH_OPENIDC_STATE_H_
+#ifndef _MOD_AUTH_OPENIDC_TEST_CHECK_UTIL_H_
+#define _MOD_AUTH_OPENIDC_TEST_CHECK_UTIL_H_
 
-#include "cfg/cfg.h"
+#include <check.h>
 
-char *oidc_state_cookie_name(request_rec *r, const char *state);
-char *oidc_state_browser_fingerprint(request_rec *r, oidc_cfg_t *c, const char *nonce);
-int oidc_state_cookies_clean_expired(request_rec *r, oidc_cfg_t *c, const char *currentCookieName, int delete_oldest);
+#ifndef _ck_assert_ptr_null
+#define _ck_assert_ptr_null(X, OP)                                                                                     \
+	do {                                                                                                           \
+		const void *_ck_x = (X);                                                                               \
+		ck_assert_msg(_ck_x OP NULL, "Assertion '%s' failed: %s == %#lx", #X " " #OP " NULL", #X,              \
+			      (unsigned long)(uintptr_t)_ck_x);                                                        \
+	} while (0)
+#define ck_assert_ptr_null(X) _ck_assert_ptr_null(X, ==)
+#define ck_assert_ptr_nonnull(X) _ck_assert_ptr_null(X, !=)
+#endif
 
-#endif /* _MOD_AUTH_OPENIDC_STATE_H_ */
+#ifndef _ck_assert_ptr
+#define _ck_assert_ptr(X, OP, Y)                                                                                       \
+	do {                                                                                                           \
+		const void *_ck_x = (X);                                                                               \
+		const void *_ck_y = (Y);                                                                               \
+		ck_assert_msg(_ck_x OP _ck_y, "Assertion '%s' failed: %s == %#lx, %s == %#lx", #X " " #OP " " #Y, #X,  \
+			      (unsigned long)(uintptr_t)_ck_x, #Y, (unsigned long)(uintptr_t)_ck_y);                   \
+	} while (0)
+#define ck_assert_ptr_eq(X, Y) _ck_assert_ptr(X, ==, Y)
+#endif
+
+int oidc_test_suite_run(Suite *s);
+
+#endif // _MOD_AUTH_OPENIDC_TEST_CHECK_UTIL_H_

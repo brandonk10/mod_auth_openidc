@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -73,7 +73,9 @@ typedef enum {
 	/* pass id_token payload as JSON object in header */
 	OIDC_PASS_IDTOKEN_AS_PAYLOAD = 2,
 	/* pass id_token in compact serialized format in header */
-	OIDC_PASS_IDTOKEN_AS_SERIALIZED = 4
+	OIDC_PASS_IDTOKEN_AS_SERIALIZED = 4,
+	/* do not pass id_token */
+	OIDC_PASS_IDTOKEN_OFF = 8
 } oidc_pass_idtoken_as_t;
 
 typedef enum {
@@ -149,13 +151,11 @@ OIDC_CFG_DIR_MEMBER_FUNCS(pass_access_token, apr_byte_t)
 OIDC_CFG_DIR_MEMBER_FUNCS(pass_refresh_token, apr_byte_t)
 OIDC_CFG_DIR_MEMBER_FUNCS(discover_url, const char *)
 OIDC_CFG_DIR_MEMBER_FUNCS(state_cookie_prefix, const char *)
+OIDC_CFG_DIR_MEMBER_FUNCS(pass_idtoken_as, oidc_pass_idtoken_as_t)
 
 // 2 args
 OIDC_CFG_DIR_MEMBER_FUNCS(unautz_action, oidc_unautz_action_t, const char *)
 OIDC_CFG_DIR_MEMBER_FUNCS(refresh_access_token_before_expiry, int, const char *)
-
-// 3 args
-OIDC_CFG_DIR_MEMBER_FUNCS(pass_idtoken_as, oidc_pass_idtoken_as_t, const char *, const char *)
 
 // ifdefs
 #ifdef USE_LIBJQ

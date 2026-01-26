@@ -27,19 +27,26 @@ AM_CFLAGS += -DUSE_ZLIB @ZLIB_CFLAGS@
 LIBADD += @ZLIB_LIBS@
 endif
 
-noinst_HEADERS = helper.h
+noinst_HEADERS = \
+	util.h \
+	check_util.h
 
 LDADD = ${top_builddir}/src/libauth_openidc.la ${LIBADD}
 
 noinst_PROGRAMS = test-cmd
-test_cmd_SOURCES = test-cmd.c stub.c
-test_cmd_CFLAGS = ${AM_CFLAGS} -fPIC
 
 TESTS = test
 
-test_SOURCES = test.c stub.c
-test_CFLAGS = ${AM_CFLAGS} -fPIC
+test_SOURCES = \
+	test.c \
+	util.c \
+	stub.c
 
+test_cmd_SOURCES = \
+	test-cmd.c \
+	util.c \
+	stub.c
+	
 if HAVE_CHECK
 
 noinst_LTLIBRARIES = libtest.la
@@ -47,7 +54,8 @@ noinst_LTLIBRARIES = libtest.la
 libtest_la_CFLAGS = ${AM_CFLAGS} -fPIC
 
 libtest_la_SOURCES = \
-	helper.c \
+	util.c \
+	check_util.c \
 	stub.c
 
 AM_CFLAGS += @CHECK_CFLAGS@

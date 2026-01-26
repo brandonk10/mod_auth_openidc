@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -141,15 +141,13 @@ typedef enum {
 #define OIDC_HTML_ERROR_TEMPLATE_DEPRECATED "deprecated"
 
 typedef struct oidc_apr_expr_t {
-#if HAVE_APACHE_24
 	ap_expr_info_t *expr;
-#endif
 	char *str;
 } oidc_apr_expr_t;
 
 typedef struct oidc_crypto_passphrase_t {
-	char *secret1;
-	char *secret2;
+	const char *secret1;
+	const char *secret2;
 } oidc_crypto_passphrase_t;
 
 typedef struct oidc_remote_user_claim_t {
@@ -190,11 +188,12 @@ int oidc_cfg_merged_get(oidc_cfg_t *cfg);
 
 void oidc_pre_config_init();
 
-void *oidc_cfg_server_create(apr_pool_t *pool, server_rec *svr);
+void *oidc_cfg_server_create(apr_pool_t *pool, server_rec *s);
 void *oidc_cfg_server_merge(apr_pool_t *pool, void *BASE, void *ADD);
-int oidc_cfg_post_config(oidc_cfg_t *cfg, server_rec *s);
+apr_byte_t oidc_cfg_server_destroy(apr_pool_t *pool, server_rec *s, oidc_cfg_t *cfg);
+int oidc_cfg_post_config(apr_pool_t *pool, oidc_cfg_t *cfg, server_rec *s);
 void oidc_cfg_child_init(apr_pool_t *pool, oidc_cfg_t *cfg, server_rec *s);
-void oidc_cfg_cleanup_child(oidc_cfg_t *cfg, server_rec *s);
+void oidc_cfg_process_cleanup(oidc_cfg_t *cfg, server_rec *s);
 const char *oidc_cfg_string_list_add(apr_pool_t *pool, apr_array_header_t **list, const char *arg);
 const char *oidc_cfg_endpoint_auth_set(apr_pool_t *pool, oidc_cfg_t *cfg, const char *arg, char **auth, char **alg);
 
@@ -212,6 +211,7 @@ const char *oidc_cfg_endpoint_auth_set(apr_pool_t *pool, oidc_cfg_t *cfg, const 
 OIDC_CFG_MEMBER_FUNCS_DECL(delete_oldest_state_cookies, int)
 OIDC_CFG_MEMBER_FUNCS_DECL(action_on_userinfo_error, oidc_on_error_action_t)
 OIDC_CFG_MEMBER_FUNCS_DECL(crypto_passphrase_secret1, const char *)
+OIDC_CFG_MEMBER_FUNCS_DECL(crypto_passphrase_secret2, const char *)
 OIDC_CFG_MEMBER_FUNCS_DECL(refresh_mutex, oidc_cache_mutex_t *)
 OIDC_CFG_MEMBER_FUNCS_DECL(store_id_token, int)
 OIDC_CFG_MEMBER_FUNCS_DECL(post_preserve_template, const char *)

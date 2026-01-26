@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -93,6 +93,10 @@ static int oidc_proto_request_auth_push(request_rec *r, struct oidc_provider_t *
 	if (endpoint_url == NULL) {
 		oidc_error(r, "the Provider's OAuth 2.0 Pushed Authorization Request endpoint URL is not set, PAR "
 			      "cannot be used");
+		rv = oidc_util_html_send_error(
+		    r, "Pushed Authorization Request Endpoint not set",
+		    "the Provider's OAuth 2.0 Pushed Authorization Request endpoint URL is not set, PAR cannot be used",
+		    HTTP_INTERNAL_SERVER_ERROR);
 		goto out;
 	}
 
@@ -229,10 +233,8 @@ static int oidc_request_uri_copy_from_request(void *rec, const char *name, const
 		if (result == NULL)
 			/* assume string */
 			result = json_string(value);
-		if (result) {
-			json_object_set_new(ctx->request_object->payload.value.json, name, json_deep_copy(result));
-			json_decref(result);
-		}
+		if (result)
+			json_object_set_new(ctx->request_object->payload.value.json, name, result);
 
 		if (oidc_proto_request_uri_param_needs_action(ctx->request_object_config, name,
 							      OIDC_REQUEST_OJBECT_COPY_AND_REMOVE_FROM_REQUEST)) {

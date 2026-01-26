@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -109,8 +109,6 @@ static inline int _oidc_str_to_int(const char *s, const int default_value) {
 #ifdef WIN32
 #define snprintf _snprintf
 #endif
-
-#define HAVE_APACHE_24 MODULE_MAGIC_NUMBER_MAJOR >= 20100714
 
 #ifndef OIDC_DEBUG
 #define OIDC_DEBUG APLOG_DEBUG

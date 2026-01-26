@@ -18,7 +18,7 @@
  */
 
 /***************************************************************************
- * Copyright (C) 2017-2025 ZmartZone Holding BV
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
  * All rights reserved.
  *
  * DISCLAIMER OF WARRANTIES:
@@ -114,6 +114,8 @@ struct oidc_cfg_cache_t {
 };
 
 struct oidc_cfg_t {
+
+	server_rec *svr;
 
 	/* secret key(s) used for encryption */
 	oidc_crypto_passphrase_t crypto_passphrase;
