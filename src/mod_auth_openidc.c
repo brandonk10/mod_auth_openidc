@@ -1343,13 +1343,13 @@ static int oidc_check_mixed_userid_oauth(request_rec *r, oidc_cfg_t *c) {
 	return oidc_check_userid_openidc(r, c);
 }
 
-static int oidc_check_dir_level_config_error(request_rec *r);
+static int oidc_check_dir_level_config_error(apr_pool_t *pool, request_rec *r);
 
 int oidc_fixups(request_rec *r) {
 	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 	if (oidc_enabled(r, c) == TRUE) {
 		OIDC_METRICS_TIMING_REQUEST_ADD(r, c, OM_MOD_AUTH_OPENIDC);
-		return oidc_check_dir_level_config_error(r);
+		return oidc_check_dir_level_config_error(r->pool, r);
 	}
 	return DECLINED;
 }
@@ -1475,7 +1475,7 @@ static int oidc_check_config_openid_openidc(apr_pool_t *pool, server_rec *s, oid
 	return OK;
 }
 
-static int oidc_check_dir_level_config_error(request_rec *r) {
+static int oidc_check_dir_level_config_error(apr_pool_t *pool, request_rec *r) {
 	apr_byte_t redirect_uri_is_relative;
 	apr_uri_t r_uri;
 	server_rec *s = r->server;
@@ -1485,7 +1485,7 @@ static int oidc_check_dir_level_config_error(request_rec *r) {
 		return oidc_check_config_error(s, OIDCRedirectURI);
 
 	redirect_uri_is_relative = (oidc_cfg_dir_redirect_uri_get(r)[0] == OIDC_CHAR_FORWARD_SLASH);
-	apr_uri_parse(s->process->pconf, oidc_cfg_dir_redirect_uri_get(r), &r_uri);
+	apr_uri_parse(pool, oidc_cfg_dir_redirect_uri_get(r), &r_uri);
 	if (!redirect_uri_is_relative) {
 		if (_oidc_strnatcasecmp(r_uri.scheme, "https") != 0) {
 			oidc_swarn(s,
