@@ -1,3 +1,25 @@
+03/06/2026
+- cast curl timeouts in options to long to avoid compiler warnings
+- bump to 2.4.19.3dev
+
+02/23/2026
+- fix claims based authorization in OAuth 2.0 RS mode (AuthType oauth20 and AuthType auth-openidc)
+  regression introduced in 2.4.19
+- release 2.4.19.2
+
+02/01/2026
+- release 2.4.19.1
+
+01/29/2026
+- fix merging top-level configured OIDCCryptoPassphrase into vhosts that have not explicitly configured it
+  regression introduced in 2.4.19
+
+01/28/2026
+- refresh: fix releasing the best effort distributed refresh lock immediately after refreshing
+  the access token fails to avoid parallel requests queuing up and blocking threads; also
+  avoid trying the same prevously failed refresh request again, at least for 30 seconds
+- bump to 2.4.19.1rc0
+
 01/03/2026
 - test: fix long int test in test_util.c so that it fits within a 32bit long int size; see #1375; thanks @moschlar
 - update copyright year to 2026

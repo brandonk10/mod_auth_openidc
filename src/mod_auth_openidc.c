@@ -1565,10 +1565,8 @@ static int oidc_config_check_vhost_config(apr_pool_t *pool, server_rec *s) {
 
 	oidc_sdebug(s, "enter");
 
-	if (oidc_cfg_crypto_passphrase_secret1_get(cfg) == NULL) {
-		oidc_serror(s, "'" OIDCCryptoPassphrase "' must be set");
-		return HTTP_INTERNAL_SERVER_ERROR;
-	}
+	if (oidc_cfg_crypto_passphrase_secret1_get(cfg) == NULL)
+		oidc_cfg_crypto_passphrase_secret1_set(cfg, oidc_util_rand_hex_str(NULL, s->process->pool, 32));
 
 	if ((oidc_cfg_metadata_dir_get(cfg) != NULL) ||
 	    (oidc_cfg_provider_issuer_get(oidc_cfg_provider_get(cfg)) != NULL) ||
