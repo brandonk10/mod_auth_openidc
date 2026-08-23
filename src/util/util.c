@@ -437,9 +437,13 @@ void oidc_util_table_add_query_encoded_params(apr_pool_t *pool, apr_table_t *tab
 }
 
 char *oidc_util_hex_encode(apr_pool_t *pool, const unsigned char *bytes, unsigned int len) {
-	char *s = "";
-	for (unsigned int i = 0; i < len; i++)
-		s = apr_psprintf(pool, "%s%02x", s, bytes[i]);
+	static const char hex[] = "0123456789abcdef";
+	char *s = apr_palloc(pool, ((size_t)len * 2) + 1);
+	for (unsigned int i = 0; i < len; i++) {
+		s[i * 2] = hex[bytes[i] >> 4];
+		s[(i * 2) + 1] = hex[bytes[i] & 0x0f];
+	}
+	s[(size_t)len * 2] = '\0';
 	return s;
 }
 

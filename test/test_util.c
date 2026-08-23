@@ -1309,6 +1309,17 @@ START_TEST(test_util_hex_and_hash) {
 	ck_assert_ptr_nonnull(hex);
 	ck_assert_str_eq(hex, "ab01");
 
+	/* zero length yields an empty string, not NULL */
+	hex = oidc_util_hex_encode(r->pool, bytes, 0);
+	ck_assert_ptr_nonnull(hex);
+	ck_assert_str_eq(hex, "");
+
+	/* every nibble value, lower-case */
+	const unsigned char all[] = {0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0xff};
+	hex = oidc_util_hex_encode(r->pool, all, sizeof(all));
+	ck_assert_str_eq(hex, "0012345678"
+			      "9abcdef0ff");
+
 	ck_assert_msg(oidc_util_hash_string_and_base64url_encode(r, "SHA256", "test", &out) == TRUE,
 		      "oidc_util_hash_string_and_base64url_encode failed");
 	ck_assert_ptr_nonnull(out);

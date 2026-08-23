@@ -2081,6 +2081,9 @@ START_TEST(test_handle_response_post_preserve_javascript) {
 	ck_assert_msg(_oidc_strstr(js, "mod_auth_openidc_preserve_post_params") != NULL,
 		      "generated javascript must reference the preserve-post session storage");
 	ck_assert_msg(_oidc_strstr(js, "name") != NULL, "the POSTed parameters must be embedded in the javascript");
+	/* the parameters are joined into one object literal, in POST order, comma-separated without spaces */
+	ck_assert_msg(_oidc_strstr(js, "JSON.stringify({ 'name': 'alice','grp': 'admins' })") != NULL,
+		      "unexpected preserved-POST object literal in: %s", js);
 }
 END_TEST
 

@@ -506,6 +506,36 @@ START_TEST(test_jwk_parse_x5c_malformed) {
 }
 END_TEST
 
+/*
+ * an "x5c" value of the size the HTTP layer lets a provider's JWKS carry must be rejected in linear
+ * time and memory: PEM-wrapping it used to re-print the accumulated string per 75-character line,
+ * making the pool memory consumed quadratic in its length (OSS-Fuzz 551146117: ~2.5 GB for 440 KB)
+ */
+START_TEST(test_jwk_parse_x5c_oversized) {
+	apr_pool_t *pool = NULL;
+	oidc_jose_error_t err;
+	oidc_json_t *json = NULL;
+	char *s_err = NULL;
+	const size_t n = 2 * 1024 * 1024;
+
+	apr_pool_create(&pool, oidc_test_pool_get());
+
+	/* exactly the fuzzer's shape: a key whose only material is a (non-certificate) x5c string */
+	char *s_json = apr_palloc(pool, n + 32);
+	char *p = s_json;
+	p += apr_snprintf(p, 32, "{\"kty\":\"RSA\",\"x5c\":[\"");
+	_oidc_memset(p, 'A', n);
+	p += n;
+	apr_snprintf(p, 8, "\"]}");
+
+	ck_assert_int_eq(oidc_json_parse(pool, s_json, 0, &json, &s_err), TRUE);
+	ck_assert_ptr_null(oidc_jwk_parse(pool, json, &err));
+	oidc_json_decref(json);
+
+	apr_pool_destroy(pool);
+}
+END_TEST
+
 START_TEST(test_jwt_hdr_set_json_malformed) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	oidc_jose_error_t err;
@@ -1814,6 +1844,7 @@ int main(void) {
 	tcase_add_test(core, test_jose_jwe_decrypt_plaintext);
 	tcase_add_test(core, test_jwt_sign_parse_compressed);
 	tcase_add_test(core, test_jwk_parse_x5c_malformed);
+	tcase_add_test(core, test_jwk_parse_x5c_oversized);
 	tcase_add_test(core, test_jwt_hdr_set_json_malformed);
 	tcase_add_test(core, test_jwt_parse_payload_not_object);
 	tcase_add_test(core, test_jwt_verify_kid_not_found);

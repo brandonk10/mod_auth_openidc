@@ -982,19 +982,35 @@ static apr_byte_t _oidc_jwk_parse_x5c(apr_pool_t *pool, const json_t *json, cjos
 
 	const char *s_x5c = json_string_value(v);
 
-	/* PEM-format it */
-	const int chunk = 75;
-	int i = 0;
-	char *s = apr_psprintf(pool, "%s\n", OIDC_JOSE_CERT_BEGIN);
-	const int n = (int)_oidc_strlen(s_x5c);
-	while (i < n) {
-		s = apr_psprintf(pool, "%s%s\n", s, apr_pstrmemdup(pool, s_x5c + i, (i + chunk) > n ? (n - i) : chunk));
-		i += chunk;
+	/*
+	 * PEM-format it: the header, the base64 data in lines of at most "chunk" characters, the footer.
+	 * The result is sized and allocated once up front: the x5c value comes from the provider's JWKS
+	 * (up to the HTTP response limit) and re-printing the accumulated string per line, as was done
+	 * before, made the pool memory consumed by this function quadratic in its length (OSS-Fuzz 551146117)
+	 */
+	const size_t chunk = 75;
+	const size_t n = _oidc_strlen(s_x5c);
+	const size_t n_lines = (n + chunk - 1) / chunk;
+	const size_t len = _oidc_strlen(OIDC_JOSE_CERT_BEGIN) + 1 + n + n_lines + _oidc_strlen(OIDC_JOSE_CERT_END) + 1;
+	char *s = apr_palloc(pool, len + 1);
+	char *p = s;
+
+	_oidc_memcpy(p, OIDC_JOSE_CERT_BEGIN, _oidc_strlen(OIDC_JOSE_CERT_BEGIN));
+	p += _oidc_strlen(OIDC_JOSE_CERT_BEGIN);
+	*p++ = '\n';
+	for (size_t i = 0; i < n; i += chunk) {
+		const size_t m = ((n - i) < chunk) ? (n - i) : chunk;
+		_oidc_memcpy(p, s_x5c + i, m);
+		p += m;
+		*p++ = '\n';
 	}
-	s = apr_psprintf(pool, "%s%s\n", s, OIDC_JOSE_CERT_END);
+	_oidc_memcpy(p, OIDC_JOSE_CERT_END, _oidc_strlen(OIDC_JOSE_CERT_END));
+	p += _oidc_strlen(OIDC_JOSE_CERT_END);
+	*p++ = '\n';
+	*p = '\0';
 
 	/* put it in BIO memory */
-	BIO *input = BIO_new_mem_buf(s, (int)_oidc_strlen(s));
+	BIO *input = BIO_new_mem_buf(s, (int)(p - s));
 	if (input == NULL) {
 		oidc_jose_error_openssl(err, "BIO_new_mem_buf");
 		return FALSE;

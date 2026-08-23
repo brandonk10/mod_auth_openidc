@@ -1,3 +1,12 @@
+08/23/2026
+- jose: build the PEM wrapper for an "x5c" JWK element in a single allocation; re-printing the accumulated
+  string per line made the memory (and CPU) spent on one key quadratic in the length of the x5c value,
+  which a provider controls through its JWKs document (OSS-Fuzz 551146117, found by the jwks fuzz target);
+  the same accumulate-per-element pattern is replaced in the preserved-POST parameter JSON (whose element
+  count a client controls), in the published JWKs document and in oidc_util_hex_encode()
+- jose: fail the import of an RSA or EC key whose required public components (n/e, x/y) OpenSSL 3.x cannot
+  supply instead of dereferencing a NULL BIGNUM (OSS-Fuzz 550951150, found by the pem_key fuzz target)
+
 08/21/2026
 - test/fuzz: build the fuzz targets with the library's USE_* feature macros so oidc_cfg_t has the same
   layout on both sides; fixes fuzz_url crashing on every input in the OSS-Fuzz build

@@ -135,14 +135,16 @@ apr_byte_t oidc_response_post_preserve_javascript(request_rec *r, const char *lo
 		return FALSE;
 	}
 
+	/* collect the pairs and join them once: appending to the accumulated string per parameter would make
+	 * the pool memory used here quadratic in the number of (client-supplied) POST parameters */
 	const apr_array_header_t *arr = apr_table_elts(params);
 	const apr_table_entry_t *elts = (const apr_table_entry_t *)arr->elts;
-	char *json = "";
+	apr_array_header_t *pairs = apr_array_make(r->pool, arr->nelts, sizeof(const char *));
 	for (int i = 0; i < arr->nelts; i++) {
-		json = apr_psprintf(r->pool, "%s'%s': '%s'%s", json, oidc_http_url_encode(r, elts[i].key),
-				    oidc_http_url_encode(r, elts[i].val), i < arr->nelts - 1 ? "," : "");
+		APR_ARRAY_PUSH(pairs, const char *) = apr_psprintf(
+		    r->pool, "'%s': '%s'", oidc_http_url_encode(r, elts[i].key), oidc_http_url_encode(r, elts[i].val));
 	}
-	json = apr_psprintf(r->pool, "{ %s }", json);
+	char *json = apr_psprintf(r->pool, "{ %s }", apr_array_pstrcat(r->pool, pairs, OIDC_CHAR_COMMA));
 
 	if ((oidc_cfg_post_preserve_template_get(cfg) != NULL) &&
 	    (oidc_util_html_send_in_template(

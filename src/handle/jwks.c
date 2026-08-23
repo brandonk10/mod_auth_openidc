@@ -46,27 +46,26 @@
  * handle request for JWKs
  */
 int oidc_jwks_request(request_rec *r, const oidc_cfg_t *c) {
-	/* pickup requested JWKs type */
-	char *jwks = apr_pstrdup(r->pool, "{ \"keys\" : [");
-	apr_byte_t first = TRUE;
+	const apr_array_header_t *keys = oidc_cfg_public_keys_get(c);
+	apr_array_header_t *elems = apr_array_make(r->pool, keys ? keys->nelts : 0, sizeof(const char *));
 	const oidc_jwk_t *jwk = NULL;
 	oidc_jose_error_t err;
 	char *s_json = NULL;
 
-	/* loop over the RSA/EC public keys */
-	for (int i = 0; oidc_cfg_public_keys_get(c) && i < oidc_cfg_public_keys_get(c)->nelts; i++) {
-		jwk = APR_ARRAY_IDX(oidc_cfg_public_keys_get(c), i, oidc_jwk_t *);
+	/* loop over the RSA/EC public keys, collecting their JSON representations to be joined once */
+	for (int i = 0; keys && i < keys->nelts; i++) {
+		jwk = APR_ARRAY_IDX(keys, i, oidc_jwk_t *);
 
 		if (oidc_jwk_to_json(r->pool, jwk, &s_json, &err) == TRUE) {
-			jwks = apr_psprintf(r->pool, "%s%s %s ", jwks, first ? "" : ",", s_json);
-			first = FALSE;
+			APR_ARRAY_PUSH(elems, const char *) = apr_psprintf(r->pool, " %s ", s_json);
 		} else {
 			oidc_error(r, "could not convert RSA/EC JWK to JSON using oidc_jwk_to_json: %s",
 				   oidc_jose_e2s(r->pool, err));
 		}
 	}
 
-	jwks = apr_psprintf(r->pool, "%s ] }", jwks);
+	const char *jwks =
+	    apr_psprintf(r->pool, "{ \"keys\" : [%s ] }", apr_array_pstrcat(r->pool, elems, OIDC_CHAR_COMMA));
 
 	return oidc_util_http_send(r, jwks, _oidc_strlen(jwks), OIDC_HTTP_CONTENT_TYPE_JSON, OK);
 }
