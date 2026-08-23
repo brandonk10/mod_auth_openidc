@@ -591,8 +591,12 @@ static apr_byte_t _oidc_jwk_rsa_key_to_jwk(apr_pool_t *pool, const EVP_PKEY *pke
 	_oidc_memset(&key_spec, 0, sizeof(cjose_jwk_rsa_keyspec));
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
-	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_N, &rsa_n);
-	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_E, &rsa_e);
+	/* the modulus and exponent are required; a NULL BIGNUM here would crash BN_num_bytes() below */
+	if (!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_N, &rsa_n) ||
+	    !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_E, &rsa_e)) {
+		oidc_jose_error_openssl(err, "EVP_PKEY_get_bn_param(OSSL_PKEY_PARAM_RSA_N/E)");
+		goto end;
+	}
 	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_D, &rsa_d);
 #else
 	/* get the RSA key from the public key struct */
@@ -676,8 +680,12 @@ static apr_byte_t _oidc_jwk_ec_key_to_jwk(apr_pool_t *pool, const EVP_PKEY *pkey
 	char curve_name[64];
 	size_t curve_name_len = 0;
 
-	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_PUB_X, &ec_x);
-	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_PUB_Y, &ec_y);
+	/* a parseable EC key can lack a public point (no affine coordinates); see OSS-Fuzz issue 550951150 */
+	if (!EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_PUB_X, &ec_x) ||
+	    !EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_PUB_Y, &ec_y)) {
+		oidc_jose_error_openssl(err, "EVP_PKEY_get_bn_param(OSSL_PKEY_PARAM_EC_PUB_X/Y)");
+		goto end;
+	}
 	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_PRIV_KEY, &ec_d);
 	if (!EVP_PKEY_get_utf8_string_param(pkey, OSSL_PKEY_PARAM_GROUP_NAME, curve_name, sizeof(curve_name),
 					    &curve_name_len)) {

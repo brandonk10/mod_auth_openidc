@@ -80,12 +80,11 @@ static const struct {
     {"f6qtj", "{\"kty\":\"EC\",\"kid\":\"f6qtj\",\"use\":\"sig\","
 	      "\"x\":\"iARwFlN3B3xa8Zn_O-CVfqry68tXIhO9DckKo1yrNg0\","
 	      "\"y\":\"583S_mPS7YVZtLCjx2O69G_JzQPnMxjieOli-9cc_6Q\",\"crv\":\"P-256\"}"},
-    {"rs256",
-     "{\"kty\":\"RSA\",\"e\":\"AQAB\","
-     "\"n\":\"3lDyn_ZvG32Pw5kYbRuVxHsPfe9Xt8s9vOXnt8z7_T-hZZvealNhCxz9VEwTJ7TsZ9CLi5c30FjoEJYFkKdd"
-     "LAdxKo0oOXWc_AWrQvPwht9a-o6dX2fL_9CmXW1hGHXMH0qiLMrFqMSzZeh-GUY6F1woE_eKsAo6LOhP8X77FlEQT2Eu"
-     "71wu8KC4B3sH_9QTco50KNw14-bRY5j2V2TZelvsXJnvrN4lXtEVYWFkREKeXzMH8DhDyZzh0NcHa7dFBa7rDusyfIHj"
-     "uP6uAju_Ao6hhdOGjlKePMVtfusWBAI7MWDChLTqiCTvlZnCpkpTTh5m-i7TbE1TwmdbLceq1w\"}"},
+    {"rs256", "{\"kty\":\"RSA\",\"e\":\"AQAB\","
+	      "\"n\":\"3lDyn_ZvG32Pw5kYbRuVxHsPfe9Xt8s9vOXnt8z7_T-hZZvealNhCxz9VEwTJ7TsZ9CLi5c30FjoEJYFkKdd"
+	      "LAdxKo0oOXWc_AWrQvPwht9a-o6dX2fL_9CmXW1hGHXMH0qiLMrFqMSzZeh-GUY6F1woE_eKsAo6LOhP8X77FlEQT2Eu"
+	      "71wu8KC4B3sH_9QTco50KNw14-bRY5j2V2TZelvsXJnvrN4lXtEVYWFkREKeXzMH8DhDyZzh0NcHa7dFBa7rDusyfIHj"
+	      "uP6uAju_Ao6hhdOGjlKePMVtfusWBAI7MWDChLTqiCTvlZnCpkpTTh5m-i7TbE1TwmdbLceq1w\"}"},
     {"rsa-oaep",
      "{\"kty\":\"RSA\","
      "\"n\":\"oahUIoWw0K0usKNuOR6H4wkf4oBUXHTxRvgb48E-BVvxkeDNjbC4he8rUWcJoZmds2h7M70imEVhRU5djINXtqllXI4D"
