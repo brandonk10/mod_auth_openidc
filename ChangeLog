@@ -1,3 +1,10 @@
+08/24/2026
+- http/handle: build the authorization request's query string (and POST auto-submit form) in a single
+  join instead of re-printing the accumulated string per parameter, which made the memory (and CPU)
+  quadratic in the parameter count; a client can drive that count through "auth_request_params" on a
+  discovery response, turning it into an out-of-memory (OSS-Fuzz 551746349, found by the
+  discovery_response fuzz target)
+
 08/23/2026
 - jose: build the PEM wrapper for an "x5c" JWK element in a single allocation; re-printing the accumulated
   string per line made the memory (and CPU) spent on one key quadratic in the length of the x5c value,

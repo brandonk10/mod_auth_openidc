@@ -488,6 +488,39 @@ START_TEST(test_form_encoded_data_empty) {
 }
 END_TEST
 
+START_TEST(test_query_encoded_url_order_and_scale) {
+	request_rec *r = oidc_test_request_get();
+
+	/* byte-exact ordering and separators; URL-safe keys/values so encoding is the identity */
+	apr_table_t *params = apr_table_make(r->pool, 3);
+	apr_table_add(params, "a", "1");
+	apr_table_add(params, "b", "2");
+	apr_table_add(params, "c", "3");
+
+	ck_assert_str_eq(oidc_http_query_encoded_url(r, "https://example.com/path", params),
+			 "https://example.com/path?a=1&b=2&c=3");
+	/* a URL that already carries a query gets '&', not '?' */
+	ck_assert_str_eq(oidc_http_query_encoded_url(r, "https://example.com/path?z=0", params),
+			 "https://example.com/path?z=0&a=1&b=2&c=3");
+	ck_assert_str_eq(oidc_http_form_encoded_data(r, params), "a=1&b=2&c=3");
+
+	/*
+	 * many parameters must stay linear: the previous accumulate-per-parameter code re-printed the
+	 * whole encoded string once per parameter, which is O(n^2) in memory and time and turned a
+	 * request-controlled parameter count into an out-of-memory (OSS-Fuzz 551746349). The old code
+	 * allocates GBs and dies here; the fixed code finishes in milliseconds.
+	 */
+	const int n = 20000;
+	apr_table_t *many = apr_table_make(r->pool, n);
+	for (int i = 0; i < n; i++)
+		apr_table_addn(many, apr_psprintf(r->pool, "k%d", i), "v");
+	char *big = oidc_http_query_encoded_url(r, "https://example.com/", many);
+	ck_assert_ptr_nonnull(big);
+	ck_assert_msg(_oidc_strstr(big, "https://example.com/?k0=v&k1=v&") == big, "first params present and in order");
+	ck_assert_msg(_oidc_strstr(big, apr_psprintf(r->pool, "&k%d=v", n - 1)) != NULL, "last param present");
+}
+END_TEST
+
 START_TEST(test_proxy_s2auth_negotiate) {
 #ifdef CURLAUTH_NEGOTIATE
 	ck_assert_msg(oidc_http_proxy_s2auth(OIDC_HTTP_PROXY_AUTH_NEGOTIATE) == CURLAUTH_NEGOTIATE,
@@ -1411,6 +1444,7 @@ int main(void) {
 	tcase_add_test(accept, test_hdr_out_crlf_sanitized);
 	tcase_add_test(accept, test_forwarded_space_terminated);
 	tcase_add_test(accept, test_form_encoded_data_empty);
+	tcase_add_test(accept, test_query_encoded_url_order_and_scale);
 	tcase_add_test(accept, test_proxy_s2auth_negotiate);
 	tcase_add_test(accept, test_cookie_path_request_path_null);
 	tcase_add_test(accept, test_cookie_path_mismatch_warns);

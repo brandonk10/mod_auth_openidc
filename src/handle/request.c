@@ -152,7 +152,10 @@ static int oidc_request_authorization_set_cookie(request_rec *r, const oidc_cfg_
 /* context structure for encoding parameters */
 typedef struct oidc_request_form_post_ctx_t {
 	request_rec *r;
-	const char *html_body;
+	/* the "<input ...>" lines, joined once by the caller below; growing the whole body per parameter
+	 * instead made the work quadratic in the number of parameters, which a request-controlled
+	 * parameter count can turn into an OOM (OSS-Fuzz 551746349) */
+	apr_array_header_t *inputs;
 } oidc_request_form_post_ctx_t;
 
 /*
@@ -161,8 +164,8 @@ typedef struct oidc_request_form_post_ctx_t {
 static int oidc_request_form_post_param_add(void *rec, const char *key, const char *value) {
 	oidc_request_form_post_ctx_t *ctx = (oidc_request_form_post_ctx_t *)rec;
 	oidc_debug(ctx->r, "processing: %s=%s", key, value);
-	ctx->html_body =
-	    apr_psprintf(ctx->r->pool, "%s      <input type=\"hidden\" name=\"%s\" value=\"%s\">\n", ctx->html_body,
+	APR_ARRAY_PUSH(ctx->inputs, const char *) =
+	    apr_psprintf(ctx->r->pool, "      <input type=\"hidden\" name=\"%s\" value=\"%s\">\n",
 			 oidc_util_html_escape(ctx->r->pool, key), oidc_util_html_escape(ctx->r->pool, value));
 	return 1;
 }
@@ -174,22 +177,20 @@ static const char *oidc_request_html_post(request_rec *r, const char *url, const
 
 	oidc_debug(r, "enter");
 
-	/* the action is the provider's authorization endpoint, i.e. it comes from provider
-	 * metadata rather than from us; escape it like the parameters added below already are */
-	const char *html_body = apr_psprintf(r->pool,
-					     "    <p>Submitting Authentication Request...</p>\n"
-					     "    <form method=\"post\" action=\"%s\">\n"
-					     "      <p>\n",
-					     oidc_util_html_escape(r->pool, url));
-
-	oidc_request_form_post_ctx_t data = {r, html_body};
+	oidc_request_form_post_ctx_t data = {
+	    r, apr_array_make(r->pool, params ? apr_table_elts(params)->nelts : 0, sizeof(const char *))};
 	apr_table_do(oidc_request_form_post_param_add, &data, params, NULL);
 
-	html_body = apr_psprintf(r->pool, "%s%s", data.html_body,
-				 "      </p>\n"
-				 "    </form>\n");
-
-	return html_body;
+	/* the action is the provider's authorization endpoint, i.e. it comes from provider
+	 * metadata rather than from us; escape it like the parameters added above already are */
+	return apr_psprintf(r->pool,
+			    "    <p>Submitting Authentication Request...</p>\n"
+			    "    <form method=\"post\" action=\"%s\">\n"
+			    "      <p>\n"
+			    "%s"
+			    "      </p>\n"
+			    "    </form>\n",
+			    oidc_util_html_escape(r->pool, url), apr_array_pstrcat(r->pool, data.inputs, '\0'));
 }
 /*
  * send the authentication request via an HTML form auto-POST page

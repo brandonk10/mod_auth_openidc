@@ -542,7 +542,10 @@ end:
 /* context structure for encoding parameters */
 typedef struct oidc_http_encode_t {
 	request_rec *r;
-	char *encoded_params;
+	/* the encoded "key=value" fragments, joined once with "&" by the callers below; accumulating
+	 * them into a growing string per parameter instead made the work quadratic in the number of
+	 * parameters, which a request-controlled parameter count can turn into an OOM (OSS-Fuzz 551746349) */
+	apr_array_header_t *elems;
 } oidc_http_encode_t;
 
 /*
@@ -682,9 +685,8 @@ const char *oidc_http_redact_json_for_log(request_rec *r, const char *data) {
  */
 static int oidc_http_add_form_url_encoded_param(void *rec, const char *key, const char *value) {
 	oidc_http_encode_t *ctx = (oidc_http_encode_t *)rec;
-	const char *sep = ctx->encoded_params ? OIDC_STR_AMP : "";
-	ctx->encoded_params = apr_psprintf(ctx->r->pool, "%s%s%s=%s", ctx->encoded_params ? ctx->encoded_params : "",
-					   sep, oidc_http_url_encode(ctx->r, key), oidc_http_url_encode(ctx->r, value));
+	APR_ARRAY_PUSH(ctx->elems, const char *) = apr_psprintf(
+	    ctx->r->pool, "%s=%s", oidc_http_url_encode(ctx->r, key), oidc_http_url_encode(ctx->r, value));
 	return 1;
 }
 
@@ -694,12 +696,21 @@ static int oidc_http_add_form_url_encoded_param(void *rec, const char *key, cons
  */
 static int oidc_http_add_form_encoded_param_for_log(void *rec, const char *key, const char *value) {
 	oidc_http_encode_t *ctx = (oidc_http_encode_t *)rec;
-	const char *sep = ctx->encoded_params ? OIDC_STR_AMP : "";
 	const char *safe_value = value ? value : "";
 	const char *v = oidc_http_param_is_sensitive(key) ? "***" : safe_value;
-	ctx->encoded_params =
-	    apr_psprintf(ctx->r->pool, "%s%s%s=%s", ctx->encoded_params ? ctx->encoded_params : "", sep, key, v);
+	APR_ARRAY_PUSH(ctx->elems, const char *) = apr_psprintf(ctx->r->pool, "%s=%s", key, v);
 	return 1;
+}
+
+/*
+ * run one of the per-parameter encoders above over a table and join the collected "key=value"
+ * fragments into a single "&"-separated string in one allocation; returns NULL when there are none
+ */
+static char *oidc_http_encode_params(request_rec *r, const apr_table_t *params,
+				     int (*encoder)(void *, const char *, const char *)) {
+	oidc_http_encode_t ctx = {r, apr_array_make(r->pool, apr_table_elts(params)->nelts, sizeof(const char *))};
+	apr_table_do(encoder, &ctx, params, NULL);
+	return (ctx.elems->nelts > 0) ? apr_array_pstrcat(r->pool, ctx.elems, OIDC_CHAR_AMP) : NULL;
 }
 
 /*
@@ -712,18 +723,14 @@ char *oidc_http_query_encoded_url(request_rec *r, const char *url, const apr_tab
 		return NULL;
 	}
 	if ((params != NULL) && (apr_table_elts(params)->nelts > 0)) {
-		oidc_http_encode_t data = {r, NULL};
-		apr_table_do(oidc_http_add_form_url_encoded_param, &data, params, NULL);
+		const char *encoded_params = oidc_http_encode_params(r, params, oidc_http_add_form_url_encoded_param);
 		const char *sep = NULL;
-		if (data.encoded_params)
+		if (encoded_params)
 			sep = strchr(url, OIDC_CHAR_QUERY) != NULL ? OIDC_STR_AMP : OIDC_STR_QUERY;
-		result = apr_psprintf(r->pool, "%s%s%s", url, sep ? sep : "",
-				      data.encoded_params ? data.encoded_params : "");
+		result = apr_psprintf(r->pool, "%s%s%s", url, sep ? sep : "", encoded_params ? encoded_params : "");
 
-		oidc_http_encode_t log_data = {r, NULL};
-		apr_table_do(oidc_http_add_form_encoded_param_for_log, &log_data, params, NULL);
-		oidc_debug(r, "url=%s%s%s", url, sep ? sep : "",
-			   log_data.encoded_params ? log_data.encoded_params : "");
+		const char *log_params = oidc_http_encode_params(r, params, oidc_http_add_form_encoded_param_for_log);
+		oidc_debug(r, "url=%s%s%s", url, sep ? sep : "", log_params ? log_params : "");
 	} else {
 		result = apr_pstrdup(r->pool, url);
 		oidc_debug(r, "url=%s", result);
@@ -737,13 +744,10 @@ char *oidc_http_query_encoded_url(request_rec *r, const char *url, const apr_tab
 char *oidc_http_form_encoded_data(request_rec *r, const apr_table_t *params) {
 	char *data = NULL;
 	if ((params != NULL) && (apr_table_elts(params)->nelts > 0)) {
-		oidc_http_encode_t encode_data = {r, NULL};
-		apr_table_do(oidc_http_add_form_url_encoded_param, &encode_data, params, NULL);
-		data = encode_data.encoded_params;
+		data = oidc_http_encode_params(r, params, oidc_http_add_form_url_encoded_param);
 
-		oidc_http_encode_t log_data = {r, NULL};
-		apr_table_do(oidc_http_add_form_encoded_param_for_log, &log_data, params, NULL);
-		oidc_debug(r, "data=%s", log_data.encoded_params ? log_data.encoded_params : "(null)");
+		const char *log_params = oidc_http_encode_params(r, params, oidc_http_add_form_encoded_param_for_log);
+		oidc_debug(r, "data=%s", log_params ? log_params : "(null)");
 	} else {
 		oidc_debug(r, "data=(null)");
 	}
