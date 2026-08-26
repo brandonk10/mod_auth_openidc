@@ -12,7 +12,7 @@ parser, reusing the libcheck test fixture (`test/util.c`) for a ready
 | `fuzz_url`    | `oidc_validate_redirect_url`       | the open-redirect guard (return-to / logout URLs), in same-host, any-host and `OIDCRedirectURLsAllowed` configurations |
 | `fuzz_jwt`    | `oidc_jwt_parse` + `oidc_jwt_verify` | compact JWT/JWS/JWE parse, JWE decryption and signature verification against a fixed key set (the unit tests' RFC vectors) |
 | `fuzz_json`   | `oidc_json_decode_object`          | JSON decode (token / userinfo / metadata)         |
-| `fuzz_cookie` | `oidc_http_get_cookie`             | raw `Cookie` request header tokenizing            |
+| `fuzz_cookie` | `oidc_http_get_cookie`, `oidc_http_get_chunked_cookie`, `oidc_state_cookies_clean_expired` | raw `Cookie` request header tokenizing, chunked session-cookie reassembly (a browser-supplied chunk count) and the expired-state-cookie sweep with its `OIDCStateMaxNumberOfCookies` cap |
 | `fuzz_response_header` | `oidc_http_response_header` | raw OP response header line parsing (curl callback) |
 | `fuzz_form_params` | `oidc_util_read_form_encoded_params` | authz response / back-channel logout param parsing |
 | `fuzz_metadata` | `oidc_metadata_{provider_is_valid,provider_parse,conf_parse,client_parse}` | provider/conf/client metadata field extraction (discovery responses) |
