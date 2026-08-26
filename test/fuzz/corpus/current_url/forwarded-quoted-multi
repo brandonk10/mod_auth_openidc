@@ -1,0 +1,3 @@
+/
+Host: www.example.com
+Forwarded: for=192.0.2.43, for="[2001:db8:cafe::17]";proto=HTTPS;Host="front.example.com"

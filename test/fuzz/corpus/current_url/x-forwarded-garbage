@@ -1,0 +1,4 @@
+/
+Host: www.example.com
+X-Forwarded-Port: notaport
+X-Forwarded-Proto: gopher

@@ -1,0 +1,5 @@
+/
+Host: www.example.com
+X-Forwarded-Host: [2001:db8::1]:8443
+X-Forwarded-Port: 8443
+X-Forwarded-Proto: https
