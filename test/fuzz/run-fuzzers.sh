@@ -68,6 +68,7 @@ replay fuzz_backchannel_logout "$dir"/fuzz/corpus/backchannel_logout/*
 replay fuzz_authz_response "$dir"/fuzz/corpus/authz_response/*
 replay fuzz_current_url "$dir"/fuzz/corpus/current_url/*
 replay fuzz_bearer_token "$dir"/fuzz/corpus/bearer_token/*
+replay fuzz_redirect_uri "$dir"/fuzz/corpus/redirect_uri/*
 
 # a run in which every target was skipped proves nothing: report it as a failure
 # rather than as a pass, so a build-condition or rename that stops producing the
