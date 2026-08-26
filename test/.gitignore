@@ -53,6 +53,7 @@
 /fuzz_current_url
 /fuzz_bearer_token
 /fuzz_redirect_uri
+/fuzz_post_preserve
 /fuzz/*.o
 /fuzz/.deps/
 /fuzz/.dirstamp
