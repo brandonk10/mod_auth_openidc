@@ -1,0 +1,27 @@
+# Bearer-token shapes for fuzz_bearer_token: the Authorization schemes, the
+# parameter and cookie the token is read from, JOSE headers, and the claims
+# the resource-server validation reads (iat=0/exp=0 are filled in by the
+# target when it signs a "{...}" payload).
+"Bearer "
+"Basic "
+"bearer "
+"access_token="
+"PA.global="
+"&"
+"; "
+"\x0a"
+"eyJhbGciOiJIUzI1NiJ9."
+"eyJhbGciOiJub25lIn0."
+"eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0."
+"eyJhbGciOiJBMjU2S1ciLCJlbmMiOiJBMjU2R0NNIn0."
+"{\"iss\":\"https://as.example.com\",\"aud\":\"fuzz-resource\",\"sub\":\"alice\",\"iat\":0,\"exp\":0}"
+"\"iss\":\"https://as.example.com\""
+"\"aud\":\"fuzz-resource\""
+"\"aud\":[\"fuzz-resource\"]"
+"\"sub\":"
+"\"exp\":0"
+"\"iat\":0"
+"\"scope\":"
+"\"client_id\":"
+"\"email\":"
+"\"groups\":"

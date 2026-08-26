@@ -1,0 +1,1 @@
+Bearer {"iss":"https://as.example.com","aud":["other","fuzz-resource"],"sub":"alice","iat":0,"exp":0,"scope":"read"}

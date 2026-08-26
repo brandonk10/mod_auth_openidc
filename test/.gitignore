@@ -51,6 +51,7 @@
 /fuzz_backchannel_logout
 /fuzz_authz_response
 /fuzz_current_url
+/fuzz_bearer_token
 /fuzz/*.o
 /fuzz/.deps/
 /fuzz/.dirstamp

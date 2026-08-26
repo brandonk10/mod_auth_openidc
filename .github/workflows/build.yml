@@ -227,7 +227,7 @@ jobs:
     - name: Replay seed corpora under sanitizers
       run: |
         cd test/fuzz
-        for t in base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key backchannel_logout authz_response current_url; do
+        for t in base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key backchannel_logout authz_response current_url bearer_token; do
           echo "== replay fuzz_$t =="
           ./build/fuzz_$t corpus/$t/*
         done
