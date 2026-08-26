@@ -106,7 +106,8 @@ oidc_fuzz_targets = \
 	fuzz_state_cookie \
 	fuzz_jwks \
 	fuzz_discovery_response \
-	fuzz_pem_key
+	fuzz_pem_key \
+	fuzz_backchannel_logout
 
 fuzz_base64_SOURCES = fuzz/fuzz_base64.c fuzz/standalone.c
 fuzz_url_SOURCES = fuzz/fuzz_url.c fuzz/standalone.c
@@ -120,6 +121,7 @@ fuzz_state_cookie_SOURCES = fuzz/fuzz_state_cookie.c fuzz/standalone.c
 fuzz_jwks_SOURCES = fuzz/fuzz_jwks.c fuzz/standalone.c
 fuzz_discovery_response_SOURCES = fuzz/fuzz_discovery_response.c fuzz/standalone.c
 fuzz_pem_key_SOURCES = fuzz/fuzz_pem_key.c fuzz/standalone.c
+fuzz_backchannel_logout_SOURCES = fuzz/fuzz_backchannel_logout.c fuzz/standalone.c
 
 check_PROGRAMS = $(oidc_unit_tests) $(oidc_fuzz_targets)
 

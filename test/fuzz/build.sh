@@ -22,6 +22,8 @@
 # Flags are derived from pkg-config and apxs. If a dependency is packaged
 # differently on your system, override without editing this file, e.g.:
 #   FUZZ_LIBS="-lcjose -lhiredis" CC=clang-18 ./build.sh
+# FUZZ_TARGETS limits the build to a subset, e.g. when iterating on one target:
+#   FUZZ_TARGETS="cookie url" ./build.sh
 #
 set -eu
 
@@ -61,8 +63,9 @@ libs="$(pkg-config --libs $pkgs) -lcjose -lhiredis -ljq -lz -lldap -llber \
 
 mkdir -p "$OUT"
 # one entry per test/fuzz/fuzz_<name>.c; keep in sync with oss-fuzz-build.sh, run-fuzzers.sh and ../Makefile.am
-targets="base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key"
+all_targets="base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key backchannel_logout"
 
+targets=${FUZZ_TARGETS:-$all_targets}
 for t in $targets; do
 	src="$here/fuzz_$t.c"
 	[ -f "$src" ] || continue

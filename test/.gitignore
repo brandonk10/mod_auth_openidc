@@ -48,6 +48,7 @@
 /fuzz_jwks
 /fuzz_discovery_response
 /fuzz_pem_key
+/fuzz_backchannel_logout
 /fuzz/*.o
 /fuzz/.deps/
 /fuzz/.dirstamp

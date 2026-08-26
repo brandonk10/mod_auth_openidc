@@ -20,6 +20,7 @@ parser, reusing the libcheck test fixture (`test/util.c`) for a ready
 | `fuzz_jwks` | `oidc_jwks_parse_json`, `oidc_jwk_parse_json` | JWK Set / JWK parsing (jwks_uri documents): RSA/EC/oct material, x5c chains, round-trip serialization |
 | `fuzz_discovery_response` | `oidc_discovery_response` | the discovery-form / 3rd-party-initiated-SSO handler: query + Cookie header in, CSRF check, target_link_uri validation, authorization request + state cookie out (static-provider path only) |
 | `fuzz_pem_key` | `oidc_cfg_parse_key_record`, `oidc_jwk_pem_bio_to_jwk` | key-file directive record syntax and PEM/X.509 → JWK conversion (via a memory BIO) |
+| `fuzz_backchannel_logout` | `oidc_logout` (`?logout=backchannel`) | the unauthenticated back-channel logout endpoint: POST body parsing, logout token parse/decrypt/verify (HS256 against the provider `client_secret`, no `jwks_uri`), iss/iat/aud/azp/events/nonce/jti-replay validation and the sid/sub session cleanup; a leading `{` makes the target sign the bytes as the token payload, so the fuzzer reaches the claim validation behind the signature check |
 
 ## Three build modes
 
