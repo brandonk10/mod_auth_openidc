@@ -70,6 +70,7 @@ replay fuzz_current_url "$dir"/fuzz/corpus/current_url/*
 replay fuzz_bearer_token "$dir"/fuzz/corpus/bearer_token/*
 replay fuzz_redirect_uri "$dir"/fuzz/corpus/redirect_uri/*
 replay fuzz_post_preserve "$dir"/fuzz/corpus/post_preserve/*
+replay fuzz_strings "$dir"/fuzz/corpus/strings/*
 
 # a run in which every target was skipped proves nothing: report it as a failure
 # rather than as a pass, so a build-condition or rename that stops producing the
