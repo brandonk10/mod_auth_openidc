@@ -1,0 +1,1 @@
+=code=c&access_token=AT-1&token_type=Bearer&refresh_token=RT-1&scope=openid+email&id_token=%7B%22iss%22%3A%22https%3A//idp.example.com%22%2C%22aud%22%3A%22client_id%22%2C%22sub%22%3A%22alice%22%2C%22nonce%22%3A%22x%22%2C%22iat%22%3A0%2C%22exp%22%3A0%2C%22c_hash%22%3A%22%40%22%2C%22at_hash%22%3A%22%40%22%7D

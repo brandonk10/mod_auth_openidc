@@ -63,7 +63,7 @@ libs="$(pkg-config --libs $pkgs) -lcjose -lhiredis -ljq -lz -lldap -llber \
 
 mkdir -p "$OUT"
 # one entry per test/fuzz/fuzz_<name>.c; keep in sync with oss-fuzz-build.sh, run-fuzzers.sh and ../Makefile.am
-all_targets="base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key backchannel_logout"
+all_targets="base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key backchannel_logout authz_response"
 
 targets=${FUZZ_TARGETS:-$all_targets}
 for t in $targets; do

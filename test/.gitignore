@@ -49,6 +49,7 @@
 /fuzz_discovery_response
 /fuzz_pem_key
 /fuzz_backchannel_logout
+/fuzz_authz_response
 /fuzz/*.o
 /fuzz/.deps/
 /fuzz/.dirstamp

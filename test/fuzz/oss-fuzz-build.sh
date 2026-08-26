@@ -118,7 +118,7 @@ echo "feature flags: ${feature_cflags:-(none)}"
 # select the engine.
 # ---------------------------------------------------------------------------
 # one entry per test/fuzz/fuzz_<name>.c; keep in sync with build.sh, run-fuzzers.sh and ../Makefile.am
-targets="base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key backchannel_logout"
+targets="base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key backchannel_logout authz_response"
 
 apache_inc=$(apxs -q INCLUDEDIR 2>/dev/null || echo /usr/include/apache2)
 inc="-I$root/src -I$root/test -I$apache_inc -I$prefix/include \

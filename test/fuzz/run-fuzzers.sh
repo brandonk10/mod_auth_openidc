@@ -65,6 +65,7 @@ replay fuzz_jwks "$dir"/fuzz/corpus/jwks/*
 replay fuzz_discovery_response "$dir"/fuzz/corpus/discovery_response/*
 replay fuzz_pem_key "$dir"/fuzz/corpus/pem_key/*
 replay fuzz_backchannel_logout "$dir"/fuzz/corpus/backchannel_logout/*
+replay fuzz_authz_response "$dir"/fuzz/corpus/authz_response/*
 
 # a run in which every target was skipped proves nothing: report it as a failure
 # rather than as a pass, so a build-condition or rename that stops producing the
