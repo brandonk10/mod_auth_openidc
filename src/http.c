@@ -685,8 +685,8 @@ const char *oidc_http_redact_json_for_log(request_rec *r, const char *data) {
  */
 static int oidc_http_add_form_url_encoded_param(void *rec, const char *key, const char *value) {
 	oidc_http_encode_t *ctx = (oidc_http_encode_t *)rec;
-	APR_ARRAY_PUSH(ctx->elems, const char *) = apr_psprintf(
-	    ctx->r->pool, "%s=%s", oidc_http_url_encode(ctx->r, key), oidc_http_url_encode(ctx->r, value));
+	APR_ARRAY_PUSH(ctx->elems, const char *) =
+	    apr_psprintf(ctx->r->pool, "%s=%s", oidc_http_url_encode(ctx->r, key), oidc_http_url_encode(ctx->r, value));
 	return 1;
 }
 
@@ -1011,6 +1011,13 @@ static apr_byte_t oidc_http_request(request_rec *r, const char *url, const char 
 		   http_timeout->connect_timeout, http_timeout->retries, http_timeout->retry_interval,
 		   outgoing_proxy->host_port, outgoing_proxy->username_password ? "****" : "(null)",
 		   (int)outgoing_proxy->auth_type, pass_cookies, ssl_cert, ssl_key, ssl_key_pwd ? "****" : "(null)");
+
+	/* an endpoint that is not configured is a caller error, not a transfer failure: fail here rather
+	 * than hand curl a NULL URL and then back off and retry a request that can never be sent */
+	if (url == NULL) {
+		oidc_error(r, "no URL to send the request to: the endpoint is not configured");
+		return FALSE;
+	}
 
 	curl = oidc_http_curl_acquire();
 	if (curl == NULL) {

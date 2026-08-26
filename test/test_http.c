@@ -881,6 +881,27 @@ static oidc_http_outgoing_proxy_t e2e_no_proxy(void) {
 	return p;
 }
 
+/* an endpoint that is not configured fails before any transfer is attempted: no curl call, no
+ * retry back-off -- a NULL URL used to be handed to curl and then retried after the configured
+ * retry interval, a delay any client could trigger through a path that ends in that request */
+START_TEST(test_e2e_get_null_url) {
+	request_rec *r = oidc_test_request_get();
+	char *response = NULL;
+	long status = 0;
+	oidc_http_timeout_t to = e2e_timeout();
+	oidc_http_outgoing_proxy_t pr = e2e_no_proxy();
+	/* a retry interval long enough that a retried request would be noticed */
+	to.retries = 1;
+	to.retry_interval = 5000;
+	apr_time_t start = apr_time_now();
+	apr_byte_t ok = oidc_http_get(r, NULL, NULL, NULL, NULL, NULL, FALSE, &response, &status, NULL, &to, &pr, NULL,
+				      NULL, NULL, NULL);
+	ck_assert_int_eq(ok, FALSE);
+	ck_assert_ptr_null(response);
+	ck_assert_msg(apr_time_now() - start < apr_time_from_sec(2), "a NULL URL must fail without a retry back-off");
+}
+END_TEST
+
 START_TEST(test_e2e_get_happy_path) {
 	request_rec *r = oidc_test_request_get();
 	oidc_test_http_response_t resp = {
@@ -1471,6 +1492,7 @@ int main(void) {
 	tcase_add_checked_fixture(e2e, oidc_test_setup, oidc_test_teardown);
 	/* default tcase timeout is too tight for the retry test's back-off + connect timeouts */
 	tcase_set_timeout(e2e, 30);
+	tcase_add_test(e2e, test_e2e_get_null_url);
 	tcase_add_test(e2e, test_e2e_get_happy_path);
 	tcase_add_test(e2e, test_e2e_post_form);
 	tcase_add_test(e2e, test_e2e_post_json);

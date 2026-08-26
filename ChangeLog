@@ -1,4 +1,8 @@
 08/27/2026
+- proto/jwt: retry a failed no-"kid" signature verification with a forced JWKs refresh only when the keys
+  came from a JWKs URI: with none configured the retry handed the HTTP layer a NULL URL and a retry
+  back-off, a delay any client could trigger with a bad token (found by the new fuzz targets)
+- session: drop the stale oidc_session_set_client_id() prototype that had no definition
 - test/fuzz: add seven fuzz targets for the browser/internet-facing surfaces -- the back-channel logout
   endpoint, the authorization response, the Host/X-Forwarded-*/Forwarded parsers, OAuth resource-server
   bearer tokens, the redirect_uri dispatcher, POST preservation and the request string helpers -- and run

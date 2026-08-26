@@ -1222,6 +1222,72 @@ START_TEST(test_proto_idtoken_parse_error_paths) {
 }
 END_TEST
 
+/*
+ * a signature failure on a JWT without a kid triggers a forced JWKs refresh, but only when the keys
+ * came from a JWKs URI in the first place: a symmetric signature never does, so a bad HS256 token from
+ * a client must fail without the verifier ever contacting the JWKs URI (it used to, handing the HTTP
+ * layer the request -- and with no jwks_uri configured at all, a NULL URL plus a retry back-off)
+ */
+START_TEST(test_proto_jwt_verify_no_kid_retry_needs_jwks_uri) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	oidc_jose_error_t err;
+	oidc_jwt_t *jwt = NULL;
+	oidc_jwks_uri_t jwks_uri;
+	_oidc_memset(&jwks_uri, 0, sizeof(jwks_uri));
+
+	/* a mock JWKs endpoint that serves exactly two requests, both of which this test makes itself at the
+	 * end: a fetch by the verifier would take the first slot, and its request path would give it away */
+	oidc_test_http_response_t resps[2] = {
+	    {.status_code = 200, .content_type = "application/json", .body = "{\"keys\":[]}"},
+	    {.status_code = 200, .content_type = "application/json", .body = "{\"keys\":[]}"}};
+	oidc_test_http_server_t *srv = oidc_test_http_server_start_seq(r->pool, resps, 2);
+	ck_assert_ptr_nonnull(srv);
+	const char *url = oidc_test_http_server_url(srv, r->pool);
+	jwks_uri.uri = apr_pstrcat(r->pool, url, "/jwks", NULL);
+
+	/* an HS256 token (no kid) signed with one secret, verified against another */
+	oidc_jwk_t *jwk = NULL;
+	ck_assert_int_eq(oidc_util_key_symmetric_create(r, "the-verification-secret-0123456789", 0, NULL, TRUE, &jwk),
+			 TRUE);
+	char *s = proto_sign_idtoken_hs256(r, "alice", NULL, "a-different-signing-secret-0123456789");
+	ck_assert_jwt_parses(r->pool, s, jwt, NULL, err);
+	ck_assert_ptr_null(jwt->header.kid);
+	ck_assert_int_eq(
+	    oidc_proto_jwt_verify(r, c, jwt, &jwks_uri, 1, oidc_util_key_symmetric_merge(r->pool, NULL, jwk), NULL),
+	    FALSE);
+	oidc_jwt_destroy(jwt);
+	oidc_jwk_destroy(jwk);
+
+	/* and with no JWKs URI configured at all the failure stands without any fetch attempt either */
+	_oidc_memset(&jwks_uri, 0, sizeof(jwks_uri));
+	ck_assert_int_eq(oidc_util_key_symmetric_create(r, "the-verification-secret-0123456789", 0, NULL, TRUE, &jwk),
+			 TRUE);
+	ck_assert_jwt_parses(r->pool, s, jwt, NULL, err);
+	ck_assert_int_eq(
+	    oidc_proto_jwt_verify(r, c, jwt, &jwks_uri, 1, oidc_util_key_symmetric_merge(r->pool, NULL, jwk), NULL),
+	    FALSE);
+	oidc_jwt_destroy(jwt);
+	oidc_jwk_destroy(jwk);
+
+	/* the two requests the mock server serves are these deliberate ones, not a JWKs fetch by the verifier
+	 * (which would have taken the first slot and left the second of these refused) */
+	/* short timeouts, no retries: if the verifier did use up the slots these must fail fast rather than
+	 * hang the test, so that the assertions below are what report it */
+	oidc_http_timeout_t to = {.request_timeout = 1, .connect_timeout = 1, .retries = 0, .retry_interval = 0};
+	for (int i = 0; i < 2; i++) {
+		char *response = NULL;
+		long status = 0;
+		oidc_http_get(r, apr_pstrcat(r->pool, url, "/not-the-verifier", NULL), NULL, NULL, NULL, NULL, FALSE,
+			      &response, &status, NULL, &to, oidc_cfg_outgoing_proxy_get(c), NULL, NULL, NULL, NULL);
+	}
+	ck_assert_int_eq(oidc_test_http_server_request_count(srv), 2);
+	ck_assert_str_eq(oidc_test_http_server_captured(srv, 0)->path, "/not-the-verifier");
+	ck_assert_str_eq(oidc_test_http_server_captured(srv, 1)->path, "/not-the-verifier");
+	oidc_test_http_server_stop(srv);
+}
+END_TEST
+
 START_TEST(test_proto_jwt_verify_paths) {
 	request_rec *r = oidc_test_request_get();
 	oidc_cfg_t *c = oidc_test_cfg_get();
@@ -4490,6 +4556,7 @@ int main(void) {
 	tcase_add_test(core, test_proto_idtoken_parse_error_paths);
 	tcase_add_test(core, test_proto_idtoken_parse_alg_none);
 	tcase_add_test(core, test_proto_jwt_verify_paths);
+	tcase_add_test(core, test_proto_jwt_verify_no_kid_retry_needs_jwks_uri);
 	tcase_add_test(core, test_proto_validate_hash_error_paths);
 	tcase_add_test(core, test_proto_state_timestamp_and_bad_cookie);
 	tcase_add_test(core, test_proto_nonce_uniqueness);

@@ -188,6 +188,7 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 	oidc_jose_error_t err;
 	apr_hash_t *dynamic_keys = NULL;
 	apr_byte_t force_refresh = FALSE;
+	apr_byte_t use_jwks_uri = FALSE;
 	apr_byte_t rv = FALSE;
 
 	if (alg != NULL) {
@@ -218,6 +219,7 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 			   (jwks_uri->signed_uri != NULL) ? "signed_jwks_uri" : "jwks_uri");
 	} else {
 		/* get the key from the JWKs that corresponds with the key specified in the header */
+		use_jwks_uri = TRUE;
 		force_refresh = FALSE;
 		if (oidc_proto_jwks_uri_keys(r, cfg, jwt, jwks_uri, ssl_validate_server, dynamic_keys,
 					     &force_refresh) == FALSE) {
@@ -229,8 +231,13 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 	/* do the actual JWS verification with the locally and remotely provided key material */
 	rv = oidc_jwt_verify(r->pool, jwt, oidc_proto_jwt_verify_keys_merge(r, static_keys, dynamic_keys), &err);
 
-	/* if no kid was provided we may have used stale keys from the cache, so we'll refresh it */
-	if ((rv == FALSE) && (jwt->header.kid == NULL)) {
+	/*
+	 * if no kid was provided we may have used stale keys from the cache, so we'll refresh it -- but
+	 * only when the keys came from a JWKs URI in the first place: with none configured, or with a
+	 * symmetric signature, there is nothing to refresh from, and retrying would hand the HTTP layer a
+	 * NULL URL (and sleep through its retry back-off) for every bad no-kid token a client sends
+	 */
+	if ((rv == FALSE) && (jwt->header.kid == NULL) && (use_jwks_uri == TRUE)) {
 		oidc_warn(
 		    r, "JWT signature verification failed (%s) for JWT with no kid, re-trying with forced refresh now",
 		    oidc_jose_e2s(r->pool, err));
