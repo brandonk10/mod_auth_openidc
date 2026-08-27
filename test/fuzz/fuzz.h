@@ -21,11 +21,32 @@
 #ifndef _MOD_AUTH_OPENIDC_TEST_FUZZ_H_
 #define _MOD_AUTH_OPENIDC_TEST_FUZZ_H_
 
+#include <apr_pools.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /* the one entry point every fuzz target implements */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+
+/*
+ * Copy the fuzzer's input bytes into a NUL-terminated string on the given pool.
+ *
+ * Deliberately not apr_pstrmemdup(): APR declares that function with
+ * __attribute__((alloc_size(3))), which tells the compiler the result is n
+ * bytes long although APR allocates n + 1 -- so under gcc's UBSan object-size
+ * check (the CI sanitizers job builds the targets with -fsanitize=undefined
+ * -fno-sanitize-recover) a harness that reads the terminator, or [0] of an
+ * empty input, is reported as an out-of-object load and the replay aborts.
+ * apr_palloc's own size annotation is truthful, so this copy is not.
+ */
+static inline char *fuzz_strndup(apr_pool_t *pool, const uint8_t *data, size_t size) {
+	char *s = apr_palloc(pool, size + 1);
+	if (size > 0)
+		memcpy(s, data, size);
+	s[size] = '\0';
+	return s;
+}
 
 /*
  * One-time fixture setup (oidc_test_setup), implemented by every target.

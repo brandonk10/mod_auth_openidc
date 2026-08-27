@@ -102,7 +102,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 	r.output_filters = &filter;
 
 	const unsigned int sel = (size > 0) ? data[0] : 0;
-	r.args = apr_pstrmemdup(pool, (const char *)(size > 0 ? data + 1 : data), size > 0 ? size - 1 : 0);
+	r.args = ((size > 0) ? fuzz_strndup(pool, data + 1, size - 1) : fuzz_strndup(pool, data, 0));
 
 	/* the request is to the configured redirect URI: the content handler matches on the path */
 	r.uri = "/protected/";

@@ -67,7 +67,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 	r.pool = pool;
 	r.headers_in = apr_table_copy(pool, r.headers_in);
 
-	char *input = apr_pstrmemdup(pool, (const char *)data, size);
+	char *input = fuzz_strndup(pool, data, size);
 	char *body = "";
 	char *nl = strchr(input, '\n');
 	if (nl != NULL) {

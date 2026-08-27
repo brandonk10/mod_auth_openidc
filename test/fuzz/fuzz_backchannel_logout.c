@@ -138,7 +138,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 	r.method = "POST";
 	apr_table_set(r.headers_in, "Content-Type", "application/x-www-form-urlencoded");
 
-	char *body = apr_pstrmemdup(pool, (const char *)data, size);
+	char *body = fuzz_strndup(pool, data, size);
 	if ((size > 0) && (data[0] == '{')) {
 		oidc_json_t *payload = NULL;
 		if ((oidc_json_decode_object(&r, body, &payload) == TRUE) && (payload != NULL)) {

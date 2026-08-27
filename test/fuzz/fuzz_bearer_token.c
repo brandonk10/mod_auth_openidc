@@ -251,7 +251,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 	}
 
 	/* the three sections */
-	char *input = apr_pstrmemdup(pool, (const char *)(size > 0 ? data + 1 : data), size > 0 ? size - 1 : 0);
+	char *input = ((size > 0) ? fuzz_strndup(pool, data + 1, size - 1) : fuzz_strndup(pool, data, 0));
 	char *authorization = input;
 	char *args = NULL;
 	char *cookie = NULL;

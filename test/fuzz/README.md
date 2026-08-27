@@ -87,6 +87,10 @@ cd test && ./fuzz_url crash-file          # one input per file
    or copy an `oidc_cfg_t` by value in a target: its size depends on the
    `USE_*` feature macros (`cfg/cache.h` embeds per-backend members), and the
    fuzzing builds compile the target by hand rather than through automake.
+   Copy the input bytes with `fuzz_strndup()` from `fuzz.h`, not `apr_pstrmemdup()`:
+   APR declares the latter with `alloc_size(3)` although it allocates `n + 1`, so
+   a harness that reads the terminator (or `[0]` of an empty input) trips gcc's
+   UBSan object-size check in the CI sanitizers job.
    `build.sh` and `oss-fuzz-build.sh` ask make for the library's `AM_CFLAGS`
    and pass the `USE_*` macros on, but a config the library allocates
    (`oidc_cfg_server_create`) is sized right under any flags.

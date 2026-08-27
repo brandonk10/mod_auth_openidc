@@ -252,7 +252,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 	apr_table_set(r.headers_in, "Cookie",
 		      apr_psprintf(pool, "foo=bar; %s=%s; baz=zot", oidc_state_cookie_name(&r, fingerprint), cookie));
 
-	char *params = apr_pstrmemdup(pool, (const char *)(size > 0 ? data + 1 : data), size > 0 ? size - 1 : 0);
+	char *params = ((size > 0) ? fuzz_strndup(pool, data + 1, size - 1) : fuzz_strndup(pool, data, 0));
 	if (fuzz_param_get(&r, params, "state") == NULL)
 		params = apr_pstrcat(pool, "state=", oidc_http_url_encode(&r, fingerprint), "&", params, NULL);
 	params = fuzz_id_token_substitute(&r, params, nonce);

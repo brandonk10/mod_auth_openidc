@@ -67,7 +67,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 	r.pool = pool;
 	r.headers_in = apr_table_make(pool, 4);
 
-	const char *s = apr_pstrmemdup(pool, (const char *)data, size);
+	const char *s = fuzz_strndup(pool, data, size);
 
 	/* URL encoding: decode, encode, and the round trip */
 	oidc_http_url_encode(&r, oidc_http_url_decode(&r, s));
