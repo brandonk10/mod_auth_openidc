@@ -55,7 +55,10 @@ apache_inc=$($APXS -q INCLUDEDIR 2>/dev/null || echo /usr/include/apache2)
 feature_cflags=$(make -s -C "$root/src" --eval='oidc-print-am-cflags: ; @echo $(AM_CFLAGS)' oidc-print-am-cflags |
 	tr ' ' '\n' | grep -E '^-D(USE_[A-Z0-9_]+|SSL_SUPPORT)$' | sort -u | tr '\n' ' ')
 
-cflags="-g -O1 -fsanitize=$SANITIZE -DFUZZING $feature_cflags \
+# -include stddef.h keeps APR_OFFSETOF on the builtin offsetof (an apr.h that
+# does not pull in <stddef.h> makes UBSan flag APR's NULL-based fallback in the
+# brigade ring macros); see oss-fuzz-build.sh
+cflags="-g -O1 -fsanitize=$SANITIZE -DFUZZING -include stddef.h $feature_cflags \
 	-I$root/src -I$root/test -I$apache_inc \
 	$(pkg-config --cflags $pkgs) $FUZZ_CFLAGS"
 libs="$(pkg-config --libs $pkgs) -lcjose -lhiredis -ljq -lz -lldap -llber \

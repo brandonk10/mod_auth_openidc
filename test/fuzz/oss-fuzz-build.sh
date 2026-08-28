@@ -76,7 +76,16 @@ cd "$root"
 # constructors end up in comdat sections the linker discards, and every object in
 # libauth_openidc.a then fails to link with "defined in discarded section". automake
 # puts $(CFLAGS) after $(AM_CFLAGS), so -fno-lto here overrides what apxs supplied.
-export CFLAGS="$CFLAGS -fno-lto"
+#
+# -include stddef.h: the builder's apr.h (1.7.2) does not include <stddef.h>, so
+# offsetof is undefined when apr_general.h is preprocessed and APR_OFFSETOF falls
+# back to the &((struct apr_bucket *)NULL)->link idiom inside APR_RING_SENTINEL.
+# UBSan's null check flags that address computation as "member access within
+# null pointer" although nothing is dereferenced, which killed every target that
+# passes a brigade (APR_BRIGADE_INSERT_TAIL in oidc_util_http_send, the
+# ap_get_brigade stub) on the libfuzzer-undefined leg. With offsetof defined
+# up front APR uses the builtin and the false positive is gone.
+export CFLAGS="$CFLAGS -fno-lto -include stddef.h"
 
 ./autogen.sh
 ./configure \
