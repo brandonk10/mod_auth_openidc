@@ -1,3 +1,9 @@
+08/30/2026
+- util/appinfo: join array claims and propagate a token's claims in linear instead of quadratic memory
+  and time, so a large or claim-heavy token cannot exhaust or stall a worker (OSS-Fuzz 554464974)
+- http: redact logged request bodies and provider responses in linear instead of quadratic memory
+  (OSS-Fuzz 554483423)
+
 08/27/2026
 - proto/jwt: retry a failed no-"kid" signature verification with a forced JWKs refresh only when the keys
   came from a JWKs URI: with none configured the retry handed the HTTP layer a NULL URL and a retry

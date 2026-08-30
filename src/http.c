@@ -202,18 +202,24 @@ static apr_byte_t oidc_http_hdr_in_contains(const request_rec *r, const char *na
 }
 
 /*
+ * copy a header value with CR/LF replaced, to prevent header injection
+ */
+static char *oidc_http_hdr_value_sanitize(const request_rec *r, const char *value) {
+	char *s_value = apr_pstrdup(r->pool, value);
+	char *p = NULL;
+	while ((p = strpbrk(s_value, "\r\n")))
+		*p = OIDC_CHAR_SPACE;
+	return s_value;
+}
+
+/*
  * set a HTTP response header; table could be headers_out or err_headers_out
  */
 static void oidc_http_hdr_table_set(const request_rec *r, apr_table_t *table, const char *name, const char *value) {
 
 	if (value != NULL) {
 
-		char *s_value = apr_pstrdup(r->pool, value);
-
-		/* Replace CR/LF to prevent response-header injection. */
-		char *p = NULL;
-		while ((p = strpbrk(s_value, "\r\n")))
-			*p = OIDC_CHAR_SPACE;
+		char *s_value = oidc_http_hdr_value_sanitize(r, value);
 
 		oidc_debug(r, "%s: %s", name, s_value);
 		apr_table_set(table, name, s_value);
@@ -223,6 +229,17 @@ static void oidc_http_hdr_table_set(const request_rec *r, apr_table_t *table, co
 		oidc_debug(r, "unset %s", name);
 		apr_table_unset(table, name);
 	}
+}
+
+/*
+ * append a (sanitized) header to a table without the scan for an existing entry that apr_table_set()
+ * does, for callers that collect many headers and merge them into the request's table at once with
+ * apr_table_overlap(); the name and the value must live as long as the table
+ */
+void oidc_http_hdr_table_add(const request_rec *r, apr_table_t *table, const char *name, const char *value) {
+	char *s_value = oidc_http_hdr_value_sanitize(r, value);
+	oidc_debug(r, "%s: %s", name, s_value);
+	apr_table_addn(table, name, s_value);
 }
 
 /*
@@ -568,49 +585,71 @@ apr_byte_t oidc_http_param_is_sensitive(const char *key) {
 }
 
 /*
+ * TRUE when the name_len-byte parameter name is one of _oidc_http_sensitive_params
+ */
+static apr_byte_t oidc_http_param_name_is_sensitive(const char *name, size_t name_len) {
+	for (int i = 0; _oidc_http_sensitive_params[i] != NULL; i++)
+		if ((_oidc_strlen(_oidc_http_sensitive_params[i]) == name_len) &&
+		    (_oidc_strncmp(name, _oidc_http_sensitive_params[i], name_len) == 0))
+			return TRUE;
+	return FALSE;
+}
+
+/*
  * best-effort redaction of the well-known sensitive parameters listed in
  * _oidc_http_sensitive_params inside a URL-form-encoded request body, for debug-log
  * purposes; JSON request bodies do not carry these parameters in this codebase and
  * are therefore left untouched
  */
 const char *oidc_http_redact_body_for_log(request_rec *r, const char *data) {
-	char *result = NULL;
-	apr_pool_t *pool = (r != NULL) ? r->pool : NULL;
+	size_t n_params = 1;
 
 	if (data == NULL)
 		return NULL;
-	/* OIDCDebugMaskSecrets Off */
-	if (oidc_util_log_mask_secrets(r) == FALSE)
+	/* OIDCDebugMaskSecrets Off, or no request pool to build the redacted copy in */
+	if ((r == NULL) || (oidc_util_log_mask_secrets(r) == FALSE))
 		return data;
+	apr_pool_t *pool = r->pool;
 
-	result = apr_pstrdup(pool, data);
+	/*
+	 * one pass over the "&"-separated parameters into a single buffer: rewriting the whole
+	 * string with an apr_psprintf() per redacted value made the work quadratic in the number
+	 * of sensitive parameters, which a request-sized body turned into an OOM (OSS-Fuzz
+	 * 554483423); a redacted value only ever grows to the 3 bytes of "***", so the result fits
+	 * in the input length plus 3 bytes per parameter
+	 */
+	for (const char *c = data; *c != '\0'; c++)
+		if (*c == OIDC_CHAR_AMP)
+			n_params++;
+	char *result = apr_palloc(pool, _oidc_strlen(data) + (3 * n_params) + 1);
+	char *out = result;
+	const char *param = data;
 
-	for (int i = 0; _oidc_http_sensitive_params[i] != NULL; i++) {
-		const char *needle = apr_pstrcat(pool, _oidc_http_sensitive_params[i], "=", NULL);
-		const apr_size_t needle_len = _oidc_strlen(needle);
-		/*
-		 * scan from an offset rather than from the start: each rewrite allocates a new string, so a
-		 * cursor into the old one would dangle, and resuming at the beginning would keep re-finding
-		 * the "<name>=***" just written instead of ever reaching a second occurrence
-		 */
-		apr_size_t offset = 0;
-		for (;;) {
-			const char *pos = _oidc_strstr(result + offset, needle);
-			if (pos == NULL)
-				break;
-			/* everything up to and including the "<name>=" is kept */
-			const apr_size_t prefix_len = (pos - result) + needle_len;
-			/* only redact at a parameter boundary, so that e.g. "xcode=" is not taken for "code=" */
-			if ((pos != result) && (pos[-1] != OIDC_CHAR_AMP)) {
-				offset = prefix_len;
-				continue;
-			}
-			const char *value_end = strchr(result + prefix_len, OIDC_CHAR_AMP);
-			result = apr_psprintf(pool, "%.*s***%s", (int)prefix_len, result, value_end ? value_end : "");
-			/* resume just after the "***" that replaced the value */
-			offset = prefix_len + 3;
+	for (;;) {
+		const char *param_end = strchr(param, OIDC_CHAR_AMP);
+		const size_t param_len = (param_end != NULL) ? (size_t)(param_end - param) : _oidc_strlen(param);
+		const char *eq = memchr(param, OIDC_CHAR_EQUAL, param_len);
+		/* only a "<name>=" at the parameter boundary is redacted, so that e.g. "xcode=" is not taken for
+		 * "code=" */
+		const apr_byte_t redact =
+		    ((eq != NULL) && (oidc_http_param_name_is_sensitive(param, (size_t)(eq - param)) == TRUE)) ? TRUE
+													       : FALSE;
+		/* everything up to and including the "<name>=" is kept */
+		const size_t keep = (redact == TRUE) ? (size_t)(eq - param) + 1 : param_len;
+
+		_oidc_memcpy(out, param, keep);
+		out += keep;
+		if (redact == TRUE) {
+			_oidc_memcpy(out, "***", 3);
+			out += 3;
 		}
+		if (param_end == NULL)
+			break;
+		*out = OIDC_CHAR_AMP;
+		out++;
+		param = param_end + 1;
 	}
+	*out = '\0';
 
 	return result;
 }
@@ -624,55 +663,77 @@ static const char *_oidc_http_sensitive_json_members[] = {OIDC_PROTO_ACCESS_TOKE
  * Redact quoted JSON members without parsing, so malformed or non-JSON responses remain
  * loggable and otherwise unchanged. This scanner assumes a sensitive value has no escaped quote:
  * the next quote terminates the value.
+ * The input is copied through into a single buffer with each value replaced as it is found:
+ * rewriting the whole string with an apr_psprintf() per member made the work quadratic in the
+ * number of sensitive members, which a response-sized body turned into an OOM (OSS-Fuzz
+ * 554483423). A match consumes at least the member name, the colon and the opening quote and
+ * adds at most the 3 bytes of "***", which bounds the size of the result.
  */
-static char *oidc_http_redact_json_member(apr_pool_t *pool, char *data, const char *needle) {
+static const char *oidc_http_redact_json_member(apr_pool_t *pool, const char *data, const char *needle) {
 	const apr_size_t needle_len = _oidc_strlen(needle);
-	apr_size_t offset = 0;
+	const apr_size_t data_len = _oidc_strlen(data);
+	char *result = apr_palloc(pool, data_len + (3 * ((data_len / (needle_len + 2)) + 1)) + 1);
+	char *out = result;
+	/* the input up to here has been copied to the output */
+	const char *copied = data;
+	/* the scan cursor */
+	const char *pos = data;
+	size_t len = 0;
 
 	for (;;) {
-		const char *pos = _oidc_strstr(data + offset, needle);
-		if (pos == NULL)
+		const char *match = _oidc_strstr(pos, needle);
+		if (match == NULL)
 			break;
 		/* step over the member name and expect ": " then a quoted value; anything
 		 * else (a non-string value, a member name appearing inside a value) is
 		 * skipped rather than guessed at */
-		const char *p = pos + needle_len;
+		const char *p = match + needle_len;
 		while ((*p == ' ') || (*p == '\t'))
 			p++;
 		if (*p != OIDC_CHAR_COLON) {
-			offset = (pos - data) + needle_len;
+			pos = match + needle_len;
 			continue;
 		}
 		p++;
 		while ((*p == ' ') || (*p == '\t'))
 			p++;
 		if (*p != OIDC_CHAR_DQUOTE) {
-			offset = (pos - data) + needle_len;
+			pos = match + needle_len;
 			continue;
 		}
 		p++;
-		/* If the closing quote is missing, mask to the end rather than leak a partial token. */
+		/* copy everything up to and including the opening quote, then the mask */
+		len = (size_t)(p - copied);
+		_oidc_memcpy(out, copied, len);
+		out += len;
+		_oidc_memcpy(out, "***", 3);
+		out += 3;
+		/* If the closing quote is missing, mask to the end rather than leak a partial token; the
+		 * closing quote itself is copied with the next chunk and the scan resumes after the mask. */
 		const char *value_end = strchr(p, OIDC_CHAR_DQUOTE);
-		const apr_size_t prefix_len = p - data;
-		data = apr_psprintf(pool, "%.*s***%s", (int)prefix_len, data, value_end ? value_end : "");
-		/* resume just after the "***" that replaced the value */
-		offset = prefix_len + 3;
+		copied = (value_end != NULL) ? value_end : p + _oidc_strlen(p);
+		pos = copied;
 	}
 
-	return data;
+	len = _oidc_strlen(copied);
+	_oidc_memcpy(out, copied, len);
+	out += len;
+	*out = '\0';
+
+	return result;
 }
 
 const char *oidc_http_redact_json_for_log(request_rec *r, const char *data) {
-	char *result = NULL;
-	apr_pool_t *pool = (r != NULL) ? r->pool : NULL;
+	const char *result = NULL;
 
 	if (data == NULL)
 		return NULL;
-	/* OIDCDebugMaskSecrets Off */
-	if (oidc_util_log_mask_secrets(r) == FALSE)
+	/* OIDCDebugMaskSecrets Off, or no request pool to build the redacted copy in */
+	if ((r == NULL) || (oidc_util_log_mask_secrets(r) == FALSE))
 		return data;
+	apr_pool_t *pool = r->pool;
 
-	result = apr_pstrdup(pool, data);
+	result = data;
 	for (int i = 0; _oidc_http_sensitive_json_members[i] != NULL; i++)
 		result = oidc_http_redact_json_member(
 		    pool, result, apr_pstrcat(pool, "\"", _oidc_http_sensitive_json_members[i], "\"", NULL));

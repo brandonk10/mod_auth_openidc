@@ -130,6 +130,8 @@ START_TEST(test_util_appinfo_set) {
 				     "\"name\": \"GÜnther\","
 				     "\"dagger\": \"D†gÿger\","
 				     "\"anarr\" : [ false, \"hans\", \"piet\", true, {} ],"
+				     "\"emptyarr\" : [],"
+				     "\"leadingempty\" : [ \"\", \"a\", \"\", \"b,c\" ],"
 				     "\"names\" : [ \"hans\", \"piet\" ],"
 				     "\"abool\": true,"
 				     "\"anint\": 5,"
@@ -149,6 +151,9 @@ START_TEST(test_util_appinfo_set) {
 	ck_assert_table_str(r->headers_in, "OIDC_CLAIM_dagger", "D\u2020gÿger");
 	ck_assert_table_str(r->headers_in, "OIDC_CLAIM_anarr", "0,hans,piet,1");
 	ck_assert_table_str(r->headers_in, "OIDC_CLAIM_names", "hans,piet");
+	ck_assert_table_str(r->headers_in, "OIDC_CLAIM_emptyarr", "");
+	/* empty elements in front of the first non-empty one leave no trace, later ones do; delimiters are escaped */
+	ck_assert_table_str(r->headers_in, "OIDC_CLAIM_leadingempty", "a,,b\\,c");
 	ck_assert_table_str(r->headers_in, "OIDC_CLAIM_abool", "1");
 	ck_assert_table_str(r->headers_in, "OIDC_CLAIM_anint", "5");
 	ck_assert_table_str(r->headers_in, "OIDC_CLAIM_lint", "1111111111");

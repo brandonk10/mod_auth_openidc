@@ -174,6 +174,11 @@ START_TEST(test_redact_body_for_log) {
 	// the needle only matches at a parameter boundary: a parameter whose name merely ends in a
 	// sensitive one keeps its value
 	ck_assert_str_eq(oidc_http_redact_body_for_log(r, "xcode=keepme&code=hideme"), "xcode=keepme&code=***");
+	/* an empty value is still masked, a leading/trailing "&" and a value-less name are kept as they are */
+	ck_assert_str_eq(oidc_http_redact_body_for_log(r, "code=&scope=openid"), "code=***&scope=openid");
+	ck_assert_str_eq(oidc_http_redact_body_for_log(r, "&code=x&"), "&code=***&");
+	ck_assert_str_eq(oidc_http_redact_body_for_log(r, "code&scope=openid&code=y"), "code&scope=openid&code=***");
+	ck_assert_str_eq(oidc_http_redact_body_for_log(r, "code=a=b&x=code=c"), "code=***&x=code=c");
 
 	// ... including as the very first parameter of the body
 	ck_assert_str_eq(oidc_http_redact_body_for_log(r, "my_access_token=keepme&scope=openid"),
@@ -222,6 +227,10 @@ START_TEST(test_redact_json_for_log) {
 	// a truncated body whose value never closes is masked to the end, so that the partial
 	// token it starts with does not reach the log
 	ck_assert_str_eq(oidc_http_redact_json_for_log(r, "{\"access_token\":\"AT-trunc"), "{\"access_token\":\"***");
+	/* repeated members and an empty value */
+	ck_assert_str_eq(
+	    oidc_http_redact_json_for_log(r, "{\"access_token\":\"\",\"access_token\":\"x\",\"id_token\":\"y\"}"),
+	    "{\"access_token\":\"***\",\"access_token\":\"***\",\"id_token\":\"***\"}");
 
 	// more than one occurrence is masked, not just the first
 	ck_assert_str_eq(oidc_http_redact_json_for_log(r, "{\"a\":{\"access_token\":\"1\"},"

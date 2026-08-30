@@ -126,6 +126,7 @@ apr_byte_t oidc_http_param_is_sensitive(const char *key);
 void oidc_http_hdr_err_out_add(const request_rec *r, const char *name, const char *value);
 void oidc_http_set_no_cache_headers(const request_rec *r);
 void oidc_http_hdr_in_set(const request_rec *r, const char *name, const char *value);
+void oidc_http_hdr_table_add(const request_rec *r, apr_table_t *table, const char *name, const char *value);
 const char *oidc_http_hdr_in_cookie_get(const request_rec *r);
 void oidc_http_hdr_in_cookie_set(const request_rec *r, const char *value);
 const char *oidc_http_hdr_in_user_agent_get(const request_rec *r);
