@@ -80,6 +80,10 @@ AC_SUBST(JANSSON_LIBS)
 PKG_CHECK_MODULES(CJOSE, cjose)
 AC_SUBST(CJOSE_CFLAGS)
 AC_SUBST(CJOSE_LIBS)
+# the linked cjose version, for the test suite to gate seeds that trip a
+# version-specific cjose bug (see test/fuzz/run-fuzzers.sh)
+CJOSE_VERSION=`$PKG_CONFIG --modversion cjose 2>/dev/null`
+AC_SUBST(CJOSE_VERSION)
 
 # PCRE
 PKG_CHECK_MODULES([PCRE2], libpcre2-8, [

@@ -174,7 +174,9 @@ SH_LOG_COMPILER = $(SHELL)
 # or a developer can still tighten it for a single run.
 # NB: the "export" is load-bearing. am__check_pre ends with $(AM_TESTS_ENVIRONMENT) followed by
 # the log driver, so a bare "VAR=value;" is a shell assignment the test binary never inherits.
-AM_TESTS_ENVIRONMENT = CK_DEFAULT_TIMEOUT=$${CK_DEFAULT_TIMEOUT:-60}; export CK_DEFAULT_TIMEOUT;
+# CJOSE_VERSION lets fuzz/run-fuzzers.sh skip the one seed that trips a cjose
+# bug present below 0.6.2.8; @CJOSE_VERSION@ is the version configure linked.
+AM_TESTS_ENVIRONMENT = CK_DEFAULT_TIMEOUT=$${CK_DEFAULT_TIMEOUT:-60}; export CK_DEFAULT_TIMEOUT; CJOSE_VERSION=$${CJOSE_VERSION:-@CJOSE_VERSION@}; export CJOSE_VERSION;
 dist_check_SCRIPTS = check_registration.sh check_directives.sh check_conf_reference.sh fuzz/run-fuzzers.sh
 
 EXTRA_DIST = \
