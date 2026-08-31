@@ -86,6 +86,25 @@
 #define ck_assert_int_ge(X, Y) _ck_assert_int_cmp(X, >=, Y)
 #endif
 
+/* check < 0.10.0 (e.g. CentOS 7's 0.9.9) has none of the unsigned assert variants -- neither
+ * eq/ne nor the lt/le/gt/ge wrappers -- so guard on the eq wrapper and provide the set. uintmax_t
+ * so the 64-bit siphash values in test_cache do not truncate on an ILP32 host */
+#ifndef ck_assert_uint_eq
+#define _ck_assert_uint_cmp(X, OP, Y)                                                                                  \
+	do {                                                                                                           \
+		uintmax_t _ck_x = (X);                                                                                 \
+		uintmax_t _ck_y = (Y);                                                                                 \
+		ck_assert_msg(_ck_x OP _ck_y, "Assertion '%s' failed: %s == %ju, %s == %ju", #X " " #OP " " #Y, #X,    \
+			      _ck_x, #Y, _ck_y);                                                                       \
+	} while (0)
+#define ck_assert_uint_eq(X, Y) _ck_assert_uint_cmp(X, ==, Y)
+#define ck_assert_uint_ne(X, Y) _ck_assert_uint_cmp(X, !=, Y)
+#define ck_assert_uint_lt(X, Y) _ck_assert_uint_cmp(X, <, Y)
+#define ck_assert_uint_le(X, Y) _ck_assert_uint_cmp(X, <=, Y)
+#define ck_assert_uint_gt(X, Y) _ck_assert_uint_cmp(X, >, Y)
+#define ck_assert_uint_ge(X, Y) _ck_assert_uint_cmp(X, >=, Y)
+#endif
+
 #ifndef _ck_assert_mem
 #define ck_assert_mem_eq(X, Y, L) ck_assert_msg(memcmp((X), (Y), (L)) == 0, "Assertion '%s' failed", #X " == " #Y)
 #endif
