@@ -237,6 +237,10 @@ static void e2e_metrics_teardown_flushed(request_rec *r) {
 	unsetenv("OIDC_METRICS_CACHE_STORAGE_INTERVAL");
 }
 
+/* defined below: poll the JSON formatter until the asynchronously-flushed data appears, so a value
+ * assertion need not race the background flush interval on a loaded builder */
+static const char *metrics_json_wait_for(request_rec *r, const char *needle, int max_ms);
+
 START_TEST(test_metrics_handle_request_flushed_prometheus) {
 	request_rec *r = oidc_test_request_get();
 	oidc_cfg_t *c = oidc_test_cfg_get();
@@ -335,7 +339,9 @@ START_TEST(test_metrics_handle_request_flushed_reset_nested_counter) {
 	oidc_cfg_t *c = oidc_test_cfg_get();
 	e2e_metrics_setup_flushed(r);
 	OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
-	apr_sleep(apr_time_from_msec(300));
+	/* wait for the async flush to land the counter in shared memory instead of a fixed sleep a
+	 * loaded builder can outrun; only then can the reset below zero an actually-present counter */
+	ck_assert_ptr_nonnull(_oidc_strstr(metrics_json_wait_for(r, "\"200\"", 5000), "\"200\""));
 
 	r->args = "format=json&reset=true";
 	int rc = oidc_metrics_handle_request(r);
@@ -361,7 +367,9 @@ START_TEST(test_metrics_handle_request_flushed_counter_inc_twice_before_flush) {
 	e2e_metrics_setup_flushed(r);
 	OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
 	OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
-	apr_sleep(apr_time_from_msec(300));
+	/* wait for both increments to be flushed (they merge into one shm entry in a single store)
+	 * rather than racing a fixed sleep on a loaded builder */
+	ck_assert_ptr_nonnull(_oidc_strstr(metrics_json_wait_for(r, "\"200\"", 5000), "\"200\""));
 
 	r->args = "format=status&server_name=www.example.com&counter=provider.http.response.code&value=200";
 	int rc = oidc_metrics_handle_request(r);
