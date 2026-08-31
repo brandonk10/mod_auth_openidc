@@ -579,23 +579,32 @@ START_TEST(test_util_file_write_hard_failure) {
 	apr_finfo_t fi;
 	struct rlimit rl_orig, rl_low;
 	void (*prev_handler)(int);
+	int gr, sr_low, sr_restore;
 
 	apr_temp_dir_get(&dir, r->pool);
 	path = apr_psprintf(r->pool, "%s/test-write-hard-failure.tmp", dir);
 	apr_file_remove(path, r->pool); /* in case a previous run left it behind */
 
+	/* No ck_assert may run while RLIMIT_FSIZE is capped: libcheck's fork mode writes each result
+	 * as it is recorded, and on older libcheck (el7's 0.9.9) that internal write is itself subject
+	 * to the 4-byte cap, fails with EFBIG and takes the child down before the body finishes
+	 * ("Early exit with return value 2"). So capture the rlimit calls' returns, do the write,
+	 * restore the limit, and only then assert -- which also keeps a failed assertion from leaving
+	 * the rest of the suite capped. */
 	prev_handler = signal(SIGXFSZ, SIG_IGN);
-	ck_assert_int_eq(getrlimit(RLIMIT_FSIZE, &rl_orig), 0);
+	gr = getrlimit(RLIMIT_FSIZE, &rl_orig);
 	rl_low.rlim_cur = 4;
 	rl_low.rlim_max = rl_orig.rlim_max;
-	ck_assert_int_eq(setrlimit(RLIMIT_FSIZE, &rl_low), 0);
+	sr_low = setrlimit(RLIMIT_FSIZE, &rl_low);
 
 	rc = oidc_util_file_write(r, path, "this string is longer than the 4-byte cap above");
 
-	/* restore before asserting, so a failed assertion cannot leave the rest of the suite capped */
-	ck_assert_int_eq(setrlimit(RLIMIT_FSIZE, &rl_orig), 0);
+	sr_restore = setrlimit(RLIMIT_FSIZE, &rl_orig);
 	signal(SIGXFSZ, prev_handler);
 
+	ck_assert_int_eq(gr, 0);
+	ck_assert_int_eq(sr_low, 0);
+	ck_assert_int_eq(sr_restore, 0);
 	ck_assert_int_eq(rc, FALSE);
 	/* the write failed before the rename, so the destination must not exist either */
 	ck_assert_int_ne(apr_stat(&fi, path, APR_FINFO_TYPE, r->pool), APR_SUCCESS);
