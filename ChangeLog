@@ -1,3 +1,6 @@
+09/01/2026
+- release 2.4.20.3
+
 08/30/2026
 - util/appinfo: join array claims and propagate a token's claims in linear instead of quadratic memory
   and time, so a large or claim-heavy token cannot exhaust or stall a worker (OSS-Fuzz 554464974)
