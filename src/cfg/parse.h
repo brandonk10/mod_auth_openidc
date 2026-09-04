@@ -45,9 +45,14 @@
 
 #include "cfg/cfg.h"
 
+typedef enum {
+	OIDC_KEY_RECORD_PAIR = 0,    /* [<use>#][<kid>#]<key> */
+	OIDC_KEY_RECORD_TRIPLET = 1, /* [<use>#][[<alg>[+<alg>]]#][<kid>#]<key> */
+} oidc_key_record_format_t;
+
 typedef struct oidc_cfg_option_t {
 	int val;
-	char *str;
+	const char *str;
 } oidc_cfg_option_t;
 
 char *oidc_cfg_parse_option(apr_pool_t *pool, const oidc_cfg_option_t options[], int n, const char *arg, int *v);
@@ -55,7 +60,6 @@ char *oidc_cfg_parse_option_ignore_case(apr_pool_t *pool, const oidc_cfg_option_
 					int *v);
 char *oidc_cfg_parse_options_flatten(apr_pool_t *pool, const oidc_cfg_option_t options[], int n);
 
-char *oidc_cfg_parse_flatten_options(apr_pool_t *pool, const char *options[]);
 const char *oidc_cfg_parse_is_valid_option(apr_pool_t *pool, const char *arg, const char *options[]);
 const char *oidc_cfg_parse_is_valid_int(apr_pool_t *pool, int value, int min_value, int max_value);
 const char *oidc_cfg_parse_is_valid_url(apr_pool_t *pool, const char *arg, const char *scheme);
@@ -69,21 +73,25 @@ const char *oidc_cfg_parse_is_valid_encrypted_response_enc(apr_pool_t *pool, con
 const char *oidc_cfg_parse_boolean(apr_pool_t *pool, const char *arg, int *bool_value);
 const char *oidc_cfg_parse_int(apr_pool_t *pool, const char *arg, int *int_value);
 const char *oidc_cfg_parse_int_min_max(apr_pool_t *pool, const char *arg, int *int_value, int min_value, int max_value);
+const char *oidc_cfg_parse_int_min_max_or_zero(apr_pool_t *pool, const char *arg, int *int_value, int min_value,
+					       int max_value);
 const char *oidc_cfg_parse_timeout_min_max(apr_pool_t *pool, const char *arg, apr_interval_time_t *timeout_value,
 					   apr_interval_time_t min_value, apr_interval_time_t max_value);
 const char *oidc_cfg_parse_dirname(apr_pool_t *pool, const char *arg, char **value);
 const char *oidc_cfg_parse_filename(apr_pool_t *pool, const char *arg, char **value);
 const char *oidc_cfg_parse_relative_or_absolute_url(apr_pool_t *pool, const char *arg, char **value);
 const char *oidc_cfg_parse_key_record(apr_pool_t *pool, const char *tuple, char **kid, char **key, int *key_len,
-				      char **use, apr_byte_t triplet);
+				      char **use, char **alg, oidc_key_record_format_t format);
 const char *oidc_cfg_parse_action_on_error_refresh_as(apr_pool_t *pool, const char *arg,
 						      oidc_on_error_action_t *action);
 const char *oidc_cfg_parse_passphrase(apr_pool_t *pool, const char *arg, char **passphrase);
 const char *oidc_cfg_parse_public_key_files(apr_pool_t *pool, const char *arg, apr_array_header_t **keys);
+const char *oidc_cfg_parse_private_key_files(apr_pool_t *pool, const char *arg, apr_array_header_t **keys);
 
 typedef const char *(*oidc_valid_function_t)(apr_pool_t *, const char *);
 
-oidc_valid_function_t oidc_cfg_get_valid_endpoint_auth_function(oidc_cfg_t *cfg);
+oidc_valid_function_t oidc_cfg_get_valid_endpoint_auth_function(const oidc_cfg_t *cfg, apr_byte_t allow_mtls);
+apr_byte_t oidc_cfg_endpoint_auth_is_mtls(const char *method);
 const char *oidc_parse_remote_user_claim(apr_pool_t *pool, const char *v1, const char *v2, const char *v3,
 					 oidc_remote_user_claim_t *remote_user_claim);
 const char *oidc_cfg_parse_http_timeout(apr_pool_t *pool, const char *arg1, const char *arg2, const char *arg3,

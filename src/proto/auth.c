@@ -48,7 +48,7 @@
 /*
  * setup for an endpoint call without authentication
  */
-static apr_byte_t oidc_proto_endpoint_auth_none(request_rec *r, const char *client_id, apr_table_t *params) {
+static apr_byte_t oidc_proto_endpoint_auth_none(const char *client_id, apr_table_t *params) {
 	apr_table_set(params, OIDC_PROTO_CLIENT_ID, client_id);
 	return TRUE;
 }
@@ -92,12 +92,14 @@ static apr_byte_t oidc_proto_jwt_create(request_rec *r, const char *client_id, c
 	*out = oidc_jwt_new(r->pool, TRUE, TRUE);
 	oidc_jwt_t *jwt = *out;
 
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_ISS, json_string(client_id));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_SUB, json_string(client_id));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_AUD, json_string(audience));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_JTI, json_string(oidc_proto_jti_gen(r)));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_EXP, json_integer(apr_time_sec(apr_time_now()) + 60));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_IAT, json_integer(apr_time_sec(apr_time_now())));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_ISS, oidc_json_string(client_id));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_SUB, oidc_json_string(client_id));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_AUD, oidc_json_string(audience));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_JTI, oidc_json_string(oidc_proto_jti_gen(r)));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_EXP,
+				 oidc_json_integer(apr_time_sec(apr_time_now()) + 60));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_IAT,
+				 oidc_json_integer(apr_time_sec(apr_time_now())));
 
 	return TRUE;
 }
@@ -105,7 +107,8 @@ static apr_byte_t oidc_proto_jwt_create(request_rec *r, const char *client_id, c
 /*
  * helper function to add a JWT assertion to the HTTP request as endpoint authentication
  */
-static apr_byte_t oidc_proto_jwt_sign_and_add(request_rec *r, apr_table_t *params, oidc_jwt_t *jwt, oidc_jwk_t *jwk) {
+static apr_byte_t oidc_proto_jwt_sign_and_add(request_rec *r, apr_table_t *params, oidc_jwt_t *jwt,
+					      const oidc_jwk_t *jwk) {
 	char *cser = NULL;
 
 	if (oidc_proto_jwt_sign_and_serialize(r, jwk, jwt, &cser) == FALSE)
@@ -117,7 +120,7 @@ static apr_byte_t oidc_proto_jwt_sign_and_add(request_rec *r, apr_table_t *param
 	return TRUE;
 }
 
-#define OIDC_PROTO_JWT_ASSERTION_SYMMETRIC_ALG CJOSE_HDR_ALG_HS256
+#define OIDC_PROTO_JWT_ASSERTION_SYMMETRIC_ALG OIDC_JOSE_HDR_ALG_HS256
 
 /*
  * create a JWT assertion signed with the client secret and add it to the HTTP request as endpoint authentication
@@ -134,7 +137,7 @@ static apr_byte_t oidc_proto_endpoint_auth_client_secret_jwt(request_rec *r, con
 		return FALSE;
 
 	oidc_jwk_t *jwk = oidc_jwk_create_symmetric_key(r->pool, NULL, (const unsigned char *)client_secret,
-							_oidc_strlen(client_secret), FALSE, &err);
+							(unsigned int)_oidc_strlen(client_secret), FALSE, &err);
 	if (jwk == NULL) {
 		oidc_error(r, "parsing of client secret into JWK failed: %s", oidc_jose_e2s(r->pool, err));
 		oidc_jwt_destroy(jwt);
@@ -170,62 +173,73 @@ static apr_byte_t oidc_proto_endpoint_access_token_bearer(request_rec *r, oidc_c
 }
 
 /*
+ * pick the private signing key (and its accompanying x5t when available) used to sign a private_key_jwt
+ * assertion: client-specific keys take precedence over the module-wide configured private keys
+ */
+static oidc_jwk_t *oidc_proto_endpoint_auth_pick_signing_key(const oidc_cfg_t *cfg,
+							     const apr_array_header_t *client_keys, const char **x5t) {
+	const oidc_jwk_t *jwk_pub = NULL;
+	oidc_jwk_t *jwk = NULL;
+
+	*x5t = NULL;
+	if ((client_keys != NULL) && (client_keys->nelts > 0)) {
+		jwk = oidc_util_key_list_first(client_keys, -1, OIDC_JOSE_JWK_SIG_STR);
+		if (jwk && jwk->x5t)
+			*x5t = jwk->x5t;
+		return jwk;
+	}
+	if ((oidc_cfg_private_keys_get(cfg) != NULL) && (oidc_cfg_private_keys_get(cfg)->nelts > 0)) {
+		jwk = oidc_util_key_list_first(oidc_cfg_private_keys_get(cfg), -1, OIDC_JOSE_JWK_SIG_STR);
+		jwk_pub = oidc_util_key_list_first(oidc_cfg_public_keys_get(cfg), -1, OIDC_JOSE_JWK_SIG_STR);
+		if (jwk_pub && jwk_pub->x5t)
+			// populate x5t; at least required for Microsoft Entra ID / Azure AD
+			*x5t = jwk_pub->x5t;
+	}
+	return jwk;
+}
+
+/*
  * create a JWT assertion signed with the configured private key and add it to the HTTP request as endpoint
  * authentication
  */
-static apr_byte_t oidc_proto_endpoint_auth_private_key_jwt(request_rec *r, oidc_cfg_t *cfg,
+static apr_byte_t oidc_proto_endpoint_auth_private_key_jwt(request_rec *r, const oidc_cfg_t *cfg,
 							   const char *token_endpoint_auth_alg, const char *client_id,
 							   const apr_array_header_t *client_keys, const char *audience,
 							   apr_table_t *params) {
 	apr_byte_t rv = FALSE;
 	oidc_jwt_t *jwt = NULL;
-	oidc_jwk_t *jwk = NULL;
-	const oidc_jwk_t *jwk_pub = NULL;
+	const oidc_jwk_t *jwk = NULL;
+	const char *x5t = NULL;
+	const char *alg = NULL;
 
 	oidc_debug(r, "enter");
 
 	if (oidc_proto_jwt_create(r, client_id, audience, &jwt) == FALSE)
 		return FALSE;
 
-	if ((client_keys != NULL) && (client_keys->nelts > 0)) {
-		jwk = oidc_util_key_list_first(client_keys, -1, OIDC_JOSE_JWK_SIG_STR);
-		if (jwk && jwk->x5t)
-			jwt->header.x5t = apr_pstrdup(r->pool, jwk->x5t);
-	} else if ((oidc_cfg_private_keys_get(cfg) != NULL) && (oidc_cfg_private_keys_get(cfg)->nelts > 0)) {
-		jwk = oidc_util_key_list_first(oidc_cfg_private_keys_get(cfg), -1, OIDC_JOSE_JWK_SIG_STR);
-		jwk_pub = oidc_util_key_list_first(oidc_cfg_public_keys_get(cfg), -1, OIDC_JOSE_JWK_SIG_STR);
-		if (jwk_pub && jwk_pub->x5t)
-			// populate x5t; at least required for Microsoft Entra ID / Azure AD
-			jwt->header.x5t = apr_pstrdup(r->pool, jwk_pub->x5t);
-	}
-
+	jwk = oidc_proto_endpoint_auth_pick_signing_key(cfg, client_keys, &x5t);
 	if (jwk == NULL) {
 		oidc_error(r, "no private signing keys have been configured to use for private_key_jwt client "
 			      "authentication (" OIDCPrivateKeyFiles ")");
 		goto end;
 	}
 
+	if (x5t != NULL)
+		jwt->header.x5t = apr_pstrdup(r->pool, x5t);
 	jwt->header.kid = apr_pstrdup(r->pool, jwk->kid);
 
 	if (token_endpoint_auth_alg != NULL) {
-		jwt->header.alg = apr_pstrdup(r->pool, token_endpoint_auth_alg);
 		// oidc_proto_jwt_sign_and_add will fail later if no corresponding key was configured
+		alg = token_endpoint_auth_alg;
 	} else {
-		if (jwk->kty == CJOSE_JWK_KTY_RSA) {
-			jwt->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_RS256);
-		} else if (jwk->kty == CJOSE_JWK_KTY_EC) {
-			if (cjose_jwk_EC_get_curve(jwk->cjose_jwk, NULL) == NID_X9_62_prime256v1)
-				jwt->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_ES256);
-			if (cjose_jwk_EC_get_curve(jwk->cjose_jwk, NULL) == NID_secp384r1)
-				jwt->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_ES384);
-			if (cjose_jwk_EC_get_curve(jwk->cjose_jwk, NULL) == NID_secp521r1)
-				jwt->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_ES512);
-		} else {
+		alg = oidc_jwk_default_jws_alg(jwk);
+		if (alg == NULL) {
 			oidc_error(
 			    r, "no valid signing key (RSA or Elliptic Curve) could be found in " OIDCPrivateKeyFiles);
 			goto end;
 		}
 	}
+	jwt->header.alg = apr_pstrdup(r->pool, alg);
 
 	oidc_debug(r, "signing private_key_jwt assertion with algorithm: %s", jwt->header.alg);
 
@@ -241,7 +255,8 @@ end:
 }
 
 /*
- * add the configured token endpoint authentication method to the request (or return it in the *_auth_str parameters)
+ * Keep this idempotent: retries rebuild the authentication data to obtain a fresh client
+ * assertion, so credentials must replace earlier values rather than create duplicates.
  */
 apr_byte_t oidc_proto_token_endpoint_auth(request_rec *r, oidc_cfg_t *cfg, const char *token_endpoint_auth,
 					  const char *token_endpoint_auth_alg, const char *client_id,
@@ -267,14 +282,23 @@ apr_byte_t oidc_proto_token_endpoint_auth(request_rec *r, oidc_cfg_t *cfg, const
 		    "no client secret is configured or the token endpoint auth method was set to \"%s\"; calling the "
 		    "token endpoint without client authentication; only public clients are supported",
 		    OIDC_PROTO_ENDPOINT_AUTH_NONE);
-		return oidc_proto_endpoint_auth_none(r, client_id, params);
+		return oidc_proto_endpoint_auth_none(client_id, params);
+	}
+
+	// RFC 8705: the client authenticates at the TLS layer with its mutual-TLS client
+	// certificate; only the client_id is passed in the request body
+	if (oidc_cfg_endpoint_auth_is_mtls(token_endpoint_auth)) {
+		oidc_debug(r,
+			   "\"%s\": authentication occurs at the TLS layer, adding only the client_id to the request",
+			   token_endpoint_auth);
+		return oidc_proto_endpoint_auth_none(client_id, params);
 	}
 
 	// if no client_secret is set and we don't authenticate using private_key_jwt,
 	// we can only be a public client since the other methods require a client_secret
 	if ((client_secret == NULL) && (_oidc_strcmp(token_endpoint_auth, OIDC_PROTO_PRIVATE_KEY_JWT) != 0)) {
 		oidc_debug(r, "no client secret set and not using private_key_jwt, assume we are a public client");
-		return oidc_proto_endpoint_auth_none(r, client_id, params);
+		return oidc_proto_endpoint_auth_none(client_id, params);
 	}
 
 	if (_oidc_strcmp(token_endpoint_auth, OIDC_PROTO_CLIENT_SECRET_BASIC) == 0)

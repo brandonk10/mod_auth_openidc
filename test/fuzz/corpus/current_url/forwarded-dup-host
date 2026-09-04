@@ -1,0 +1,3 @@
+/
+Host: www.example.com
+Forwarded: proto=https;host=x.example.com;host=y.example.com

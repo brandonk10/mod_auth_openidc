@@ -43,24 +43,32 @@
 #include "proto/proto.h"
 
 /*
- * returns the "aud" claim to insert into the JWT used for client
- * authentication towards the token endpoint using private_key_jwt/client_secret_jwt
+ * per-profile overrides of provider settings: each callback returns the effective value of a
+ * setting under its profile; the plain OIDC 1.0 entries pass the provider configuration
+ * through, the FAPI 2.0 entries enforce the FAPI 2.0 Security Profile requirements; adding a
+ * profile means adding one ops instance here rather than a branch in every getter
  */
-const char *oidc_proto_profile_token_endpoint_auth_aud(oidc_provider_t *provider) {
-	if (oidc_cfg_provider_profile_get(provider) == OIDC_PROFILE_FAPI20) {
-		return oidc_cfg_provider_issuer_get(provider);
-	}
+typedef struct oidc_proto_profile_ops_t {
+	const char *(*token_endpoint_auth_aud)(const oidc_provider_t *provider);
+	const char *(*revocation_endpoint_auth_aud)(const oidc_provider_t *provider, const char *val);
+	oidc_auth_request_method_t (*auth_request_method)(const oidc_provider_t *provider);
+	const apr_array_header_t *(*id_token_aud_values)(apr_pool_t *pool, const oidc_provider_t *provider);
+	const oidc_proto_pkce_t *(*pkce)(const oidc_provider_t *provider);
+	oidc_dpop_mode_t (*dpop_mode)(const oidc_provider_t *provider);
+	oidc_cert_bound_tokens_t (*cert_bound_tokens)(const oidc_provider_t *provider);
+	int (*response_require_iss)(const oidc_provider_t *provider);
+	const char *(*request_uri_scope)(const oidc_provider_t *provider);
+} oidc_proto_profile_ops_t;
+
+/*
+ * plain OpenID Connect 1.0: the configured provider settings apply as-is
+ */
+
+static const char *oidc_profile_oidc10_token_endpoint_auth_aud(const oidc_provider_t *provider) {
 	return oidc_cfg_provider_token_endpoint_url_get(provider);
 }
 
-/*
- * returns the "aud" claim to insert into the JWT used for client
- * authentication towards the revocation endpoint using private_key_jwt/client_secret_jwt
- */
-const char *oidc_proto_profile_revocation_endpoint_auth_aud(oidc_provider_t *provider, const char *val) {
-	if (oidc_cfg_provider_profile_get(provider) == OIDC_PROFILE_FAPI20) {
-		return oidc_cfg_provider_issuer_get(provider);
-	}
+static const char *oidc_profile_oidc10_revocation_endpoint_auth_aud(const oidc_provider_t *provider, const char *val) {
 	const char *aud = oidc_cfg_provider_revocation_endpoint_url_get(provider);
 	if (val != NULL) {
 		if (_oidc_strcmp(val, "token") == 0) {
@@ -72,56 +80,216 @@ const char *oidc_proto_profile_revocation_endpoint_auth_aud(oidc_provider_t *pro
 	return aud;
 }
 
+static oidc_auth_request_method_t oidc_profile_oidc10_auth_request_method(const oidc_provider_t *provider) {
+	return oidc_cfg_provider_auth_request_method_get(provider);
+}
+
+static const apr_array_header_t *oidc_profile_oidc10_id_token_aud_values(apr_pool_t *pool,
+									 const oidc_provider_t *provider) {
+	return oidc_cfg_provider_id_token_aud_values_get(provider);
+}
+
+static const oidc_proto_pkce_t *oidc_profile_oidc10_pkce(const oidc_provider_t *provider) {
+	return oidc_cfg_provider_pkce_get(provider);
+}
+
+static oidc_dpop_mode_t oidc_profile_oidc10_dpop_mode(const oidc_provider_t *provider) {
+	return oidc_cfg_provider_dpop_mode_get(provider);
+}
+
+static oidc_cert_bound_tokens_t oidc_profile_oidc10_cert_bound_tokens(const oidc_provider_t *provider) {
+	return oidc_cfg_provider_cert_bound_tokens_get(provider);
+}
+
+static int oidc_profile_oidc10_response_require_iss(const oidc_provider_t *provider) {
+	return oidc_cfg_provider_response_require_iss_get(provider);
+}
+
+static const char *oidc_profile_oidc10_request_uri_scope(const oidc_provider_t *provider) {
+	// OpenID Connect Core 1.0 incorporating errata set 2 section 6.2: even if a scope parameter is present in
+	// the referenced Request Object, a scope parameter MUST always be passed using the OAuth 2.0 request
+	// syntax containing the openid scope value
+	return OIDC_PROTO_SCOPE_OPENID;
+}
+
+static const oidc_proto_profile_ops_t _oidc_profile_oidc10_ops = {
+    oidc_profile_oidc10_token_endpoint_auth_aud,
+    oidc_profile_oidc10_revocation_endpoint_auth_aud,
+    oidc_profile_oidc10_auth_request_method,
+    oidc_profile_oidc10_id_token_aud_values,
+    oidc_profile_oidc10_pkce,
+    oidc_profile_oidc10_dpop_mode,
+    oidc_profile_oidc10_cert_bound_tokens,
+    oidc_profile_oidc10_response_require_iss,
+    oidc_profile_oidc10_request_uri_scope,
+};
+
+/*
+ * FAPI 2.0 Security Profile: harden the settings the profile mandates
+ */
+
+static const char *oidc_profile_fapi20_token_endpoint_auth_aud(const oidc_provider_t *provider) {
+	return oidc_cfg_provider_issuer_get(provider);
+}
+
+static const char *oidc_profile_fapi20_revocation_endpoint_auth_aud(const oidc_provider_t *provider, const char *val) {
+	return oidc_cfg_provider_issuer_get(provider);
+}
+
+static oidc_auth_request_method_t oidc_profile_fapi20_auth_request_method(const oidc_provider_t *provider) {
+	return OIDC_AUTH_REQUEST_METHOD_PAR;
+}
+
+static const apr_array_header_t *oidc_profile_fapi20_id_token_aud_values(apr_pool_t *pool,
+									 const oidc_provider_t *provider) {
+	// NB: the acceptable "aud" values may be overridden; when they are, the client_id is assumed (but not
+	//     enforced, even for FAPI20) to be among them
+	const apr_array_header_t *values = oidc_cfg_provider_id_token_aud_values_get(provider);
+	if (values == NULL) {
+		apr_array_header_t *list = NULL;
+		oidc_cfg_string_list_add(pool, &list, oidc_cfg_provider_client_id_get(provider));
+		return list;
+	}
+	return values;
+}
+
+static const oidc_proto_pkce_t *oidc_profile_fapi20_pkce(const oidc_provider_t *provider) {
+	return &oidc_pkce_s256;
+}
+
+static oidc_dpop_mode_t oidc_profile_fapi20_dpop_mode(const oidc_provider_t *provider) {
+	// FAPI 2.0 Security Profile section 5.3.2.1: access tokens shall be sender-constrained using
+	// *either* RFC 8705 mutual-TLS certificate binding *or* RFC 9449 DPoP. Mandating DPoP regardless
+	// breaks the mutual-TLS variant of the profile against an OP that does not support DPoP at all,
+	// so stand down when the access tokens are certificate-bound (as resolved into the provider
+	// struct by oidc_metadata_provider_parse) and the OP does not advertise DPoP support; the
+	// configured mode then applies, so DPoP can still be asked for explicitly
+	oidc_cert_bound_tokens_t mode = oidc_cfg_provider_cert_bound_tokens_get(provider);
+
+	// still "auto" means oidc_metadata_provider_parse never ran for this provider, i.e. an OP whose
+	// endpoints are all configured by hand, with no provider metadata to resolve it against. Take the
+	// same decision the profile hands that function in oidc_profile_fapi20_cert_bound_tokens: under
+	// FAPI 2.0 a configured TLS client certificate is there for RFC 8705 binding
+	if (mode == OIDC_CERT_BOUND_TOKENS_AUTO) {
+		if (oidc_cfg_provider_token_endpoint_tls_client_cert_get(provider) != NULL)
+			mode = OIDC_CERT_BOUND_TOKENS_ON;
+		else
+			mode = OIDC_CERT_BOUND_TOKENS_OFF;
+	}
+
+	if ((mode == OIDC_CERT_BOUND_TOKENS_ON) && (oidc_cfg_provider_dpop_supported_get(provider) == FALSE))
+		return oidc_cfg_provider_dpop_mode_get(provider);
+	return OIDC_DPOP_MODE_REQUIRED;
+}
+
+static oidc_cert_bound_tokens_t oidc_profile_fapi20_cert_bound_tokens(const oidc_provider_t *provider) {
+	// FAPI 2.0 Security Profile section 5.3.2.1: access tokens are sender-constrained through either
+	// mutual-TLS or DPoP, so a TLS client certificate configured against a FAPI 2.0 OP is there for
+	// RFC 8705 binding; use the mutual-TLS endpoints without requiring the OP to advertise support
+	return OIDC_CERT_BOUND_TOKENS_ON;
+}
+
+static int oidc_profile_fapi20_response_require_iss(const oidc_provider_t *provider) {
+	return 1;
+}
+
+static const char *oidc_profile_fapi20_request_uri_scope(const oidc_provider_t *provider) {
+	// FAPI 2.0 Security Profile section 5.3.3.2: the client shall only send the client_id and request_uri
+	// request parameters to the authorization endpoint, all other parameters (scope included) are sent in
+	// the pushed authorization request
+	return NULL;
+}
+
+static const oidc_proto_profile_ops_t _oidc_profile_fapi20_ops = {
+    oidc_profile_fapi20_token_endpoint_auth_aud,
+    oidc_profile_fapi20_revocation_endpoint_auth_aud,
+    oidc_profile_fapi20_auth_request_method,
+    oidc_profile_fapi20_id_token_aud_values,
+    oidc_profile_fapi20_pkce,
+    oidc_profile_fapi20_dpop_mode,
+    oidc_profile_fapi20_cert_bound_tokens,
+    oidc_profile_fapi20_response_require_iss,
+    oidc_profile_fapi20_request_uri_scope,
+};
+
+/*
+ * return the ops for the provider's configured profile
+ */
+static const oidc_proto_profile_ops_t *oidc_proto_profile_ops(const oidc_provider_t *provider) {
+	switch (oidc_cfg_provider_profile_get(provider)) {
+	case OIDC_PROFILE_FAPI20:
+		return &_oidc_profile_fapi20_ops;
+	case OIDC_PROFILE_OIDC10:
+	default:
+		return &_oidc_profile_oidc10_ops;
+	}
+}
+
+/*
+ * returns the "aud" claim to insert into the JWT used for client
+ * authentication towards the token endpoint using private_key_jwt/client_secret_jwt
+ */
+const char *oidc_proto_profile_token_endpoint_auth_aud(const oidc_provider_t *provider) {
+	return oidc_proto_profile_ops(provider)->token_endpoint_auth_aud(provider);
+}
+
+/*
+ * returns the "aud" claim to insert into the JWT used for client
+ * authentication towards the revocation endpoint using private_key_jwt/client_secret_jwt
+ */
+const char *oidc_proto_profile_revocation_endpoint_auth_aud(const oidc_provider_t *provider, const char *val) {
+	return oidc_proto_profile_ops(provider)->revocation_endpoint_auth_aud(provider, val);
+}
+
 /*
  * returns the method to be used when sending the authorization request to the Provider
  */
-oidc_auth_request_method_t oidc_proto_profile_auth_request_method_get(oidc_provider_t *provider) {
-	if (oidc_cfg_provider_profile_get(provider) == OIDC_PROFILE_FAPI20)
-		return OIDC_AUTH_REQUEST_METHOD_PAR;
-	return oidc_cfg_provider_auth_request_method_get(provider);
+oidc_auth_request_method_t oidc_proto_profile_auth_request_method_get(const oidc_provider_t *provider) {
+	return oidc_proto_profile_ops(provider)->auth_request_method(provider);
 }
 
 /*
  * returns the acceptable "aud" values in the ID token
  */
-const apr_array_header_t *oidc_proto_profile_id_token_aud_values_get(apr_pool_t *pool, oidc_provider_t *provider) {
-	const apr_array_header_t *values = oidc_cfg_provider_id_token_aud_values_get(provider);
-	// TODO: so we actually do allow overriding the acceptable "aud" values but we sort of assume the client_id
-	//       is in there in that case; perhaps check that - in the config check? - for FAPI20
-	if (values == NULL) {
-		if (oidc_cfg_provider_profile_get(provider) == OIDC_PROFILE_FAPI20) {
-			apr_array_header_t *list = NULL;
-			oidc_cfg_string_list_add(pool, &list, oidc_cfg_provider_client_id_get(provider));
-			return list;
-		}
-	}
-	return values;
+const apr_array_header_t *oidc_proto_profile_id_token_aud_values_get(apr_pool_t *pool,
+								     const oidc_provider_t *provider) {
+	return oidc_proto_profile_ops(provider)->id_token_aud_values(pool, provider);
 }
 
 /*
  * returns the PKCE mode
  */
-const oidc_proto_pkce_t *oidc_proto_profile_pkce_get(oidc_provider_t *provider) {
-	if (oidc_cfg_provider_profile_get(provider) == OIDC_PROFILE_FAPI20)
-		return &oidc_pkce_s256;
-	return oidc_cfg_provider_pkce_get(provider);
+const oidc_proto_pkce_t *oidc_proto_profile_pkce_get(const oidc_provider_t *provider) {
+	return oidc_proto_profile_ops(provider)->pkce(provider);
 }
 
 /*
  * returns the DPoP mode
  */
-oidc_dpop_mode_t oidc_proto_profile_dpop_mode_get(oidc_provider_t *provider) {
-	if (oidc_cfg_provider_profile_get(provider) == OIDC_PROFILE_FAPI20)
-		return OIDC_DPOP_MODE_REQUIRED;
-	return oidc_cfg_provider_dpop_mode_get(provider);
+oidc_dpop_mode_t oidc_proto_profile_dpop_mode_get(const oidc_provider_t *provider) {
+	return oidc_proto_profile_ops(provider)->dpop_mode(provider);
+}
+
+/*
+ * returns whether to obtain RFC 8705 certificate-bound access tokens with a configured TLS client
+ * certificate that is not (also) used for mutual-TLS client authentication
+ */
+oidc_cert_bound_tokens_t oidc_proto_profile_cert_bound_tokens_get(const oidc_provider_t *provider) {
+	return oidc_proto_profile_ops(provider)->cert_bound_tokens(provider);
 }
 
 /*
  * returns whether the Provider is required to pass back an "iss" parameter
  * together with the authorization response sent to the Redirect URI
  */
-int oidc_proto_profile_response_require_iss_get(oidc_provider_t *provider) {
-	if (oidc_cfg_provider_profile_get(provider) == OIDC_PROFILE_FAPI20)
-		return 1;
-	return oidc_cfg_provider_response_require_iss_get(provider);
+int oidc_proto_profile_response_require_iss_get(const oidc_provider_t *provider) {
+	return oidc_proto_profile_ops(provider)->response_require_iss(provider);
+}
+
+/*
+ * returns the value of the "scope" parameter to add to an authorization request that
+ * references its parameters through a "request_uri", or NULL when it must be omitted
+ */
+const char *oidc_proto_profile_request_uri_scope_get(const oidc_provider_t *provider) {
+	return oidc_proto_profile_ops(provider)->request_uri_scope(provider);
 }

@@ -47,7 +47,7 @@
 /*
  * validate "iat" claim in JWT
  */
-static apr_byte_t oidc_proto_validate_iat(request_rec *r, oidc_jwt_t *jwt, apr_byte_t is_mandatory, int slack) {
+static apr_byte_t oidc_proto_validate_iat(request_rec *r, const oidc_jwt_t *jwt, apr_byte_t is_mandatory, int slack) {
 
 	/* get the current time */
 	apr_time_t now = apr_time_sec(apr_time_now());
@@ -60,6 +60,10 @@ static apr_byte_t oidc_proto_validate_iat(request_rec *r, oidc_jwt_t *jwt, apr_b
 		}
 		return TRUE;
 	}
+	if (!(jwt->payload.iat >= 0)) {
+		oidc_error(r, "\"%s\" validation failure: JWT contained an invalid timestamp", OIDC_CLAIM_IAT);
+		return FALSE;
+	}
 
 	/* see if we are asked to enforce a time window at all */
 	if (slack < 0) {
@@ -67,15 +71,22 @@ static apr_byte_t oidc_proto_validate_iat(request_rec *r, oidc_jwt_t *jwt, apr_b
 		return TRUE;
 	}
 
+	/* bounded seconds for logging only: a JSON number can exceed apr_time_t, and "%f" of a huge value
+	 * reads uninitialised bytes in apr_vformatter; the comparisons below stay in the exact double domain */
+	apr_time_t iat = apr_time_sec(oidc_util_apr_time_from_sec(jwt->payload.iat));
+
 	/* check if this id_token has been issued just now +- slack (default 10 minutes) */
-	if ((now - slack) > jwt->payload.iat) {
-		oidc_error(r, "\"iat\" validation failure (%ld): JWT was issued more than %d seconds ago",
-			   (long)jwt->payload.iat, slack);
+	if ((double)(now - slack) > jwt->payload.iat) {
+		oidc_error(r,
+			   "\"iat\" validation failure (%" APR_TIME_T_FMT "): JWT was issued more than %d seconds ago",
+			   iat, slack);
 		return FALSE;
 	}
-	if ((now + slack) < jwt->payload.iat) {
-		oidc_error(r, "\"iat\" validation failure (%ld): JWT was issued more than %d seconds in the future",
-			   (long)jwt->payload.iat, slack);
+	if ((double)(now + slack) < jwt->payload.iat) {
+		oidc_error(r,
+			   "\"iat\" validation failure (%" APR_TIME_T_FMT
+			   "): JWT was issued more than %d seconds in the future",
+			   iat, slack);
 		return FALSE;
 	}
 
@@ -85,7 +96,7 @@ static apr_byte_t oidc_proto_validate_iat(request_rec *r, oidc_jwt_t *jwt, apr_b
 /*
  * validate "exp" claim in JWT
  */
-static apr_byte_t oidc_proto_validate_exp(request_rec *r, oidc_jwt_t *jwt, apr_byte_t is_mandatory) {
+static apr_byte_t oidc_proto_validate_exp(request_rec *r, const oidc_jwt_t *jwt, apr_byte_t is_mandatory) {
 
 	/* get the current time */
 	apr_time_t now = apr_time_sec(apr_time_now());
@@ -99,11 +110,18 @@ static apr_byte_t oidc_proto_validate_exp(request_rec *r, oidc_jwt_t *jwt, apr_b
 		return TRUE;
 	}
 
-	/* see if now is beyond the JWT expiry timestamp */
-	apr_time_t expires = jwt->payload.exp;
-	if (now > expires) {
-		oidc_error(r, "\"exp\" validation failure (%ld): JWT expired %ld seconds ago", (long)expires,
-			   (long)(now - expires));
+	if (!(jwt->payload.exp >= 0)) {
+		oidc_error(r, "\"%s\" validation failure: JWT contained an invalid timestamp", OIDC_CLAIM_EXP);
+		return FALSE;
+	}
+	/* compare in the double domain: an out-of-range JSON number ("exp":1e300) cast to apr_time_t is
+	 * undefined behaviour, and would otherwise let platform-specific wraparound decide validity; the
+	 * bounded seconds value is for logging only (see oidc_proto_validate_iat) */
+	apr_time_t exp = apr_time_sec(oidc_util_apr_time_from_sec(jwt->payload.exp));
+	if ((double)now > jwt->payload.exp) {
+		oidc_error(
+		    r, "\"%s\" validation failure (%" APR_TIME_T_FMT "): JWT expired %" APR_TIME_T_FMT " seconds ago",
+		    OIDC_CLAIM_EXP, exp, now - exp);
 		return FALSE;
 	}
 
@@ -144,6 +162,23 @@ apr_byte_t oidc_proto_jwt_validate(request_rec *r, oidc_jwt_t *jwt, const char *
 	return TRUE;
 }
 
+/* Merge verification keys, letting the provider's current JWKS override static keys with the same kid. */
+static apr_hash_t *oidc_proto_jwt_verify_keys_merge(request_rec *r, apr_hash_t *static_keys, apr_hash_t *dynamic_keys) {
+	if ((static_keys != NULL) && (dynamic_keys != NULL)) {
+		for (apr_hash_index_t *hi = apr_hash_first(r->pool, static_keys); hi != NULL; hi = apr_hash_next(hi)) {
+			const void *kid = NULL;
+			apr_hash_this(hi, &kid, NULL, NULL);
+			if ((kid != NULL) && (apr_hash_get(dynamic_keys, kid, APR_HASH_KEY_STRING) != NULL))
+				oidc_warn(r,
+					  "a statically configured verification key with kid \"%s\" is shadowed by a "
+					  "key with the same kid obtained from the provider's JWKS; using the JWKS key",
+					  (const char *)kid);
+		}
+	}
+	/* dynamic keys (first argument) take precedence over static keys on a "kid" collision */
+	return oidc_util_key_sets_hash_merge(r->pool, dynamic_keys, static_keys);
+}
+
 /*
  * verify the signature on a JWT using the dynamically obtained and statically configured keys
  */
@@ -153,6 +188,7 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 	oidc_jose_error_t err;
 	apr_hash_t *dynamic_keys = NULL;
 	apr_byte_t force_refresh = FALSE;
+	apr_byte_t use_jwks_uri = FALSE;
 	apr_byte_t rv = FALSE;
 
 	if (alg != NULL) {
@@ -161,6 +197,12 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 				   jwt->header.alg, alg);
 			return FALSE;
 		}
+	} else if ((jwt->header.alg == NULL) || (_oidc_strcmp(jwt->header.alg, "none") == 0)) {
+		/* without an admin-configured algorithm to pin against, refuse the
+		 * unsigned "none" alg outright; cjose would also fail to find a
+		 * matching key, but reject early so the failure is unambiguous */
+		oidc_error(r, "no expected signing algorithm configured and JWT alg is \"none\" or unset: refusing");
+		return FALSE;
 	}
 
 	dynamic_keys = apr_hash_make(r->pool);
@@ -171,12 +213,13 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 			      "performed against statically configured keys");
 		/* the JWKs URI was provided, but let's see if it makes sense to pull down keys, i.e. if it is an
 		 * asymmetric signature */
-	} else if (oidc_jwt_alg2kty(jwt) == CJOSE_JWK_KTY_OCT) {
+	} else if (oidc_jwt_alg2kty(jwt) == OIDC_JOSE_JWK_KTY_OCT) {
 		oidc_debug(r,
 			   "\"%s\" is set, but the JWT has a symmetric signature so we won't pull/use keys from there",
 			   (jwks_uri->signed_uri != NULL) ? "signed_jwks_uri" : "jwks_uri");
 	} else {
 		/* get the key from the JWKs that corresponds with the key specified in the header */
+		use_jwks_uri = TRUE;
 		force_refresh = FALSE;
 		if (oidc_proto_jwks_uri_keys(r, cfg, jwt, jwks_uri, ssl_validate_server, dynamic_keys,
 					     &force_refresh) == FALSE) {
@@ -186,11 +229,15 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 	}
 
 	/* do the actual JWS verification with the locally and remotely provided key material */
-	// TODO: now static keys "win" if the same `kid` was used in both local and remote key sets
-	rv = oidc_jwt_verify(r->pool, jwt, oidc_util_key_sets_hash_merge(r->pool, static_keys, dynamic_keys), &err);
+	rv = oidc_jwt_verify(r->pool, jwt, oidc_proto_jwt_verify_keys_merge(r, static_keys, dynamic_keys), &err);
 
-	/* if no kid was provided we may have used stale keys from the cache, so we'll refresh it */
-	if ((rv == FALSE) && (jwt->header.kid == NULL)) {
+	/*
+	 * if no kid was provided we may have used stale keys from the cache, so we'll refresh it -- but
+	 * only when the keys came from a JWKs URI in the first place: with none configured, or with a
+	 * symmetric signature, there is nothing to refresh from, and retrying would hand the HTTP layer a
+	 * NULL URL (and sleep through its retry back-off) for every bad no-kid token a client sends
+	 */
+	if ((rv == FALSE) && (jwt->header.kid == NULL) && (use_jwks_uri == TRUE)) {
 		oidc_warn(
 		    r, "JWT signature verification failed (%s) for JWT with no kid, re-trying with forced refresh now",
 		    oidc_jose_e2s(r->pool, err));
@@ -198,8 +245,8 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 		/* destroy the list to avoid memory leaks when keys with the same kid are retrieved */
 		oidc_jwk_list_destroy_hash(dynamic_keys);
 		oidc_proto_jwks_uri_keys(r, cfg, jwt, jwks_uri, ssl_validate_server, dynamic_keys, &force_refresh);
-		rv = oidc_jwt_verify(r->pool, jwt, oidc_util_key_sets_hash_merge(r->pool, static_keys, dynamic_keys),
-				     &err);
+		rv =
+		    oidc_jwt_verify(r->pool, jwt, oidc_proto_jwt_verify_keys_merge(r, static_keys, dynamic_keys), &err);
 	}
 
 	if (rv == FALSE) {
@@ -218,8 +265,9 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
  * return the compact-encoded JWT header contents
  */
 char *oidc_proto_jwt_header_peek(request_rec *r, const char *compact_encoded_jwt, char **alg, char **enc, char **kid) {
-	char *input = NULL, *result = NULL;
-	char *p = _oidc_strstr(compact_encoded_jwt ? compact_encoded_jwt : "", ".");
+	const char *input = NULL;
+	char *result = NULL;
+	const char *p = _oidc_strstr(compact_encoded_jwt ? compact_encoded_jwt : "", ".");
 	if (p == NULL) {
 		oidc_warn(r, "could not parse first element separated by \".\" from input");
 		return NULL;
@@ -229,24 +277,28 @@ char *oidc_proto_jwt_header_peek(request_rec *r, const char *compact_encoded_jwt
 		oidc_warn(r, "oidc_base64url_decode returned an error");
 		return NULL;
 	}
-	if ((alg != NULL) || (enc != NULL)) {
-		json_t *json = NULL;
-		oidc_util_json_decode_object(r, result, &json);
+	/* Parse when kid alone is requested; otherwise a present key ID would be reported as absent. */
+	if ((alg != NULL) || (enc != NULL) || (kid != NULL)) {
+		oidc_json_t *json = NULL;
+		oidc_json_decode_object(r, result, &json);
 		if (json) {
 			if (alg)
-				*alg = apr_pstrdup(r->pool, json_string_value(json_object_get(json, CJOSE_HDR_ALG)));
+				*alg = apr_pstrdup(
+				    r->pool, oidc_json_string_value(oidc_json_object_get(json, OIDC_JOSE_HDR_ALG)));
 			if (enc)
-				*enc = apr_pstrdup(r->pool, json_string_value(json_object_get(json, CJOSE_HDR_ENC)));
+				*enc = apr_pstrdup(
+				    r->pool, oidc_json_string_value(oidc_json_object_get(json, OIDC_JOSE_HDR_ENC)));
 			if (kid)
-				*kid = apr_pstrdup(r->pool, json_string_value(json_object_get(json, CJOSE_HDR_KID)));
+				*kid = apr_pstrdup(
+				    r->pool, oidc_json_string_value(oidc_json_object_get(json, OIDC_JOSE_HDR_KID)));
 		}
-		json_decref(json);
+		oidc_json_decref(json);
 	}
 	return result;
 }
 
-apr_byte_t oidc_proto_jwt_create_from_first_pkey(request_rec *r, oidc_cfg_t *cfg, oidc_jwk_t **jwk, oidc_jwt_t **jwt,
-						 apr_byte_t use_psa_for_rsa) {
+apr_byte_t oidc_proto_jwt_create_from_first_pkey(request_rec *r, const oidc_cfg_t *cfg, oidc_jwk_t **jwk,
+						 oidc_jwt_t **jwt, apr_byte_t use_psa_for_rsa) {
 	apr_byte_t rv = FALSE;
 
 	oidc_debug(r, "enter");
@@ -263,10 +315,11 @@ apr_byte_t oidc_proto_jwt_create_from_first_pkey(request_rec *r, oidc_cfg_t *cfg
 
 	(*jwt)->header.kid = apr_pstrdup(r->pool, (*jwk)->kid);
 
-	if ((*jwk)->kty == CJOSE_JWK_KTY_RSA)
-		(*jwt)->header.alg = apr_pstrdup(r->pool, use_psa_for_rsa ? CJOSE_HDR_ALG_PS256 : CJOSE_HDR_ALG_RS256);
-	else if ((*jwk)->kty == CJOSE_JWK_KTY_EC)
-		(*jwt)->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_ES256);
+	if ((*jwk)->kty == OIDC_JOSE_JWK_KTY_RSA)
+		(*jwt)->header.alg =
+		    apr_pstrdup(r->pool, use_psa_for_rsa ? OIDC_JOSE_HDR_ALG_PS256 : OIDC_JOSE_HDR_ALG_RS256);
+	else if ((*jwk)->kty == OIDC_JOSE_JWK_KTY_EC)
+		(*jwt)->header.alg = apr_pstrdup(r->pool, OIDC_JOSE_HDR_ALG_ES256);
 	else {
 		oidc_error(r, "no usable RSA/EC signing keys has been configured (in " OIDCPrivateKeyFiles ")");
 		goto end;
@@ -280,7 +333,7 @@ end:
 	return rv;
 }
 
-apr_byte_t oidc_proto_jwt_sign_and_serialize(request_rec *r, oidc_jwk_t *jwk, oidc_jwt_t *jwt, char **cser) {
+apr_byte_t oidc_proto_jwt_sign_and_serialize(request_rec *r, const oidc_jwk_t *jwk, oidc_jwt_t *jwt, char **cser) {
 	apr_byte_t rv = FALSE;
 	oidc_jose_error_t err;
 

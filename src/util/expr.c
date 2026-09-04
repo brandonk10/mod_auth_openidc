@@ -42,6 +42,7 @@
 
 #include "util/pcre_subst.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
 
 /*
  * regexp substitute
@@ -54,7 +55,7 @@
 apr_byte_t oidc_util_regexp_substitute(apr_pool_t *pool, const char *input, const char *regexp, const char *replace,
 				       char **output, char **error_str) {
 
-	char *substituted = NULL;
+	const char *substituted = NULL;
 	apr_byte_t rc = FALSE;
 
 	struct oidc_pcre *preg = oidc_pcre_compile(pool, regexp, error_str);
@@ -64,10 +65,9 @@ apr_byte_t oidc_util_regexp_substitute(apr_pool_t *pool, const char *input, cons
 		goto out;
 	}
 
-	if (_oidc_strlen(input) >= OIDC_PCRE_MAXCAPTURE - 1) {
-		*error_str =
-		    apr_psprintf(pool, "string length (%d) is larger than the maximum allowed for pcre_subst (%d)",
-				 (int)_oidc_strlen(input), OIDC_PCRE_MAXCAPTURE - 1);
+	if (_oidc_strlen(input) > OIDC_PCRE_SUBST_MAX_INPUT_LEN) {
+		*error_str = apr_psprintf(pool, "string length (%d) is larger than the maximum allowed (%d)",
+					  (int)_oidc_strlen(input), OIDC_PCRE_SUBST_MAX_INPUT_LEN);
 		goto out;
 	}
 
@@ -126,16 +126,20 @@ out:
 /*
  * parse an Apache expression
  */
-char *oidc_util_apr_expr_parse(cmd_parms *cmd, const char *str, oidc_apr_expr_t **expr, apr_byte_t result_is_str) {
+char *oidc_util_apr_expr_parse(cmd_parms *cmd, const char *str, oidc_apr_expr_t **expr,
+			       oidc_apr_expr_result_t result_type) {
 	char *rv = NULL;
 	if ((str == NULL) || (expr == NULL))
 		return NULL;
 	*expr = apr_pcalloc(cmd->pool, sizeof(oidc_apr_expr_t));
 	(*expr)->str = apr_pstrdup(cmd->pool, str);
 	const char *expr_err = NULL;
-	unsigned int flags = AP_EXPR_FLAG_DONT_VARY & AP_EXPR_FLAG_RESTRICTED;
-	if (result_is_str)
-		flags += AP_EXPR_FLAG_STRING_RESULT;
+	/* combine the flags with bitwise-OR; "&" left flags at 0, dropping AP_EXPR_FLAG_RESTRICTED (and
+	 * AP_EXPR_FLAG_DONT_VARY) so the expression was parsed unrestricted even though these directives
+	 * are valid in .htaccess (OR_AUTHCFG) */
+	unsigned int flags = AP_EXPR_FLAG_DONT_VARY | AP_EXPR_FLAG_RESTRICTED;
+	if (result_type)
+		flags |= AP_EXPR_FLAG_STRING_RESULT;
 	(*expr)->expr = ap_expr_parse_cmd(cmd, str, flags, &expr_err, NULL);
 	if (expr_err != NULL) {
 		rv = apr_pstrcat(cmd->temp_pool, "cannot parse expression: ", expr_err, NULL);
@@ -147,12 +151,12 @@ char *oidc_util_apr_expr_parse(cmd_parms *cmd, const char *str, oidc_apr_expr_t 
 /*
  * execute an Apache expression
  */
-const char *oidc_util_apr_expr_exec(request_rec *r, const oidc_apr_expr_t *expr, apr_byte_t result_is_str) {
+const char *oidc_util_apr_expr_exec(request_rec *r, const oidc_apr_expr_t *expr, oidc_apr_expr_result_t result_type) {
 	const char *expr_result = NULL;
 	if (expr == NULL)
 		return NULL;
 	const char *expr_err = NULL;
-	if (result_is_str) {
+	if (result_type) {
 		expr_result = ap_expr_str_exec(r, expr->expr, &expr_err);
 	} else {
 		expr_result = ap_expr_exec(r, expr->expr, &expr_err) ? "" : NULL;

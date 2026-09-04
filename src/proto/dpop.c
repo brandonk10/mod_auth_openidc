@@ -40,20 +40,22 @@
  * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
+#include "metrics.h"
 #include "mod_auth_openidc.h"
 #include "proto/proto.h"
 #include "util/util.h"
 
 #define OIDC_PROTO_DPOP_JWT_TYP "dpop+jwt"
 
-apr_byte_t oidc_proto_dpop_use_nonce(request_rec *r, oidc_cfg_t *cfg, json_t *j_result, apr_hash_t *response_hdrs,
-				     const char *url, const char *method, const char *access_token, char **dpop) {
+apr_byte_t oidc_proto_dpop_use_nonce(request_rec *r, const oidc_cfg_t *cfg, const oidc_json_t *j_result,
+				     apr_hash_t *response_hdrs, const char *url, const char *method,
+				     const char *access_token, char **dpop) {
 	apr_byte_t rv = FALSE;
-	char *dpop_nonce = NULL;
+	const char *dpop_nonce = NULL;
 
-	json_t *j_error = json_object_get(j_result, OIDC_PROTO_ERROR);
-	if ((j_error == NULL) || (!json_is_string(j_error)) ||
-	    (_oidc_strcmp(json_string_value(j_error), OIDC_PROTO_DPOP_USE_NONCE) != 0))
+	const oidc_json_t *j_error = oidc_json_object_get(j_result, OIDC_PROTO_ERROR);
+	if ((j_error == NULL) || (!oidc_json_is_string(j_error)) ||
+	    (_oidc_strcmp(oidc_json_string_value(j_error), OIDC_PROTO_DPOP_USE_NONCE) != 0))
 		goto end;
 
 	/* try again with a DPoP nonce provided by the server */
@@ -66,6 +68,9 @@ apr_byte_t oidc_proto_dpop_use_nonce(request_rec *r, oidc_cfg_t *cfg, json_t *j_
 
 	rv = oidc_proto_dpop_create(r, cfg, url, method, access_token, dpop_nonce, dpop);
 
+	if (rv == TRUE)
+		OIDC_METRICS_COUNTER_INC(r, cfg, OM_PROVIDER_DPOP_RETRY);
+
 end:
 
 	oidc_debug(r, "leave: %d, dpop=%s", rv, *dpop ? "true" : "false");
@@ -76,13 +81,12 @@ end:
 /*
  * generate a DPoP proof for the specified URL/method/access_token
  */
-apr_byte_t oidc_proto_dpop_create(request_rec *r, oidc_cfg_t *cfg, const char *url, const char *method,
+apr_byte_t oidc_proto_dpop_create(request_rec *r, const oidc_cfg_t *cfg, const char *url, const char *method,
 				  const char *access_token, const char *nonce, char **dpop) {
 	apr_byte_t rv = FALSE;
 	oidc_jwt_t *jwt = NULL;
 	oidc_jwk_t *jwk = NULL;
 	oidc_jose_error_t err;
-	cjose_err cjose_err;
 	char *s_jwk = NULL;
 	char *ath = NULL;
 
@@ -91,26 +95,33 @@ apr_byte_t oidc_proto_dpop_create(request_rec *r, oidc_cfg_t *cfg, const char *u
 	if (oidc_proto_jwt_create_from_first_pkey(r, cfg, &jwk, &jwt, TRUE) == FALSE)
 		goto end;
 
-	json_object_set_new(jwt->header.value.json, OIDC_CLAIM_TYP, json_string(OIDC_PROTO_DPOP_JWT_TYP));
-	s_jwk = cjose_jwk_to_json(jwk->cjose_jwk, 0, &cjose_err);
-	cjose_header_set_raw(jwt->header.value.json, OIDC_CLAIM_JWK, s_jwk, &cjose_err);
+	oidc_json_object_set_new(jwt->header.value.json, OIDC_CLAIM_TYP, oidc_json_string(OIDC_PROTO_DPOP_JWT_TYP));
+	if (oidc_jwk_to_public_json(r->pool, jwk, &s_jwk, &err) == FALSE) {
+		oidc_error(r, "oidc_jwk_to_public_json failed: %s", oidc_jose_e2s(r->pool, err));
+		goto end;
+	}
+	if (oidc_jwt_hdr_set_json(jwt, OIDC_CLAIM_JWK, s_jwk, &err) == FALSE) {
+		oidc_error(r, "oidc_jwt_hdr_set_json failed: %s", oidc_jose_e2s(r->pool, err));
+		goto end;
+	}
 
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_JTI, json_string(oidc_proto_jti_gen(r)));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_HTM, json_string(method));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_HTU, json_string(url));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_IAT, json_integer(apr_time_sec(apr_time_now())));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_JTI, oidc_json_string(oidc_proto_jti_gen(r)));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_HTM, oidc_json_string(method));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_HTU, oidc_json_string(url));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_IAT,
+				 oidc_json_integer(apr_time_sec(apr_time_now())));
 
 	if (access_token != NULL) {
 		if (oidc_jose_hash_and_base64url_encode(r->pool, OIDC_JOSE_ALG_SHA256, access_token,
-							_oidc_strlen(access_token), &ath, &err) == FALSE) {
+							(int)_oidc_strlen(access_token), &ath, &err) == FALSE) {
 			oidc_error(r, "oidc_jose_hash_and_base64url_encode failed: %s", oidc_jose_e2s(r->pool, err));
 			goto end;
 		}
-		json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_ATH, json_string(ath));
+		oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_ATH, oidc_json_string(ath));
 	}
 
 	if (nonce != NULL)
-		json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_NONCE, json_string(nonce));
+		oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_NONCE, oidc_json_string(nonce));
 
 	if (oidc_proto_jwt_sign_and_serialize(r, jwk, jwt, dpop) == FALSE)
 		goto end;
@@ -118,9 +129,6 @@ apr_byte_t oidc_proto_dpop_create(request_rec *r, oidc_cfg_t *cfg, const char *u
 	rv = TRUE;
 
 end:
-
-	if (s_jwk)
-		cjose_get_dealloc()(s_jwk);
 
 	if (jwt)
 		oidc_jwt_destroy(jwt);

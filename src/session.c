@@ -41,10 +41,11 @@
  * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
+#include "session.h"
 #include "cfg/dir.h"
 #include "metrics.h"
-#include "mod_auth_openidc.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
 
 /* the name of the remote-user attribute in the session  */
 #define OIDC_SESSION_REMOTE_USER_KEY "r"
@@ -60,16 +61,24 @@
 #define OIDC_SESSION_KEY_USERINFO_CLAIMS "uic"
 /* key for storing the id_token claims in the session context */
 #define OIDC_SESSION_KEY_IDTOKEN_CLAIMS "idc"
+/* the name of the payload format version attribute in the session */
+#define OIDC_SESSION_FORMAT_VERSION_KEY "v"
+
+/*
+ * Bump only when older readers cannot safely interpret the payload. Adding keys is compatible
+ * because readers ignore unknown keys. A missing version means the original, version-1 layout.
+ */
+#define OIDC_SESSION_FORMAT_VERSION 1
 
 /*
  * encode/serialize the session object/data into a string, possibly a serialized encrypted JWT when encryption is
  * requested
  */
-static apr_byte_t oidc_session_encode(request_rec *r, oidc_cfg_t *c, oidc_session_t *z, char **s_value,
+static apr_byte_t oidc_session_encode(request_rec *r, const oidc_cfg_t *c, const oidc_session_t *z, char **s_value,
 				      apr_byte_t encrypt) {
 
 	if (encrypt == FALSE) {
-		*s_value = oidc_util_json_encode(r->pool, z->state, JSON_COMPACT);
+		*s_value = oidc_json_encode(r->pool, z->state, OIDC_JSON_COMPACT);
 		return (*s_value != NULL);
 	} else if (oidc_cfg_crypto_passphrase_secret1_get(c) == NULL) {
 		oidc_error(r, "cannot encrypt session state because " OIDCCryptoPassphrase " is not set");
@@ -77,21 +86,43 @@ static apr_byte_t oidc_session_encode(request_rec *r, oidc_cfg_t *c, oidc_sessio
 	}
 
 	if (oidc_util_jwt_create(r, oidc_cfg_crypto_passphrase_get(c),
-				 oidc_util_json_encode(r->pool, z->state, JSON_COMPACT), s_value) == FALSE)
+				 oidc_json_encode(r->pool, z->state, OIDC_JSON_COMPACT), s_value) == FALSE)
 		return FALSE;
 
+	return TRUE;
+}
+
+/* Reject payloads from newer layouts so the caller re-authenticates instead of misreading them. */
+static apr_byte_t oidc_session_version_supported(request_rec *r, oidc_session_t *z) {
+	int version = 0;
+	/* absent: written before the field existed, i.e. the original layout */
+	oidc_json_object_get_int(z->state, OIDC_SESSION_FORMAT_VERSION_KEY, &version, 1);
+	if (version > OIDC_SESSION_FORMAT_VERSION) {
+		oidc_warn(r,
+			  "discarding a session in payload format version %d: this module writes and understands "
+			  "up to version %d, so it was written by a newer mod_auth_openidc sharing this cache",
+			  version, OIDC_SESSION_FORMAT_VERSION);
+		/* the rejected object is refcounted, not pool-owned: drop it here, because the
+		 * callers treat FALSE as "no session" and a fallback load
+		 * (OIDCSessionCacheFallbackToCookie) overwrites the pointer and leaks it */
+		oidc_json_decref(z->state);
+		z->state = NULL;
+		return FALSE;
+	}
 	return TRUE;
 }
 
 /*
  * parse a session object from the provided string, which may be an encrypted JWT is encryption is on
  */
-static apr_byte_t oidc_session_decode(request_rec *r, oidc_cfg_t *c, oidc_session_t *z, const char *s_json,
+static apr_byte_t oidc_session_decode(request_rec *r, const oidc_cfg_t *c, oidc_session_t *z, const char *s_json,
 				      apr_byte_t encrypt) {
 	char *s_payload = NULL;
 
 	if (encrypt == FALSE) {
-		return oidc_util_json_decode_object(r, s_json, &z->state);
+		if (oidc_json_decode_object(r, s_json, &z->state) == FALSE)
+			return FALSE;
+		return oidc_session_version_supported(r, z);
 	} else if (oidc_cfg_crypto_passphrase_secret1_get(c) == NULL) {
 		oidc_error(r, "cannot decrypt session state because " OIDCCryptoPassphrase " is not set");
 		return FALSE;
@@ -102,7 +133,10 @@ static apr_byte_t oidc_session_decode(request_rec *r, oidc_cfg_t *c, oidc_sessio
 		return FALSE;
 	}
 
-	return oidc_util_json_decode_object(r, s_payload, &z->state);
+	if (oidc_json_decode_object(r, s_payload, &z->state) == FALSE)
+		return FALSE;
+
+	return oidc_session_version_supported(r, z);
 }
 
 #define OIDC_SESSION_ID_LEN 20
@@ -122,18 +156,33 @@ static void oidc_session_clear(request_rec *r, oidc_session_t *z) {
 	// NB: don't clear sid or uuid
 	z->expiry = 0;
 	if (z->state) {
-		json_decref(z->state);
+		oidc_json_decref(z->state);
 		z->state = NULL;
 	}
 }
 
 /*
+ * Replace the presented session on login. Reusing its id or contents would allow a planted
+ * server-cache cookie to survive authentication; client-cookie sessions are re-keyed for
+ * consistent behavior.
+ */
+void oidc_session_reset(request_rec *r, const oidc_cfg_t *c, oidc_session_t *z) {
+	if ((oidc_cfg_session_type_get(c) == OIDC_SESSION_TYPE_SERVER_CACHE) && (z->uuid != NULL))
+		oidc_cache_set_session(r, z->uuid, NULL, 0);
+	oidc_session_clear(r, z);
+	/* these two index the session for back-channel logout and belong to the previous occupant */
+	z->sid = NULL;
+	z->sub = NULL;
+	oidc_session_id_new(r, z);
+}
+
+/*
  * get a value from the session based on the name from a name/value pair
  */
-static apr_byte_t oidc_session_get(request_rec *r, oidc_session_t *z, const char *key, char **value) {
+static apr_byte_t oidc_session_get(request_rec *r, const oidc_session_t *z, const char *key, char **value) {
 
 	/* just return the value for the key */
-	oidc_util_json_object_get_string(r->pool, z->state, key, (char **)value, NULL);
+	oidc_json_object_get_string(r->pool, z->state, key, value, NULL);
 
 	return TRUE;
 }
@@ -141,15 +190,15 @@ static apr_byte_t oidc_session_get(request_rec *r, oidc_session_t *z, const char
 /*
  * set a name/value key pair in the session
  */
-static apr_byte_t oidc_session_json_set(request_rec *r, oidc_session_t *z, const char *key, json_t *value) {
+static apr_byte_t oidc_session_json_set(request_rec *r, oidc_session_t *z, const char *key, oidc_json_t *value) {
 
 	/* only set it if non-NULL, otherwise delete the entry */
 	if (value) {
 		if (z->state == NULL)
-			z->state = json_object();
-		json_object_set_new(z->state, key, value);
+			z->state = oidc_json_object();
+		oidc_json_object_set_new(z->state, key, value);
 	} else if (z->state != NULL) {
-		json_object_del(z->state, key);
+		oidc_json_object_del(z->state, key);
 	}
 
 	return TRUE;
@@ -158,21 +207,21 @@ static apr_byte_t oidc_session_json_set(request_rec *r, oidc_session_t *z, const
 /*
  * get a json object from the session based on the name from a name/value pair
  */
-static json_t *oidc_session_json_get(request_rec *r, oidc_session_t *z, const char *key) {
-	return json_object_get(z->state, key);
+static oidc_json_t *oidc_session_json_get(request_rec *r, const oidc_session_t *z, const char *key) {
+	return oidc_json_object_get(z->state, key);
 }
 
 /*
  * set a name/string key pair in the session
  */
 static apr_byte_t oidc_session_set(request_rec *r, oidc_session_t *z, const char *key, const char *value) {
-	return oidc_session_json_set(r, z, key, value ? json_string(value) : NULL);
+	return oidc_session_json_set(r, z, key, value ? oidc_json_string(value) : NULL);
 }
 
 /*
  * load the session from the session cache, indexed by its uuid session id
  */
-apr_byte_t oidc_session_load_cache_by_uuid(request_rec *r, oidc_cfg_t *c, const char *uuid, oidc_session_t *z) {
+apr_byte_t oidc_session_load_cache_by_uuid(request_rec *r, const oidc_cfg_t *c, const char *uuid, oidc_session_t *z) {
 	char *stored_uuid = NULL;
 	char *s_json = NULL;
 	apr_byte_t rc = FALSE;
@@ -209,7 +258,7 @@ apr_byte_t oidc_session_load_cache_by_uuid(request_rec *r, oidc_cfg_t *c, const 
  * load the session from the cache using the cookie as the index
  */
 static apr_byte_t oidc_session_load_cache(request_rec *r, oidc_session_t *z) {
-	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+	const oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 
 	apr_byte_t rc = FALSE;
 
@@ -230,6 +279,14 @@ static apr_byte_t oidc_session_load_cache(request_rec *r, oidc_session_t *z) {
 
 		/* cache backend does not contain an entry for the given key */
 		if (z->state == NULL) {
+
+			/*
+			 * With OIDCSessionCacheFallbackToCookie this may be a complete session, not a cache key.
+			 * Preserve it and report failure so oidc_session_load() can try the cookie fallback.
+			 */
+			if (oidc_cfg_session_cache_fallback_to_cookie_get(c))
+				return FALSE;
+
 			/* delete the session cookie */
 			oidc_http_set_cookie(r, oidc_cfg_dir_cookie_get(r), "", 0,
 					     OIDC_HTTP_COOKIE_SAMESITE_NONE(c, r));
@@ -239,7 +296,7 @@ static apr_byte_t oidc_session_load_cache(request_rec *r, oidc_session_t *z) {
 	return rc;
 }
 
-static const char *oidc_session_cookie_samesite(request_rec *r, struct oidc_cfg_t *c, int first_time) {
+static const char *oidc_session_cookie_samesite(const request_rec *r, const struct oidc_cfg_t *c, int first_time) {
 	const char *rv = NULL;
 	switch (oidc_cfg_cookie_same_site_session_get(c)) {
 	case OIDC_SAMESITE_COOKIE_STRICT:
@@ -262,8 +319,8 @@ static const char *oidc_session_cookie_samesite(request_rec *r, struct oidc_cfg_
 /*
  * save the session to the cache using a cookie for the index
  */
-static apr_byte_t oidc_session_save_cache(request_rec *r, oidc_session_t *z, apr_byte_t first_time) {
-	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+static apr_byte_t oidc_session_save_cache(request_rec *r, oidc_session_t *z, oidc_session_save_t first_time) {
+	const oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 
 	apr_byte_t rc = TRUE;
 
@@ -272,6 +329,12 @@ static apr_byte_t oidc_session_save_cache(request_rec *r, oidc_session_t *z, apr
 		if (z->sid != NULL) {
 			oidc_cache_set_sid(r, z->sid, z->uuid, z->expiry);
 			oidc_session_set(r, z, OIDC_SESSION_SID_KEY, z->sid);
+		}
+
+		/* secondary "sub"-based logout index (shares the sid cache namespace, distinct key) */
+		if (z->sub != NULL) {
+			oidc_cache_set_sid(r, z->sub, z->uuid, z->expiry);
+			oidc_session_set(r, z, OIDC_SESSION_SUB_KEY, z->sub);
 		}
 
 		/* store the string-encoded session in the cache; encryption depends on cache backend settings */
@@ -290,6 +353,13 @@ static apr_byte_t oidc_session_save_cache(request_rec *r, oidc_session_t *z, apr
 
 		if (z->sid != NULL)
 			oidc_cache_set_sid(r, z->sid, NULL, 0);
+		if (z->sub != NULL) {
+			/* Delete the shared sub index only when it still points to this session. */
+			char *sub_uuid = NULL;
+			oidc_cache_get_sid(r, z->sub, &sub_uuid);
+			if ((sub_uuid == NULL) || (_oidc_strcmp(sub_uuid, z->uuid) == 0))
+				oidc_cache_set_sid(r, z->sub, NULL, 0);
+		}
 
 		/* clear the cookie */
 		oidc_http_set_cookie(r, oidc_cfg_dir_cookie_get(r), "", 0, OIDC_HTTP_COOKIE_SAMESITE_NONE(c, r));
@@ -304,47 +374,52 @@ static apr_byte_t oidc_session_save_cache(request_rec *r, oidc_session_t *z, apr
 /*
  * load the session from a self-contained client-side cookie
  */
-static apr_byte_t oidc_session_load_cookie(request_rec *r, oidc_cfg_t *c, oidc_session_t *z) {
-	char *cookieValue =
+static apr_byte_t oidc_session_load_cookie(request_rec *r, const oidc_cfg_t *c, oidc_session_t *z) {
+	const char *cookieValue =
 	    oidc_http_get_chunked_cookie(r, oidc_cfg_dir_cookie_get(r), oidc_cfg_session_cookie_chunk_size_get(c));
-	if ((cookieValue != NULL) && (oidc_session_decode(r, c, z, cookieValue, TRUE) == FALSE))
+
+	if (cookieValue == NULL)
+		return TRUE;
+
+	if (oidc_session_decode(r, c, z, cookieValue, TRUE) == FALSE)
 		return FALSE;
+
 	return TRUE;
 }
 
 /*
  * store the session in a self-contained client-side-only cookie storage
  */
-static apr_byte_t oidc_session_save_cookie(request_rec *r, oidc_session_t *z, apr_byte_t first_time) {
-	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+static apr_byte_t oidc_session_save_cookie(request_rec *r, const oidc_session_t *z, oidc_session_save_t first_time) {
+	const oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 	char *cookieValue = "";
 	if ((z->state != NULL) && (oidc_session_encode(r, c, z, &cookieValue, TRUE) == FALSE))
 		return FALSE;
 
-	oidc_http_set_chunked_cookie(
+	/* Reject sessions that exceed the cookie-chunk limit to avoid an authentication loop. */
+	return oidc_http_set_chunked_cookie(
 	    r, oidc_cfg_dir_cookie_get(r), cookieValue, oidc_cfg_persistent_session_cookie_get(c) ? z->expiry : -1,
 	    oidc_cfg_session_cookie_chunk_size_get(c),
 	    (z->state == NULL) ? OIDC_HTTP_COOKIE_SAMESITE_NONE(c, r) : oidc_session_cookie_samesite(r, c, first_time));
-
-	return TRUE;
 }
 
 /*
  * retrieve an integer from the session state
  */
-static inline int oidc_session_get_int(request_rec *r, oidc_session_t *z, const char *key, int def_val) {
+static inline int oidc_session_get_int(request_rec *r, const oidc_session_t *z, const char *key, int def_val) {
 	int v;
-	oidc_util_json_object_get_int(z->state, key, &v, def_val);
+	oidc_json_object_get_int(z->state, key, &v, def_val);
 	return v;
 }
 
 /*
  * retrieve a timestamp from the session state
  */
-static inline apr_time_t oidc_session_get_key2timestamp(request_rec *r, oidc_session_t *z, const char *key) {
-	int value = -1;
-	oidc_util_json_object_get_int(z->state, key, &value, -1);
-	return (value > -1) ? apr_time_from_sec(value) : -1;
+static inline apr_time_t oidc_session_get_key2timestamp(request_rec *r, const oidc_session_t *z, const char *key) {
+	oidc_json_int_t value = -1;
+	oidc_json_object_get_int64(z->state, key, &value, -1);
+	/* saturate rather than wrap, guarding a tampered client-cookie session with an oversized value */
+	return (value > -1) ? oidc_util_apr_time_from_sec((double)value) : -1;
 }
 
 /*
@@ -352,14 +427,14 @@ static inline apr_time_t oidc_session_get_key2timestamp(request_rec *r, oidc_ses
  */
 apr_byte_t oidc_session_extract(request_rec *r, oidc_session_t *z) {
 	apr_byte_t rc = FALSE;
-	json_t *json = NULL;
+	const oidc_json_t *json = NULL;
 
 	if (z->state == NULL)
 		goto out;
 
 	/* sanity check also taking into account OIDC_DONT_STORE_ID_TOKEN_CLAIMS_IN_SESSION=true */
 	json = oidc_session_json_get(r, z, OIDC_SESSION_KEY_IDTOKEN_CLAIMS);
-	if ((json != NULL) && (!json_is_object(json))) {
+	if ((json != NULL) && (!oidc_json_is_object(json))) {
 
 		oidc_error(r, "session is corrupted/incompatible: id_token claims is not a JSON object");
 		oidc_session_kill(r, z);
@@ -379,6 +454,7 @@ apr_byte_t oidc_session_extract(request_rec *r, oidc_session_t *z) {
 
 	oidc_session_get(r, z, OIDC_SESSION_REMOTE_USER_KEY, &z->remote_user);
 	oidc_session_get(r, z, OIDC_SESSION_SID_KEY, &z->sid);
+	oidc_session_get(r, z, OIDC_SESSION_SUB_KEY, &z->sub);
 	oidc_session_get(r, z, OIDC_SESSION_SESSION_ID, &z->uuid);
 
 	rc = TRUE;
@@ -392,7 +468,7 @@ out:
  * load a session from the cache/cookie
  */
 apr_byte_t oidc_session_load(request_rec *r, oidc_session_t **zz) {
-	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+	const oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 
 	apr_byte_t rc = FALSE;
 
@@ -401,6 +477,7 @@ apr_byte_t oidc_session_load(request_rec *r, oidc_session_t **zz) {
 	oidc_session_clear(r, z);
 	oidc_session_id_new(r, z);
 	z->sid = NULL;
+	z->sub = NULL;
 
 	if (oidc_cfg_session_type_get(c) == OIDC_SESSION_TYPE_SERVER_CACHE)
 		/* load the session from the cache */
@@ -425,27 +502,33 @@ apr_byte_t oidc_session_load(request_rec *r, oidc_session_t **zz) {
  */
 static void oidc_session_set_int(request_rec *r, oidc_session_t *z, const char *key, int v) {
 	if (z->state == NULL)
-		z->state = json_object();
-	json_object_set_new(z->state, key, json_integer(v));
+		z->state = oidc_json_object();
+	oidc_json_object_set_new(z->state, key, oidc_json_integer(v));
 }
 
 /*
  * store a timestamp value into the session state
  */
 static void oidc_session_set_timestamp(request_rec *r, oidc_session_t *z, const char *key, const apr_time_t timestamp) {
-	if (timestamp > -1)
-		oidc_session_set_int(r, z, key, apr_time_sec(timestamp));
+	if (timestamp <= -1)
+		return;
+	if (z->state == NULL)
+		z->state = oidc_json_object();
+	/* store the full seconds value as a 64-bit JSON integer: the previous (int) cast wrapped any
+	 * timestamp past January 2038 into a negative, i.e. already-expired, value */
+	oidc_json_object_set_new(z->state, key, oidc_json_integer(apr_time_sec(timestamp)));
 }
 
 /*
  * save a session to cache/cookie
  */
-apr_byte_t oidc_session_save(request_rec *r, oidc_session_t *z, apr_byte_t first_time) {
-	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+apr_byte_t oidc_session_save(request_rec *r, oidc_session_t *z, oidc_session_save_t first_time) {
+	const oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 
 	apr_byte_t rc = FALSE;
 
 	if (z->state != NULL) {
+		oidc_session_set_int(r, z, OIDC_SESSION_FORMAT_VERSION_KEY, OIDC_SESSION_FORMAT_VERSION);
 		oidc_session_set(r, z, OIDC_SESSION_REMOTE_USER_KEY, z->remote_user);
 		oidc_session_set_timestamp(r, z, OIDC_SESSION_EXPIRY_KEY, z->expiry);
 		oidc_session_set(r, z, OIDC_SESSION_SESSION_ID, z->uuid);
@@ -457,9 +540,12 @@ apr_byte_t oidc_session_save(request_rec *r, oidc_session_t *z, apr_byte_t first
 
 	/* if we get here we configured client-cookie or saving in the cache failed */
 	if ((oidc_cfg_session_type_get(c) == OIDC_SESSION_TYPE_CLIENT_COOKIE) ||
-	    ((rc == FALSE) && oidc_cfg_session_cache_fallback_to_cookie_get(c)))
+	    ((rc == FALSE) && oidc_cfg_session_cache_fallback_to_cookie_get(c))) {
+		if (oidc_cfg_session_type_get(c) != OIDC_SESSION_TYPE_CLIENT_COOKIE)
+			OIDC_METRICS_COUNTER_INC(r, c, OM_SESSION_FALLBACK_COOKIE);
 		/* store the session in a self-contained cookie */
 		rc = oidc_session_save_cookie(r, z, first_time);
+	}
 
 	return rc;
 }
@@ -478,10 +564,10 @@ apr_byte_t oidc_session_free(request_rec *r, oidc_session_t *z) {
 apr_byte_t oidc_session_kill(request_rec *r, oidc_session_t *z) {
 	r->user = NULL;
 	if (z->state) {
-		json_decref(z->state);
+		oidc_json_decref(z->state);
 		z->state = NULL;
 	}
-	oidc_session_save(r, z, FALSE);
+	oidc_session_save(r, z, OIDC_SESSION_SAVE_UPDATE);
 	return oidc_session_free(r, z);
 }
 
@@ -523,108 +609,142 @@ apr_byte_t oidc_session_kill(request_rec *r, oidc_session_t *z) {
 /* key for storing the scope in the session context */
 #define OIDC_SESSION_KEY_SCOPE "scp"
 
+#define OIDC_SESSION_KEY_PATH_AUTH_REQUEST_PARAMS "parp"
+
+#define OIDC_SESSION_KEY_PATH_SCOPE "psc"
+
 /*
  * helper functions
  */
-static const char *oidc_session_get_key2string(request_rec *r, oidc_session_t *z, const char *key) {
+static const char *oidc_session_get_key2string(request_rec *r, const oidc_session_t *z, const char *key) {
 	char *s_value = NULL;
 	oidc_session_get(r, z, key, &s_value);
 	return s_value;
 }
 
-#define OIDC_SESSION_WARN_CLAIM_SIZE 1024 * 8
+#define OIDC_SESSION_WARN_CLAIM_SIZE (1024 * 8)
 #define OIDC_SESSION_WARN_CLAIM_SIZE_VAR "OIDC_SESSION_WARN_CLAIM_SIZE"
+
+/*
+ * read the warning threshold for the (encoded) size of a single session claim from the environment
+ */
+static int oidc_session_warn_claim_size_get(request_rec *r) {
+	const char *str = NULL;
+
+	if (r->subprocess_env == NULL)
+		return OIDC_SESSION_WARN_CLAIM_SIZE;
+
+	str = apr_table_get(r->subprocess_env, OIDC_SESSION_WARN_CLAIM_SIZE_VAR);
+	if (str == NULL)
+		return OIDC_SESSION_WARN_CLAIM_SIZE;
+
+	int warn_claim_size = _oidc_str_to_int(str, OIDC_SESSION_WARN_CLAIM_SIZE);
+	oidc_debug(r, "warn_claim_size set to %d in environment variable %s", warn_claim_size,
+		   OIDC_SESSION_WARN_CLAIM_SIZE_VAR);
+	return warn_claim_size;
+}
+
+/*
+ * check whether a single claim passes the configured black/white list filters
+ */
+static apr_byte_t oidc_session_claim_is_allowed(request_rec *r, const oidc_cfg_t *c, const char *session_key,
+						const char *name) {
+	if ((oidc_cfg_black_listed_claims_get(c) != NULL) &&
+	    (apr_hash_get(oidc_cfg_black_listed_claims_get(c), name, APR_HASH_KEY_STRING) != NULL)) {
+		oidc_debug(r, "removing blacklisted claim [%s]: '%s'", session_key, name);
+		return FALSE;
+	}
+
+	if ((oidc_cfg_white_listed_claims_get(c) != NULL) &&
+	    (apr_hash_get(oidc_cfg_white_listed_claims_get(c), name, APR_HASH_KEY_STRING) == NULL)) {
+		oidc_debug(r, "removing non-whitelisted claim [%s]: '%s'", session_key, name);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/*
+ * record a single allowed claim into the destination object, increment metrics and warn on oversized values
+ */
+static void oidc_session_filtered_claim_record(request_rec *r, const oidc_cfg_t *c, const char *session_key,
+					       const char *name, oidc_json_t *value, oidc_json_t *dst,
+					       int warn_claim_size) {
+	const char *str = value ? oidc_json_encode(r->pool, value,
+						   OIDC_JSON_PRESERVE_ORDER | OIDC_JSON_COMPACT | OIDC_JSON_ENCODE_ANY)
+				: "";
+
+	if ((int)_oidc_strlen(str) > warn_claim_size)
+		oidc_warn(r,
+			  "(encoded) value size of [%s] claim \"%s\" is larger than %d; consider "
+			  "blacklisting it in OIDCBlackListedClaims "
+			  "or increase the warning limit with environment variable %s",
+			  session_key, name, warn_claim_size, OIDC_SESSION_WARN_CLAIM_SIZE_VAR);
+
+	oidc_json_object_set(dst, name, value);
+
+	const char *metric_value = oidc_json_is_string(value) ? oidc_json_string_value(value) : str;
+	if (_oidc_strcmp(session_key, OIDC_SESSION_KEY_USERINFO_CLAIMS) == 0) {
+		OIDC_METRICS_COUNTER_INC_NAME_VALUE(r, c, OM_CLAIM_USER_INFO, name, metric_value);
+	} else {
+		OIDC_METRICS_COUNTER_INC_NAME_VALUE(r, c, OM_CLAIM_ID_TOKEN, name, metric_value);
+	}
+}
+
+#ifdef USE_LIBJQ
+/*
+ * apply the configured JQ filter to the collected claims; replaces *dst with the filtered object on success
+ */
+static void oidc_session_jq_filter_apply(request_rec *r, const oidc_cfg_t *c, const char *session_key,
+					 oidc_json_t **dst) {
+	const oidc_apr_expr_t *filter = oidc_cfg_filter_claims_expr_get(c);
+	const char *s_filter = oidc_util_apr_expr_exec(r, filter, OIDC_APR_EXPR_RESULT_STRING);
+
+	if (filter == NULL)
+		return;
+
+	const char *filtered_claims = oidc_util_jq_filter(r, *dst, s_filter);
+	oidc_json_decref(*dst);
+	*dst = NULL;
+	if (oidc_json_decode_object(r, filtered_claims, dst) == FALSE)
+		oidc_error(r, "JQ filtering of claims for [%s] resulted in invalid JSON object, filter='%s'",
+			   session_key, s_filter);
+}
+#endif
 
 /*
  * apply whitelisting/blacklisting and a JQ filter  to the provided (serialized JSON) claims
  * session_key may refer to id_token claims or userinfo claims
  */
 static void oidc_session_set_filtered_claims(request_rec *r, oidc_session_t *z, const char *session_key,
-					     json_t *claims) {
-	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
-
-	const char *name = NULL;
-	json_t *dst = NULL, *value = NULL;
+					     oidc_json_t *claims) {
+	const oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+	oidc_json_t *dst = NULL;
 	void *iter = NULL;
-	apr_byte_t is_allowed = TRUE;
-	int warn_claim_size = OIDC_SESSION_WARN_CLAIM_SIZE;
-	const char *str = NULL;
+	int warn_claim_size = oidc_session_warn_claim_size_get(r);
 
 	// avoid gcc 14 warning: '%s' directive argument is null [-Wformat-overflow=]
 	if (session_key == NULL)
 		session_key = "";
 
-	if (r->subprocess_env != NULL) {
-		str = apr_table_get(r->subprocess_env, OIDC_SESSION_WARN_CLAIM_SIZE_VAR);
-		if (str) {
-			warn_claim_size = _oidc_str_to_int(str, OIDC_SESSION_WARN_CLAIM_SIZE);
-			oidc_debug(r, "warn_claim_size set to %d in environment variable %s", warn_claim_size,
-				   OIDC_SESSION_WARN_CLAIM_SIZE_VAR);
-		}
-	}
-
 	if (claims != NULL) {
-		dst = json_object();
-		iter = json_object_iter(claims);
+		dst = oidc_json_object();
+		iter = oidc_json_object_iter(claims);
 	}
 
 	// NB: need this loop for all claims for the metrics
 	while (iter) {
-		is_allowed = TRUE;
-		name = json_object_iter_key(iter);
-		value = json_object_iter_value(iter);
+		const char *name = oidc_json_object_iter_key(iter);
+		oidc_json_t *value = oidc_json_object_iter_value(iter);
 
-		if ((oidc_cfg_black_listed_claims_get(c) != NULL) &&
-		    (apr_hash_get(oidc_cfg_black_listed_claims_get(c), name, APR_HASH_KEY_STRING) != NULL)) {
-			oidc_debug(r, "removing blacklisted claim [%s]: '%s'", session_key, name);
-			is_allowed = FALSE;
-		}
+		if (oidc_session_claim_is_allowed(r, c, session_key, name) == TRUE)
+			oidc_session_filtered_claim_record(r, c, session_key, name, value, dst, warn_claim_size);
 
-		if ((is_allowed == TRUE) && (oidc_cfg_white_listed_claims_get(c) != NULL) &&
-		    (apr_hash_get(oidc_cfg_white_listed_claims_get(c), name, APR_HASH_KEY_STRING) == NULL)) {
-			oidc_debug(r, "removing non-whitelisted claim [%s]: '%s'", session_key, name);
-			is_allowed = FALSE;
-		}
-
-		if (is_allowed == TRUE) {
-			str = value ? oidc_util_json_encode(r->pool, value,
-							    JSON_PRESERVE_ORDER | JSON_COMPACT | JSON_ENCODE_ANY)
-				    : "";
-			if (_oidc_strlen(str) > warn_claim_size)
-				oidc_warn(r,
-					  "(encoded) value size of [%s] claim \"%s\" is larger than %d; consider "
-					  "blacklisting it in OIDCBlackListedClaims "
-					  "or increase the warning limit with environment variable %s",
-					  session_key, name, warn_claim_size, OIDC_SESSION_WARN_CLAIM_SIZE_VAR);
-			json_object_set(dst, name, value);
-
-			if (_oidc_strcmp(session_key, OIDC_SESSION_KEY_USERINFO_CLAIMS) == 0) {
-				OIDC_METRICS_COUNTER_INC_NAME_VALUE(r, c, OM_CLAIM_USER_INFO, name,
-								    json_is_string(value) ? json_string_value(value)
-											  : str);
-			} else {
-				OIDC_METRICS_COUNTER_INC_NAME_VALUE(r, c, OM_CLAIM_ID_TOKEN, name,
-								    json_is_string(value) ? json_string_value(value)
-											  : str);
-			}
-		}
-
-		iter = json_object_iter_next(claims, iter);
+		iter = oidc_json_object_iter_next(claims, iter);
 	}
 
 #ifdef USE_LIBJQ
-	const char *filtered_claims = NULL;
-	const oidc_apr_expr_t *filter = oidc_cfg_filter_claims_expr_get(c);
-	const char *s_filter = oidc_util_apr_expr_exec(r, filter, TRUE);
-	if (filter != NULL) {
-		filtered_claims = oidc_util_jq_filter(r, dst, s_filter);
-		json_decref(dst);
-		dst = NULL;
-		if (oidc_util_json_decode_object(r, filtered_claims, &dst) == FALSE) {
-			oidc_error(r, "JQ filtering of claims for [%s] resulted in invalid JSON object, filter='%s'",
-				   session_key, s_filter);
-		}
-	}
+	oidc_session_jq_filter_apply(r, c, session_key, &dst);
 #endif
 
 	oidc_session_json_set(r, z, session_key, dst);
@@ -633,11 +753,11 @@ static void oidc_session_set_filtered_claims(request_rec *r, oidc_session_t *z, 
 /*
  * userinfo claims
  */
-void oidc_session_set_userinfo_claims(request_rec *r, oidc_session_t *z, json_t *claims_json) {
+void oidc_session_set_userinfo_claims(request_rec *r, oidc_session_t *z, oidc_json_t *claims_json) {
 	oidc_session_set_filtered_claims(r, z, OIDC_SESSION_KEY_USERINFO_CLAIMS, claims_json);
 }
 
-json_t *oidc_session_get_userinfo_claims(request_rec *r, oidc_session_t *z) {
+oidc_json_t *oidc_session_get_userinfo_claims(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_json_get(r, z, OIDC_SESSION_KEY_USERINFO_CLAIMS);
 }
 
@@ -645,19 +765,19 @@ void oidc_session_set_userinfo_jwt(request_rec *r, oidc_session_t *z, const char
 	oidc_session_set(r, z, OIDC_SESSION_KEY_USERINFO_JWT, s_userinfo_jwt);
 }
 
-const char *oidc_session_get_userinfo_jwt(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_userinfo_jwt(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_USERINFO_JWT);
 }
 
 /*
  * id_token claims
  */
-void oidc_session_set_idtoken_claims(request_rec *r, oidc_session_t *z, json_t *idtoken_claims) {
+void oidc_session_set_idtoken_claims(request_rec *r, oidc_session_t *z, oidc_json_t *idtoken_claims) {
 	if (apr_table_get(r->subprocess_env, "OIDC_DONT_STORE_ID_TOKEN_CLAIMS_IN_SESSION") == NULL)
 		oidc_session_set_filtered_claims(r, z, OIDC_SESSION_KEY_IDTOKEN_CLAIMS, idtoken_claims);
 }
 
-json_t *oidc_session_get_idtoken_claims(request_rec *r, oidc_session_t *z) {
+oidc_json_t *oidc_session_get_idtoken_claims(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_json_get(r, z, OIDC_SESSION_KEY_IDTOKEN_CLAIMS);
 }
 
@@ -669,7 +789,7 @@ void oidc_session_set_idtoken(request_rec *r, oidc_session_t *z, const char *s_i
 	oidc_session_set(r, z, OIDC_SESSION_KEY_IDTOKEN, s_id_token);
 }
 
-const char *oidc_session_get_idtoken(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_idtoken(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_IDTOKEN);
 }
 
@@ -680,7 +800,7 @@ void oidc_session_set_access_token(request_rec *r, oidc_session_t *z, const char
 	oidc_session_set(r, z, OIDC_SESSION_KEY_ACCESSTOKEN, access_token);
 }
 
-const char *oidc_session_get_access_token(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_access_token(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_ACCESSTOKEN);
 }
 
@@ -691,7 +811,7 @@ void oidc_session_set_access_token_type(request_rec *r, oidc_session_t *z, const
 	oidc_session_set(r, z, OIDC_SESSION_KEY_ACCESSTOKEN_TYPE, token_type);
 }
 
-const char *oidc_session_get_access_token_type(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_access_token_type(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_ACCESSTOKEN_TYPE);
 }
 
@@ -706,11 +826,11 @@ void oidc_session_set_access_token_expires(request_rec *r, oidc_session_t *z, co
 	}
 }
 
-apr_time_t oidc_session_get_access_token_expires(request_rec *r, oidc_session_t *z) {
+apr_time_t oidc_session_get_access_token_expires(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2timestamp(r, z, OIDC_SESSION_KEY_ACCESSTOKEN_EXPIRES);
 }
 
-const char *oidc_session_get_access_token_expires2str(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_access_token_expires2str(request_rec *r, const oidc_session_t *z) {
 	apr_time_t expires = oidc_session_get_access_token_expires(r, z);
 	return (expires > -1) ? apr_psprintf(r->pool, "%" APR_TIME_T_FMT, apr_time_sec(expires)) : NULL;
 }
@@ -722,7 +842,7 @@ void oidc_session_set_refresh_token(request_rec *r, oidc_session_t *z, const cha
 	oidc_session_set(r, z, OIDC_SESSION_KEY_REFRESH_TOKEN, refresh_token);
 }
 
-const char *oidc_session_get_refresh_token(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_refresh_token(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_REFRESH_TOKEN);
 }
 
@@ -733,7 +853,7 @@ void oidc_session_set_session_expires(request_rec *r, oidc_session_t *z, const a
 	oidc_session_set_timestamp(r, z, OIDC_SESSION_KEY_SESSION_EXPIRES, expires);
 }
 
-apr_time_t oidc_session_get_session_expires(request_rec *r, oidc_session_t *z) {
+apr_time_t oidc_session_get_session_expires(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2timestamp(r, z, OIDC_SESSION_KEY_SESSION_EXPIRES);
 }
 
@@ -744,7 +864,7 @@ void oidc_session_set_cookie_domain(request_rec *r, oidc_session_t *z, const cha
 	oidc_session_set(r, z, OIDC_SESSION_KEY_COOKIE_DOMAIN, cookie_domain);
 }
 
-const char *oidc_session_get_cookie_domain(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_cookie_domain(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_COOKIE_DOMAIN);
 }
 
@@ -756,7 +876,7 @@ void oidc_session_set_userinfo_refresh_interval(request_rec *r, oidc_session_t *
 	oidc_session_set_int(r, z, OIDC_SESSION_KEY_USERINFO_REFRESH_INTERVAL, interval);
 }
 
-int oidc_session_get_userinfo_refresh_interval(request_rec *r, oidc_session_t *z) {
+int oidc_session_get_userinfo_refresh_interval(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_int(r, z, OIDC_SESSION_KEY_USERINFO_REFRESH_INTERVAL, -1);
 }
 
@@ -764,7 +884,7 @@ void oidc_session_reset_userinfo_last_refresh(request_rec *r, oidc_session_t *z)
 	oidc_session_set_timestamp(r, z, OIDC_SESSION_KEY_USERINFO_LAST_REFRESH, apr_time_now());
 }
 
-apr_time_t oidc_session_get_userinfo_last_refresh(request_rec *r, oidc_session_t *z) {
+apr_time_t oidc_session_get_userinfo_last_refresh(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2timestamp(r, z, OIDC_SESSION_KEY_USERINFO_LAST_REFRESH);
 }
 
@@ -775,7 +895,7 @@ void oidc_session_set_access_token_last_refresh(request_rec *r, oidc_session_t *
 	oidc_session_set_timestamp(r, z, OIDC_SESSION_KEY_ACCESS_TOKEN_LAST_REFRESH, ts);
 }
 
-apr_time_t oidc_session_get_access_token_last_refresh(request_rec *r, oidc_session_t *z) {
+apr_time_t oidc_session_get_access_token_last_refresh(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2timestamp(r, z, OIDC_SESSION_KEY_ACCESS_TOKEN_LAST_REFRESH);
 }
 
@@ -786,7 +906,7 @@ void oidc_session_set_request_state(request_rec *r, oidc_session_t *z, const cha
 	oidc_session_set(r, z, OIDC_SESSION_KEY_REQUEST_STATE, request_state);
 }
 
-const char *oidc_session_get_request_state(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_request_state(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_REQUEST_STATE);
 }
 
@@ -797,7 +917,7 @@ void oidc_session_set_original_url(request_rec *r, oidc_session_t *z, const char
 	oidc_session_set(r, z, OIDC_SESSION_KEY_ORIGINAL_URL, original_url);
 }
 
-const char *oidc_session_get_original_url(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_original_url(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_ORIGINAL_URL);
 }
 
@@ -808,7 +928,7 @@ void oidc_session_set_session_state(request_rec *r, oidc_session_t *z, const cha
 	oidc_session_set(r, z, OIDC_SESSION_KEY_SESSION_STATE, session_state);
 }
 
-const char *oidc_session_get_session_state(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_session_state(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_SESSION_STATE);
 }
 
@@ -819,7 +939,7 @@ void oidc_session_set_issuer(request_rec *r, oidc_session_t *z, const char *issu
 	oidc_session_set(r, z, OIDC_SESSION_KEY_ISSUER, issuer);
 }
 
-const char *oidc_session_get_issuer(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_issuer(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_ISSUER);
 }
 
@@ -828,14 +948,14 @@ const char *oidc_session_get_issuer(request_rec *r, oidc_session_t *z) {
  */
 void oidc_session_set_session_new(request_rec *r, oidc_session_t *z, const int is_new) {
 	if (z->state == NULL)
-		z->state = json_object();
+		z->state = oidc_json_object();
 	if (is_new)
-		json_object_set_new(z->state, OIDC_SESSION_KEY_SESSION_IS_NEW, json_integer(1));
+		oidc_json_object_set_new(z->state, OIDC_SESSION_KEY_SESSION_IS_NEW, oidc_json_integer(1));
 	else
-		json_object_del(z->state, OIDC_SESSION_KEY_SESSION_IS_NEW);
+		oidc_json_object_del(z->state, OIDC_SESSION_KEY_SESSION_IS_NEW);
 }
 
-int oidc_session_get_session_new(request_rec *r, oidc_session_t *z) {
+int oidc_session_get_session_new(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_int(r, z, OIDC_SESSION_KEY_SESSION_IS_NEW, 0);
 }
 
@@ -846,6 +966,22 @@ void oidc_session_set_scope(request_rec *r, oidc_session_t *z, const char *scope
 	oidc_session_set(r, z, OIDC_SESSION_KEY_SCOPE, scope);
 }
 
-const char *oidc_session_get_scope(request_rec *r, oidc_session_t *z) {
+const char *oidc_session_get_scope(request_rec *r, const oidc_session_t *z) {
 	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_SCOPE);
+}
+
+void oidc_session_set_path_auth_request_params(request_rec *r, oidc_session_t *z, const char *auth_request_params) {
+	oidc_session_set(r, z, OIDC_SESSION_KEY_PATH_AUTH_REQUEST_PARAMS, auth_request_params);
+}
+
+const char *oidc_session_get_path_auth_request_params(request_rec *r, const oidc_session_t *z) {
+	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_PATH_AUTH_REQUEST_PARAMS);
+}
+
+void oidc_session_set_path_scope(request_rec *r, oidc_session_t *z, const char *path_scope) {
+	oidc_session_set(r, z, OIDC_SESSION_KEY_PATH_SCOPE, path_scope);
+}
+
+const char *oidc_session_get_path_scope(request_rec *r, const oidc_session_t *z) {
+	return oidc_session_get_key2string(r, z, OIDC_SESSION_KEY_PATH_SCOPE);
 }

@@ -40,22 +40,20 @@
  * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
+#include <limits.h>
+
 #include "handle/handle.h"
 #include "metrics.h"
 #include "mod_auth_openidc.h"
 #include "proto/proto.h"
 #include "session.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
 
 /* JSON object key for the value that holds the refresh token's refresh timestamp */
 #define OIDC_REFRESH_TIMESTAMP "ts"
 
-/*
- * time-to-live (seconds) for the lock that prevents parallel callers to execute
- * a refresh grant for the same refresh token; this also presents the maximum time
- * that callers will be blocked, waiting for another process to finish the refresh
- * and populate the cache with the results
- */
+/* Refresh lock lifetime and maximum wait for another caller's result. */
 #define OIDC_REFRESH_LOCK_TTL 5
 
 /*
@@ -75,35 +73,35 @@
 /*
  * cache refresh token grant results for a while to avoid (almost) parallel requests
  */
-static void oidc_refresh_token_cache_set(request_rec *r, oidc_cfg_t *c, const char *refresh_token,
-					 const char *s_access_token, const char *s_token_type, int expires_in,
-					 const char *s_id_token, const char *s_refresh_token, apr_time_t *ts) {
-	char *s_json = NULL;
+static void oidc_refresh_token_cache_set(request_rec *r, const char *refresh_token, const char *s_access_token,
+					 const char *s_token_type, int expires_in, const char *s_id_token,
+					 const char *s_refresh_token, apr_time_t *ts) {
+	const char *s_json = NULL;
 
 	/* create the JSON representation of the refresh grant results + timestamp */
-	json_t *json = json_object();
+	oidc_json_t *json = oidc_json_object();
 	if (s_access_token)
-		json_object_set_new(json, OIDC_PROTO_ACCESS_TOKEN, json_string(s_access_token));
+		oidc_json_object_set_new(json, OIDC_PROTO_ACCESS_TOKEN, oidc_json_string(s_access_token));
 	if (s_token_type)
-		json_object_set_new(json, OIDC_PROTO_TOKEN_TYPE, json_string(s_token_type));
-	json_object_set_new(json, OIDC_PROTO_EXPIRES_IN, json_integer(expires_in));
+		oidc_json_object_set_new(json, OIDC_PROTO_TOKEN_TYPE, oidc_json_string(s_token_type));
+	oidc_json_object_set_new(json, OIDC_PROTO_EXPIRES_IN, oidc_json_integer(expires_in));
 	if (s_id_token)
-		json_object_set_new(json, OIDC_PROTO_ID_TOKEN, json_string(s_id_token));
+		oidc_json_object_set_new(json, OIDC_PROTO_ID_TOKEN, oidc_json_string(s_id_token));
 	if (s_refresh_token)
-		json_object_set_new(json, OIDC_PROTO_REFRESH_TOKEN, json_string(s_refresh_token));
+		oidc_json_object_set_new(json, OIDC_PROTO_REFRESH_TOKEN, oidc_json_string(s_refresh_token));
 	*ts = apr_time_now();
-	json_object_set_new(json, OIDC_REFRESH_TIMESTAMP, json_integer(apr_time_sec(*ts)));
+	oidc_json_object_set_new(json, OIDC_REFRESH_TIMESTAMP, oidc_json_integer(apr_time_sec(*ts)));
 
 	/* stringify the JSON object and store it in the cache */
-	s_json = oidc_util_json_encode(r->pool, json, JSON_COMPACT);
-	oidc_debug(r, "caching refresh_token (%s) grant results for %d seconds: %s", refresh_token,
-		   OIDC_REFRESH_CACHE_TTL, s_json);
+	s_json = oidc_json_encode(r->pool, json, OIDC_JSON_COMPACT);
+	oidc_debug(r, "caching refresh_token (%s) grant results for %d seconds: %s",
+		   oidc_util_mask_value(r, refresh_token), OIDC_REFRESH_CACHE_TTL, oidc_util_mask_value(r, s_json));
 
 	oidc_cache_set_refresh_token(r, refresh_token, s_json,
 				     apr_time_now() + apr_time_from_sec(OIDC_REFRESH_CACHE_TTL));
 
 	/* cleanup */
-	json_decref(json);
+	oidc_json_decref(json);
 }
 
 typedef enum {
@@ -112,16 +110,57 @@ typedef enum {
 	OIDC_REFRESH_CACHE_ABORT
 } oidc_refresh_token_cache_result_t;
 /*
+ * parse a cached refresh token grant result (a JSON object string) into the individual output parameters;
+ * returns TRUE when the value was a valid JSON object that could be parsed
+ */
+static apr_byte_t oidc_refresh_token_cache_parse(request_rec *r, const char *s_json, char **s_access_token,
+						 char **s_token_type, int *expires_in, char **s_id_token,
+						 char **s_refresh_token, apr_time_t *ts) {
+
+	oidc_json_t *json = NULL;
+	const oidc_json_t *v = NULL;
+
+	if (oidc_json_decode_object(r, s_json, &json) == FALSE)
+		return FALSE;
+
+	/* parse the results from the cache into the output parameters */
+	if ((v = oidc_json_object_get(json, OIDC_PROTO_ACCESS_TOKEN)))
+		*s_access_token = apr_pstrdup(r->pool, oidc_json_string_value(v));
+	if ((v = oidc_json_object_get(json, OIDC_PROTO_TOKEN_TYPE)))
+		*s_token_type = apr_pstrdup(r->pool, oidc_json_string_value(v));
+	if ((v = oidc_json_object_get(json, OIDC_PROTO_EXPIRES_IN))) {
+		/* clamp into int range to match the writer-side guard in oidc_proto_token_response_parse */
+		oidc_json_int_t n = oidc_json_integer_value(v);
+		if (n > INT_MAX)
+			*expires_in = INT_MAX;
+		else if (n < INT_MIN)
+			*expires_in = INT_MIN;
+		else
+			*expires_in = (int)n;
+	}
+	if ((v = oidc_json_object_get(json, OIDC_PROTO_ID_TOKEN)))
+		*s_id_token = apr_pstrdup(r->pool, oidc_json_string_value(v));
+	if ((v = oidc_json_object_get(json, OIDC_PROTO_REFRESH_TOKEN)))
+		*s_refresh_token = apr_pstrdup(r->pool, oidc_json_string_value(v));
+	if ((v = oidc_json_object_get(json, OIDC_REFRESH_TIMESTAMP)))
+		*ts = apr_time_from_sec(oidc_json_integer_value(v));
+
+	/* cleanup */
+	oidc_json_decref(json);
+
+	return TRUE;
+}
+
+/*
  * obtain recent refresh token grant results from the cache
  */
-static oidc_refresh_token_cache_result_t oidc_refresh_token_cache_get(request_rec *r, oidc_cfg_t *c,
+static oidc_refresh_token_cache_result_t oidc_refresh_token_cache_get(request_rec *r, const oidc_cfg_t *c,
 								      const char *refresh_token, char **s_access_token,
 								      char **s_token_type, int *expires_in,
 								      char **s_id_token, char **s_refresh_token,
 								      apr_time_t *ts) {
 
 	char *s_json = NULL;
-	json_t *json = NULL, *v = NULL;
 	oidc_refresh_token_cache_result_t rv = OIDC_REFRESH_CACHE_ERROR;
 
 	oidc_cache_mutex_lock(r->pool, r->server, oidc_cfg_refresh_mutex_get(c));
@@ -131,11 +170,16 @@ static oidc_refresh_token_cache_result_t oidc_refresh_token_cache_get(request_re
 	if (s_json == NULL)
 		goto no_cache_found;
 
-	/* wait for the "other" caller to populate the refresh token response cache results */
-	while ((s_json != NULL) && (_oidc_strcmp(s_json, OIDC_REFRESH_LOCK_VALUE) == 0)) {
-		oidc_warn(r, "existing refresh in progress for %s, back off for 0.5s before re-trying the cache",
-			  refresh_token);
+	/*
+	 * Poll only until the lock TTL. Release the global mutex while sleeping, then reacquire it
+	 * before reading so the final read and lock claim remain atomic.
+	 */
+	int retries = OIDC_REFRESH_LOCK_TTL * 2;
+	while ((retries-- > 0) && (s_json != NULL) && (_oidc_strcmp(s_json, OIDC_REFRESH_LOCK_VALUE) == 0)) {
+		oidc_warn(r, "existing refresh in progress, back off for 0.5s before re-trying the cache");
+		oidc_cache_mutex_unlock(r->pool, r->server, oidc_cfg_refresh_mutex_get(c));
 		apr_sleep(apr_time_from_msec(500));
+		oidc_cache_mutex_lock(r->pool, r->server, oidc_cfg_refresh_mutex_get(c));
 		s_json = NULL;
 		oidc_cache_get_refresh_token(r, refresh_token, &s_json);
 	}
@@ -146,42 +190,27 @@ static oidc_refresh_token_cache_result_t oidc_refresh_token_cache_get(request_re
 	/* check if we have run into an error */
 	if (_oidc_strcmp(s_json, OIDC_REFRESH_FAILED_LOCK_VALUE) == 0) {
 		oidc_debug(r, "refresh token %s failed to refresh before, do not try to refresh it again but fail",
-			   refresh_token);
+			   oidc_util_mask_value(r, refresh_token));
 		rv = OIDC_REFRESH_CACHE_ABORT;
 		goto end;
 	}
 
 	/* check if we have run into a timeout */
 	if (_oidc_strcmp(s_json, OIDC_REFRESH_LOCK_VALUE) == 0) {
-		oidc_warn(r, "timeout waiting for refresh token %s cache to unlock", refresh_token);
-		// TODO: now we are going to refresh ourselves with a refresh token that has already been
-		// tried before; that is not great in rolling refresh token setups but I guess we have no
-		// other choice anyhow...
+		oidc_warn(r, "timeout waiting for refresh token cache to unlock; attempting our own refresh next "
+			     "(in rolling-refresh setups this token may already have been spent by the other caller, "
+			     "in which case oidc_refresh_token_grant_obtain_tokens recovers from the cache if our own "
+			     "refresh then fails)");
 		goto no_cache_found;
 	}
 
 	/* we should have valid cache results by now */
-	if (oidc_util_json_decode_object(r, s_json, &json) == FALSE)
+	oidc_debug(r, "using cached refresh_token (%s) grant results: %s", oidc_util_mask_value(r, refresh_token),
+		   oidc_util_mask_value(r, s_json));
+
+	if (oidc_refresh_token_cache_parse(r, s_json, s_access_token, s_token_type, expires_in, s_id_token,
+					   s_refresh_token, ts) == FALSE)
 		goto no_cache_found;
-
-	oidc_debug(r, "using cached refresh_token (%s) grant results: %s", refresh_token, s_json);
-
-	/* parse the results from the cache into the output parameters */
-	if ((v = json_object_get(json, OIDC_PROTO_ACCESS_TOKEN)))
-		*s_access_token = apr_pstrdup(r->pool, json_string_value(v));
-	if ((v = json_object_get(json, OIDC_PROTO_TOKEN_TYPE)))
-		*s_token_type = apr_pstrdup(r->pool, json_string_value(v));
-	if ((v = json_object_get(json, OIDC_PROTO_EXPIRES_IN)))
-		*expires_in = json_integer_value(v);
-	if ((v = json_object_get(json, OIDC_PROTO_ID_TOKEN)))
-		*s_id_token = apr_pstrdup(r->pool, json_string_value(v));
-	if ((v = json_object_get(json, OIDC_PROTO_REFRESH_TOKEN)))
-		*s_refresh_token = apr_pstrdup(r->pool, json_string_value(v));
-	if ((v = json_object_get(json, OIDC_REFRESH_TIMESTAMP)))
-		*ts = apr_time_from_sec(json_integer_value(v));
-
-	/* cleanup */
-	json_decref(json);
 
 	rv = OIDC_REFRESH_CACHE_SUCCESS;
 
@@ -189,18 +218,9 @@ static oidc_refresh_token_cache_result_t oidc_refresh_token_cache_get(request_re
 
 no_cache_found:
 
-	oidc_debug(r, "locking cache and refreshing %s...", refresh_token);
+	oidc_debug(r, "locking cache and refreshing %s...", oidc_util_mask_value(r, refresh_token));
 
-	/*
-	 * best-effort distributed locking during our upcoming refresh grant execution
-	 *
-	 * note that a small chance/race-condition remains that in a parallel request on
-	 * another server in the same cluster another process just did the same in between
-	 * i.e. calling oidc_cache_get_refresh_token (on entry) and calling
-	 * oidc_cache_set_refresh_token (on exit) hereafter
-	 *
-	 * a process lock (refresh_mutex) in the calling function prevents this at least on the same machine
-	 */
+	/* Best-effort cluster lock; refresh_mutex closes the read/set race only on this machine. */
 	oidc_cache_set_refresh_token(r, refresh_token, OIDC_REFRESH_LOCK_VALUE,
 				     apr_time_now() + apr_time_from_sec(OIDC_REFRESH_LOCK_TTL));
 
@@ -212,65 +232,163 @@ end:
 }
 
 /*
- * execute refresh token grant to refresh the existing access token
+ * obtain a fresh set of tokens, either by re-using a recent cache entry or
+ * by calling the OP token endpoint with the supplied refresh_token; on a
+ * remote refresh failure the refresh_token is locked out of future refresh
+ * attempts for OIDC_REFRESH_CACHE_TTL seconds
  */
-apr_byte_t oidc_refresh_token_grant(request_rec *r, oidc_cfg_t *c, oidc_session_t *session, oidc_provider_t *provider,
-				    char **new_access_token, char **new_access_token_type, char **new_id_token) {
-
-	apr_byte_t rc = FALSE;
-	char *s_id_token = NULL;
-	int expires_in = -1;
-	char *s_token_type = NULL;
-	char *s_access_token = NULL;
-	char *s_refresh_token = NULL;
-	char *s_scope = NULL;
-	oidc_jwt_t *id_token_jwt = NULL;
-	oidc_jose_error_t err;
-	const char *refresh_token = NULL;
-	apr_time_t ts = 0;
-	oidc_refresh_token_cache_result_t rv = OIDC_REFRESH_CACHE_ERROR;
-
-	oidc_debug(r, "enter");
-
-	/* get the refresh token that was stored in the session */
-	refresh_token = oidc_session_get_refresh_token(r, session);
-	if (refresh_token == NULL) {
-		oidc_warn(r, "refresh token routine called but no refresh_token found in the session");
-		goto end;
-	}
+static apr_byte_t oidc_refresh_token_grant_obtain_tokens(request_rec *r, oidc_cfg_t *c, const oidc_provider_t *provider,
+							 const char *refresh_token, char **s_id_token,
+							 char **s_access_token, char **s_token_type, int *expires_in,
+							 char **s_refresh_token, char **s_scope, apr_time_t *ts) {
 
 	/* see if it was refreshed very recently and we can re-use the results from the cache */
-	rv = oidc_refresh_token_cache_get(r, c, refresh_token, &s_access_token, &s_token_type, &expires_in, &s_id_token,
-					  &s_refresh_token, &ts);
+	oidc_refresh_token_cache_result_t rv = oidc_refresh_token_cache_get(
+	    r, c, refresh_token, s_access_token, s_token_type, expires_in, s_id_token, s_refresh_token, ts);
 	if (rv == OIDC_REFRESH_CACHE_SUCCESS)
-		goto process;
+		return TRUE;
 	if (rv == OIDC_REFRESH_CACHE_ABORT)
 		/* a prior refresh of the access token failed and we won't try the same again */
-		goto end;
+		return FALSE;
 
-	oidc_debug(r, "refreshing refresh_token: %s", refresh_token);
+	oidc_debug(r, "refreshing refresh_token: %s", oidc_util_mask_value(r, refresh_token));
 
 	OIDC_METRICS_TIMING_START(r, c);
 
 	/* refresh the tokens by calling the token endpoint */
-	if (oidc_proto_token_refresh_request(r, c, provider, refresh_token, &s_id_token, &s_access_token, &s_token_type,
-					     &expires_in, &s_refresh_token, &s_scope) == FALSE) {
+	if (oidc_proto_token_refresh_request(r, c, provider, refresh_token, s_id_token, s_access_token, s_token_type,
+					     expires_in, s_refresh_token, s_scope) == FALSE) {
 		OIDC_METRICS_COUNTER_INC(r, c, OM_PROVIDER_REFRESH_ERROR);
-		oidc_error(r, "access_token could not be refreshed with refresh_token: %s", refresh_token);
+		oidc_error(r, "access_token could not be refreshed");
+		/* Another caller may have rotated the token; recheck its cached result before locking it out. */
+		char *s_recovered = NULL;
+		oidc_cache_get_refresh_token(r, refresh_token, &s_recovered);
+		if ((s_recovered != NULL) && (_oidc_strcmp(s_recovered, OIDC_REFRESH_LOCK_VALUE) != 0) &&
+		    (_oidc_strcmp(s_recovered, OIDC_REFRESH_FAILED_LOCK_VALUE) != 0) &&
+		    (oidc_refresh_token_cache_parse(r, s_recovered, s_access_token, s_token_type, expires_in,
+						    s_id_token, s_refresh_token, ts) == TRUE)) {
+			oidc_warn(r, "our own refresh grant failed but another caller populated the cache with results "
+				     "for the same refresh token; re-using those instead of failing");
+			return TRUE;
+		}
 		/* release the refresh lock and indicate this refresh token should not be refreshed anymore for at least
 		 * 30 seconds */
 		oidc_cache_set_refresh_token(r, refresh_token, OIDC_REFRESH_FAILED_LOCK_VALUE,
 					     apr_time_now() + apr_time_from_sec(OIDC_REFRESH_CACHE_TTL));
-		goto end;
+		return FALSE;
 	}
 
 	OIDC_METRICS_TIMING_ADD(r, c, OM_PROVIDER_REFRESH);
 
 	/* cache the results for other callers */
-	oidc_refresh_token_cache_set(r, c, refresh_token, s_access_token, s_token_type, expires_in, s_id_token,
-				     s_refresh_token, &ts);
+	oidc_refresh_token_cache_set(r, refresh_token, *s_access_token, *s_token_type, *expires_in, *s_id_token,
+				     *s_refresh_token, ts);
 
-process:
+	return TRUE;
+}
+
+/*
+ * OIDC Core 12.2 requires a refreshed ID token to retain the original subject. Skip the check
+ * only when the session has no earlier ID-token claims.
+ */
+static apr_byte_t oidc_refresh_token_grant_id_token_sub_match(request_rec *r, const oidc_session_t *session,
+							      const oidc_jwt_t *jwt) {
+
+	const oidc_json_t *claims = oidc_session_get_idtoken_claims(r, session);
+	const char *sub =
+	    (claims != NULL) ? oidc_json_string_value(oidc_json_object_get(claims, OIDC_CLAIM_SUB)) : NULL;
+
+	if (sub == NULL)
+		return TRUE;
+
+	if (_oidc_strcmp(sub, jwt->payload.sub) != 0) {
+		oidc_error(r,
+			   "the \"%s\" claim (%s) in the refreshed id_token differs from the one established for this "
+			   "session (%s): rejecting the refreshed id_token",
+			   OIDC_CLAIM_SUB, jwt->payload.sub, sub);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/*
+ * apply a refreshed id_token to the session: validate it, store its claims and
+ * optionally its serialized form, update the session expiry when no fixed
+ * max-duration is configured and return it to the caller
+ */
+static void oidc_refresh_token_grant_apply_id_token(request_rec *r, oidc_cfg_t *c, oidc_session_t *session,
+						    const oidc_provider_t *provider, char *s_id_token,
+						    char **new_id_token) {
+
+	oidc_jwt_t *id_token_jwt = NULL;
+
+	/*
+	 * Validate as a TLS-protected back-channel ID token. Refreshes have no nonce because the nonce
+	 * belongs to the original authentication request.
+	 */
+	if (oidc_proto_idtoken_parse(r, c, provider, s_id_token, NULL, &id_token_jwt, TRUE) == FALSE) {
+		oidc_warn(r, "refreshed id_token could not be validated, retaining the claims obtained earlier");
+		return;
+	}
+
+	if (oidc_refresh_token_grant_id_token_sub_match(r, session, id_token_jwt) == FALSE) {
+		oidc_jwt_destroy(id_token_jwt);
+		return;
+	}
+
+	/* only store the serialized representation when configured so */
+	if (oidc_cfg_store_id_token_get(c))
+		oidc_session_set_idtoken(r, session, s_id_token);
+
+	/* store the claims payload in the id_token for later reference */
+	oidc_session_set_idtoken_claims(r, session, id_token_jwt->payload.value.json);
+
+	if (oidc_cfg_provider_session_max_duration_get(provider) == 0) {
+		/* update the session expiry to match the expiry of the id_token
+		 * NB: "exp" is a JSON number, so clamp rather than wrap on a far-future value */
+		apr_time_t session_expires = oidc_util_apr_time_from_sec(id_token_jwt->payload.exp);
+		oidc_session_set_session_expires(r, session, session_expires);
+
+		/* log message about the updated max session duration */
+		oidc_log_session_expires(r, "session max lifetime", session_expires);
+	}
+
+	/* see if we need to return it as a parameter */
+	if (new_id_token != NULL)
+		*new_id_token = s_id_token;
+
+	oidc_jwt_destroy(id_token_jwt);
+}
+
+/*
+ * execute refresh token grant to refresh the existing access token
+ */
+apr_byte_t oidc_refresh_token_grant(request_rec *r, oidc_cfg_t *c, oidc_session_t *session,
+				    const oidc_provider_t *provider, char **new_access_token,
+				    char **new_access_token_type, char **new_id_token) {
+
+	char *s_id_token = NULL;
+	char *s_token_type = NULL;
+	char *s_access_token = NULL;
+	char *s_refresh_token = NULL;
+	char *s_scope = NULL;
+	int expires_in = -1;
+	apr_time_t ts = 0;
+
+	oidc_debug(r, "enter");
+
+	/* get the refresh token that was stored in the session */
+	const char *refresh_token = oidc_session_get_refresh_token(r, session);
+	if (refresh_token == NULL) {
+		oidc_warn(r, "refresh token routine called but no refresh_token found in the session");
+		return FALSE;
+	}
+
+	if (oidc_refresh_token_grant_obtain_tokens(r, c, provider, refresh_token, &s_id_token, &s_access_token,
+						   &s_token_type, &expires_in, &s_refresh_token, &s_scope,
+						   &ts) == FALSE)
+		return FALSE;
 
 	/* store the new access_token in the session and discard the old one */
 	oidc_session_set_access_token(r, session, s_access_token);
@@ -295,44 +413,13 @@ process:
 		oidc_session_set_scope(r, session, s_scope);
 
 	/* if we have a new id_token, store it in the session and update the session max lifetime if required */
-	if (s_id_token != NULL) {
+	if (s_id_token != NULL)
+		oidc_refresh_token_grant_apply_id_token(r, c, session, provider, s_id_token, new_id_token);
 
-		/* only store the serialized representation when configured so */
-		if (oidc_cfg_store_id_token_get(c))
-			oidc_session_set_idtoken(r, session, s_id_token);
+	oidc_debug(r, "replaced refresh_token: %s with %s", oidc_util_mask_value(r, refresh_token),
+		   oidc_util_mask_value(r, s_refresh_token));
 
-		if (oidc_jwt_parse(r->pool, s_id_token, &id_token_jwt, NULL, FALSE, &err) == TRUE) {
-			/* store the claims payload in the id_token for later reference */
-			oidc_session_set_idtoken_claims(r, session, id_token_jwt->payload.value.json);
-
-			if (oidc_cfg_provider_session_max_duration_get(provider) == 0) {
-				/* update the session expiry to match the expiry of the id_token */
-				apr_time_t session_expires = apr_time_from_sec(id_token_jwt->payload.exp);
-				oidc_session_set_session_expires(r, session, session_expires);
-
-				/* log message about the updated max session duration */
-				oidc_log_session_expires(r, "session max lifetime", session_expires);
-			}
-
-			/* see if we need to return it as a parameter */
-			if (new_id_token != NULL)
-				*new_id_token = s_id_token;
-
-		} else {
-			oidc_warn(r, "parsing of id_token failed");
-		}
-
-		if (id_token_jwt != NULL)
-			oidc_jwt_destroy(id_token_jwt);
-	}
-
-	oidc_debug(r, "replaced refresh_token: %s with %s", refresh_token, s_refresh_token);
-
-	rc = TRUE;
-
-end:
-
-	return rc;
+	return TRUE;
 }
 
 /*
@@ -342,7 +429,7 @@ int oidc_refresh_token_request(request_rec *r, oidc_cfg_t *c, oidc_session_t *se
 
 	char *return_to = NULL;
 	char *r_access_token = NULL;
-	char *error_code = NULL;
+	const char *error_code = NULL;
 	char *error_str = NULL;
 	char *error_description = NULL;
 	apr_byte_t needs_save = TRUE;
@@ -359,7 +446,8 @@ int oidc_refresh_token_request(request_rec *r, oidc_cfg_t *c, oidc_session_t *se
 	}
 
 	/* do input validation on the return to parameter value */
-	if (oidc_validate_redirect_url(r, c, return_to, TRUE, &error_str, &error_description) == FALSE) {
+	if (oidc_validate_redirect_url(r, c, return_to, OIDC_REDIRECT_URL_SAME_HOST, &error_str, &error_description) ==
+	    FALSE) {
 		oidc_error(r, "return_to URL validation failed: %s: %s", error_str, error_description);
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
@@ -378,7 +466,7 @@ int oidc_refresh_token_request(request_rec *r, oidc_cfg_t *c, oidc_session_t *se
 	}
 
 	/* compare the access_token parameter used for XSRF protection */
-	if (_oidc_strcmp(s_access_token, r_access_token) != 0) {
+	if (oidc_util_strcmp_const_time(s_access_token, r_access_token) == FALSE) {
 		oidc_error(r, "access_token passed in refresh request does not match the one stored in the session");
 		error_code = "no_access_token_match";
 		goto end;
@@ -398,12 +486,9 @@ int oidc_refresh_token_request(request_rec *r, oidc_cfg_t *c, oidc_session_t *se
 	}
 
 	/* pass the tokens to the application, possibly updating the expiry */
-	if (oidc_session_pass_tokens(r, c, session, TRUE, &needs_save) == FALSE) {
-		error_code = "session_corruption";
-		goto end;
-	}
+	oidc_session_pass_tokens(r, c, session, TRUE, &needs_save);
 
-	if (oidc_session_save(r, session, FALSE) == FALSE) {
+	if (oidc_session_save(r, session, OIDC_SESSION_SAVE_UPDATE) == FALSE) {
 		error_code = "error saving session";
 		goto end;
 	}

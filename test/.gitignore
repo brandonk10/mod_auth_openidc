@@ -13,6 +13,9 @@
 /Makefile.in
 /test
 /test-cmd
+# not built here, but the enterprise branch adds it to noinst_PROGRAMS, so it is
+# left behind in a shared worktree and is otherwise easy to commit by accident
+/test-perf
 /test_jose
 /test_util
 /Makefile
@@ -20,4 +23,49 @@
 /test_cfg
 /test_http
 /test_cache
+/test_cache_local
 /test_proto
+/test_handle
+/test_state
+/test_session
+/test_metadata
+/test_metrics
+/test_oauth
+/mod_auth_openidc-*-coverage.info
+/mod_auth_openidc-*-coverage/
+
+# fuzz targets: ignore built binaries and the fuzz/ build artifacts, but keep
+# the sources, corpus, scripts and README under fuzz/
+/fuzz_base64
+/fuzz_url
+/fuzz_jwt
+/fuzz_json
+/fuzz_cookie
+/fuzz_response_header
+/fuzz_form_params
+/fuzz_metadata
+/fuzz_state_cookie
+/fuzz_jwks
+/fuzz_discovery_response
+/fuzz_pem_key
+/fuzz_backchannel_logout
+/fuzz_authz_response
+/fuzz_current_url
+/fuzz_bearer_token
+/fuzz_redirect_uri
+/fuzz_post_preserve
+/fuzz_strings
+/fuzz/*.o
+/fuzz/.deps/
+/fuzz/.dirstamp
+/fuzz/*.log
+/fuzz/*.trs
+/fuzz/build/
+/fuzz/crash-*
+/fuzz/oom-*
+/fuzz/timeout-*
+/fuzz/leak-*
+# inputs libFuzzer discovers and writes into the corpus dirs during a run are
+# named by their SHA1; keep the curated (human-named) seeds, ignore the rest
+/fuzz/corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+/test_config

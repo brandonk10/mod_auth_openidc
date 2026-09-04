@@ -53,8 +53,10 @@
 #include <apr_strings.h>
 #include <apr_tables.h>
 
-#include <cjose/cjose.h>
-#include <jansson.h>
+#include "json.h"
+
+/* opaque forward declaration of the OpenSSL BIO type used in the oidc_jwk_pem_bio_to_jwk() prototype below */
+typedef struct bio_st BIO;
 
 #ifndef APR_ARRAY_IDX
 #define APR_ARRAY_IDX(ary, i, type) (((type *)(ary)->elts)[i])
@@ -85,9 +87,28 @@
 #define OIDC_JOSE_JWK_X5T256_STR "x5t#S256" // X509 SHA-256 thumbprint
 #define OIDC_JOSE_JWK_SIG_STR "sig"	    // use signature type
 #define OIDC_JOSE_JWK_ENC_STR "enc"	    // use encryption type
+#define OIDC_JOSE_JWK_ALG_STR "alg"	    // algorithm intended for use with the key
 
 /* the OIDC jwks fields from RFC 5741 */
 #define OIDC_JOSE_JWKS_KEYS_STR "keys" // Array of JWKs
+
+/* Backend-independent JOSE names and values. Key types match cjose and are compile-time asserted. */
+#define OIDC_JOSE_HDR_ALG "alg"
+#define OIDC_JOSE_HDR_ENC "enc"
+#define OIDC_JOSE_HDR_KID "kid"
+#define OIDC_JOSE_HDR_ALG_DIR "dir"
+#define OIDC_JOSE_HDR_ALG_RS256 "RS256"
+#define OIDC_JOSE_HDR_ALG_PS256 "PS256"
+#define OIDC_JOSE_HDR_ALG_HS256 "HS256"
+#define OIDC_JOSE_HDR_ALG_ES256 "ES256"
+#define OIDC_JOSE_HDR_ALG_ES384 "ES384"
+#define OIDC_JOSE_HDR_ALG_ES512 "ES512"
+#define OIDC_JOSE_HDR_ENC_A256GCM "A256GCM"
+#define OIDC_JOSE_HDR_ENC_A128CBC_HS256 "A128CBC-HS256"
+
+#define OIDC_JOSE_JWK_KTY_RSA 1
+#define OIDC_JOSE_JWK_KTY_EC 2
+#define OIDC_JOSE_JWK_KTY_OCT 3
 
 /* struct for returning errors to the caller */
 typedef struct {
@@ -105,9 +126,6 @@ typedef struct {
 	_oidc_jose_error_set(err, __FILE__, __LINE__, __FUNCTION__, "%s() failed: %s", msg,                            \
 			     ERR_error_string(ERR_get_error(), NULL), ##__VA_ARGS__)
 #define oidc_jose_e2s(pool, err) apr_psprintf(pool, "[%s:%d: %s]: %s", err.source, err.line, err.function, err.text)
-#define oidc_cjose_e2s(pool, cjose_err)                                                                                \
-	apr_psprintf(pool, "%s [file: %s, function: %s, line: %ld]", cjose_err.message, cjose_err.file,                \
-		     cjose_err.function, cjose_err.line)
 
 /*
  * helper functions
@@ -121,6 +139,9 @@ apr_byte_t oidc_jose_jwe_algorithm_is_supported(apr_pool_t *pool, const char *al
 apr_array_header_t *oidc_jose_jwe_supported_encryptions(apr_pool_t *pool);
 apr_byte_t oidc_jose_jwe_encryption_is_supported(apr_pool_t *pool, const char *enc);
 
+/* return the version string of the underlying JOSE backend library */
+const char *oidc_jose_version(void);
+
 /* hash helpers */
 apr_byte_t oidc_jose_hash_string(apr_pool_t *pool, const char *alg, const char *msg, char **hash,
 				 unsigned int *hash_len, oidc_jose_error_t *err);
@@ -132,9 +153,9 @@ apr_byte_t oidc_jose_hash_and_base64url_encode(apr_pool_t *pool, const char *ope
 					       int input_len, char **output, oidc_jose_error_t *err);
 
 /* return a string claim value from a JSON object */
-apr_byte_t oidc_jose_get_string(apr_pool_t *pool, json_t *json, const char *claim_name, apr_byte_t is_mandatory,
-				char **result, oidc_jose_error_t *err);
-apr_byte_t oidc_jose_get_timestamp(apr_pool_t *pool, json_t *json, const char *claim_name, apr_byte_t is_mandatory,
+apr_byte_t oidc_jose_get_string(apr_pool_t *pool, const oidc_json_t *json, const char *claim_name,
+				apr_byte_t is_mandatory, char **result, oidc_jose_error_t *err);
+apr_byte_t oidc_jose_get_timestamp(const oidc_json_t *json, const char *claim_name, apr_byte_t is_mandatory,
 				   double *result, oidc_jose_error_t *err);
 
 apr_byte_t oidc_jose_compress(apr_pool_t *pool, const char *input, int input_len, char **output, int *output_len,
@@ -145,7 +166,7 @@ apr_byte_t oidc_jose_uncompress(apr_pool_t *pool, const char *input, int input_l
 /* a parsed JWK/JWT JSON object */
 typedef struct oidc_jose_json_t {
 	/* parsed JSON struct representation */
-	json_t *json;
+	oidc_json_t *json;
 	/* string representation */
 	char *str;
 } oidc_jose_json_t;
@@ -158,6 +179,9 @@ typedef struct oidc_jose_json_t {
 typedef struct oidc_jwk_t {
 	/* use type */
 	char *use;
+	/* JWK "alg" (algorithm) parameter (optional; RFC 7517 section 4.4); when set it is published in the
+	 * JWKs so an OP can select this key for the named algorithm, and it drives per-alg key duplication */
+	char *alg;
 	/* key type */
 	int kty;
 	/* key identifier */
@@ -168,26 +192,34 @@ typedef struct oidc_jwk_t {
 	char *x5t;
 	/* X.509 Certificate SHA-256 Thumbprint */
 	char *x5t_S256;
-	/* cjose JWK structure */
-	cjose_jwk_t *cjose_jwk;
+	/* backend-private handle to the JOSE library's key object (currently a cjose_jwk_t); typed as
+	 * void* so this public header needs no backend types: only jose.c and the jose/ subdirectory,
+	 * which include the real backend header, may dereference or operate on it */
+	void *cjose_jwk;
 } oidc_jwk_t;
 
 /* decrypt a JWT */
 apr_byte_t oidc_jwe_decrypt(apr_pool_t *pool, const char *input_json, apr_hash_t *keys, char **plaintext,
 			    int *plaintext_len, oidc_jose_error_t *err, apr_byte_t import_must_succeed);
 /* parse a JSON string (JWK) to a JWK struct */
-oidc_jwk_t *oidc_jwk_parse(apr_pool_t *pool, json_t *json, oidc_jose_error_t *err);
+oidc_jwk_t *oidc_jwk_parse(apr_pool_t *pool, const oidc_json_t *json, oidc_jose_error_t *err);
 oidc_jwk_t *oidc_jwk_copy(apr_pool_t *pool, const oidc_jwk_t *jwk);
 /* parse a JSON object (JWK) in to a JWK struct */
-apr_byte_t oidc_jwk_parse_json(apr_pool_t *pool, json_t *json, oidc_jwk_t **jwk, oidc_jose_error_t *err);
+apr_byte_t oidc_jwk_parse_json(apr_pool_t *pool, const oidc_json_t *json, oidc_jwk_t **jwk, oidc_jose_error_t *err);
 /* parse a JSON object (JWKS) to a list of JWK structs */
-apr_byte_t oidc_jwks_parse_json(apr_pool_t *pool, json_t *json, apr_array_header_t **jwk_list, oidc_jose_error_t *err);
+apr_byte_t oidc_jwks_parse_json(apr_pool_t *pool, const oidc_json_t *json, apr_array_header_t **jwk_list,
+				oidc_jose_error_t *err);
 /* test if JSON object looks like JWK */
-apr_byte_t oidc_is_jwk(json_t *json);
+apr_byte_t oidc_is_jwk(const oidc_json_t *json);
 /* test if JSON object looks like JWKS */
-apr_byte_t oidc_is_jwks(json_t *json);
+apr_byte_t oidc_is_jwks(const oidc_json_t *json);
 /* convert a JWK struct to a JSON string */
 apr_byte_t oidc_jwk_to_json(apr_pool_t *pool, const oidc_jwk_t *jwk, char **s_json, oidc_jose_error_t *err);
+/* convert the PUBLIC part of a JWK struct to a JSON string (excludes private key material) */
+apr_byte_t oidc_jwk_to_public_json(apr_pool_t *pool, const oidc_jwk_t *jwk, char **s_json, oidc_jose_error_t *err);
+/* derive the default JWS signing algorithm for a key (RS256 for RSA; ES256/384/512 per EC curve); NULL if unsupported
+ */
+const char *oidc_jwk_default_jws_alg(const oidc_jwk_t *jwk);
 /* destroy resources allocated for a JWK struct */
 void oidc_jwk_destroy(oidc_jwk_t *jwk);
 /* destroy a list of JWKs structs */
@@ -222,6 +254,8 @@ typedef struct oidc_jwt_hdr_t {
 	char *kid;
 	/* JWT "enc" claim value; encryption algorithm */
 	char *enc;
+	/* JWT "cty" claim value; content type (e.g. "JWT" for a Nested JWT) */
+	char *cty;
 	/* JWT "x5t" thumbprint */
 	char *x5t;
 } oidc_jwt_hdr_t;
@@ -246,23 +280,25 @@ typedef struct oidc_jwt_t {
 	oidc_jwt_hdr_t header;
 	/* parsed JWT payload */
 	oidc_jwt_payload_t payload;
-	/* cjose JWS structure */
-	cjose_jws_t *cjose_jws;
+	/* backend-private handle to the JOSE library's signature object (currently a cjose_jws_t); typed
+	 * as void* so this public header needs no backend types: only jose.c and the jose/ subdirectory,
+	 * which include the real backend header, may dereference or operate on it */
+	void *cjose_jws;
 } oidc_jwt_t;
 
 /* parse a string into a JSON Web Token struct and (optionally) decrypt it */
 apr_byte_t oidc_jwt_parse(apr_pool_t *pool, const char *s_json, oidc_jwt_t **j_jwt, apr_hash_t *keys,
 			  apr_byte_t compress, oidc_jose_error_t *err);
 /* sign a JWT with a JWK */
-apr_byte_t oidc_jwt_sign(apr_pool_t *pool, oidc_jwt_t *jwt, oidc_jwk_t *jwk, apr_byte_t compress,
+apr_byte_t oidc_jwt_sign(apr_pool_t *pool, oidc_jwt_t *jwt, const oidc_jwk_t *jwk, apr_byte_t compress,
 			 oidc_jose_error_t *err);
 /* verify a JWT a key in a list of JWKs */
 apr_byte_t oidc_jwt_verify(apr_pool_t *pool, oidc_jwt_t *jwt, apr_hash_t *keys, oidc_jose_error_t *err);
 /* perform compact serialization on a JWT and return the resulting string */
 char *oidc_jose_jwt_serialize(apr_pool_t *pool, oidc_jwt_t *jwt, oidc_jose_error_t *err);
 /* encrypt JWT */
-apr_byte_t oidc_jwt_encrypt(apr_pool_t *pool, oidc_jwt_t *jwe, oidc_jwk_t *jwk, const char *payload, int payload_len,
-			    char **serialized, oidc_jose_error_t *err);
+apr_byte_t oidc_jwt_encrypt(apr_pool_t *pool, oidc_jwt_t *jwe, const oidc_jwk_t *jwk, const char *payload,
+			    int payload_len, char **serialized, oidc_jose_error_t *err);
 
 /* create a new JWT */
 oidc_jwt_t *oidc_jwt_new(apr_pool_t *pool, int create_header, int create_payload);
@@ -271,8 +307,12 @@ void oidc_jwt_destroy(oidc_jwt_t *);
 
 /* get a header value from a JWT */
 const char *oidc_jwt_hdr_get(oidc_jwt_t *jwt, const char *key);
+/* set a JWT header member to a raw (pre-serialized) JSON value */
+apr_byte_t oidc_jwt_hdr_set_json(oidc_jwt_t *jwt, const char *key, const char *raw_json, oidc_jose_error_t *err);
 /* return the key type of a JWT */
-int oidc_jwt_alg2kty(oidc_jwt_t *jwt);
+int oidc_jwt_alg2kty(const oidc_jwt_t *jwt);
+/* return the key type (cjose kty) that the provided JWA algorithm name requires, or -1 if unknown */
+int oidc_alg2kty(const char *alg);
 /* return the key size for an algorithm */
 unsigned int oidc_alg2keysize(const char *alg);
 

@@ -54,94 +54,102 @@
 #include "cfg/dir.h"
 #include "const.h"
 #include "http.h"
+#include "http_int.h"
 #include "metrics.h"
 #include "proto/proto.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
+
+/* the reusable-handle pool lives at the bottom of this file */
+static CURL *oidc_http_curl_acquire(void);
+static void oidc_http_curl_release(CURL *curl, apr_byte_t reuse);
 
 /*
- * URL-encode a string
+ * URL-encode a string: percent-encode every byte outside of the RFC 3986 unreserved set,
+ * matching curl_easy_escape which was used here before (but required a throwaway CURL handle
+ * per call since handles must not be shared between threads)
  */
 char *oidc_http_url_encode(const request_rec *r, const char *str) {
-	/*
-	 * cuRL does not allow us to share the same handle in multiple threads
-	 * see: https://curl.se/libcurl/c/threadsafe.html
-	 * so we can not not use a global variable here and optimize performance
-	 */
-	char *rv = "";
-	char *result = NULL;
-	CURL *curl = NULL;
+	static const char hex[] = "0123456789ABCDEF";
+	char *rv = NULL;
+	char *p = NULL;
+	size_t len = 0;
 
 	if (str == NULL)
-		goto end;
+		return "";
 
-	curl = curl_easy_init();
-	if (curl == NULL) {
-		oidc_error(r, "curl_easy_init() error");
-		goto end;
+	len = _oidc_strlen(str);
+
+	/* worst case each input byte expands to a 3-byte %XX sequence */
+	rv = apr_palloc(r->pool, len * 3 + 1);
+	p = rv;
+	for (size_t i = 0; i < len; i++) {
+		const unsigned char c = (unsigned char)str[i];
+		if (((c >= 'A') && (c <= 'Z')) || ((c >= 'a') && (c <= 'z')) || ((c >= '0') && (c <= '9')) ||
+		    (c == '-') || (c == '.') || (c == '_') || (c == '~')) {
+			*p++ = (char)c;
+		} else {
+			*p++ = '%';
+			*p++ = hex[c >> 4];
+			*p++ = hex[c & 0x0f];
+		}
 	}
-
-	result = curl_easy_escape(curl, str, 0);
-	if (result == NULL) {
-		oidc_error(r, "curl_easy_escape() error");
-		goto end;
-	}
-
-	rv = apr_pstrdup(r->pool, result);
-
-end:
-
-	if (result)
-		curl_free(result);
-	if (curl)
-		curl_easy_cleanup(curl);
+	*p = '\0';
 
 	return rv;
 }
 
+static int oidc_http_url_decode_hex_digit(const char c) {
+	if ((c >= '0') && (c <= '9'))
+		return c - '0';
+	if ((c >= 'A') && (c <= 'F'))
+		return c - 'A' + 10;
+	if ((c >= 'a') && (c <= 'f'))
+		return c - 'a' + 10;
+	return -1;
+}
+
 /*
- * URL-decode a string
+ * URL-decode a string: form-decode "+" to space and percent-decode %XX sequences, copying
+ * malformed/truncated %-sequences through literally, matching the curl_easy_unescape based
+ * implementation that was used here before
  */
 char *oidc_http_url_decode(const request_rec *r, const char *str) {
-	char *rv = "";
-	char *result = NULL;
-	CURL *curl = NULL;
-	int counter = 0;
-	char *replaced = NULL;
+	char *rv = NULL;
+	char *p = NULL;
+	size_t i = 0;
+	size_t len = 0;
 
 	if (str == NULL)
-		goto end;
+		return "";
 
-	curl = curl_easy_init();
-	if (curl == NULL) {
-		oidc_error(r, "curl_easy_init() error");
-		goto end;
-	}
+	len = _oidc_strlen(str);
 
-	replaced = apr_pstrdup(r->pool, str);
-	while (replaced[counter] != '\0') {
-		if (replaced[counter] == '+') {
-			replaced[counter] = ' ';
+	rv = apr_palloc(r->pool, len + 1);
+	p = rv;
+	while (i < len) {
+		const char c = str[i];
+		if (c == '+') {
+			*p++ = ' ';
+			i++;
+		} else if (c == '%') {
+			/* str[i + 1] is within bounds (at worst the NUL terminator); str[i + 2] is only
+			 * read when str[i + 1] is a hex digit and thus not the terminator */
+			const int hi = oidc_http_url_decode_hex_digit(str[i + 1]);
+			const int lo = (hi >= 0) ? oidc_http_url_decode_hex_digit(str[i + 2]) : -1;
+			if (lo >= 0) {
+				*p++ = (char)((hi << 4) | lo);
+				i += 3;
+			} else {
+				*p++ = c;
+				i++;
+			}
+		} else {
+			*p++ = c;
+			i++;
 		}
-		counter++;
 	}
-
-	result = curl_easy_unescape(curl, replaced, 0, 0);
-
-	if (result == NULL) {
-		oidc_error(r, "curl_easy_unescape() error");
-		goto end;
-	}
-
-	rv = apr_pstrdup(r->pool, result);
-
-	// oidc_debug(r, "input=\"%s\", output=\"%s\"", str, rv);
-
-end:
-
-	if (result)
-		curl_free(result);
-	if (curl)
-		curl_easy_cleanup(curl);
+	*p = '\0';
 
 	return rv;
 }
@@ -172,7 +180,8 @@ static const char *oidc_http_hdr_in_get_left_most_only(const request_rec *r, con
  */
 static apr_byte_t oidc_http_hdr_in_contains(const request_rec *r, const char *name, const char *separator,
 					    const char postfix_separator, const char *needle) {
-	char *ctx = NULL, *elem = NULL;
+	char *ctx = NULL;
+	const char *elem = NULL;
 	const char *value = oidc_http_hdr_in_get(r, name);
 	apr_byte_t rc = FALSE;
 	if (value) {
@@ -193,26 +202,24 @@ static apr_byte_t oidc_http_hdr_in_contains(const request_rec *r, const char *na
 }
 
 /*
+ * copy a header value with CR/LF replaced, to prevent header injection
+ */
+static char *oidc_http_hdr_value_sanitize(const request_rec *r, const char *value) {
+	char *s_value = apr_pstrdup(r->pool, value);
+	char *p = NULL;
+	while ((p = strpbrk(s_value, "\r\n")))
+		*p = OIDC_CHAR_SPACE;
+	return s_value;
+}
+
+/*
  * set a HTTP response header; table could be headers_out or err_headers_out
  */
 static void oidc_http_hdr_table_set(const request_rec *r, apr_table_t *table, const char *name, const char *value) {
 
 	if (value != NULL) {
 
-		char *s_value = apr_pstrdup(r->pool, value);
-
-		/*
-		 * sanitize the header value by replacing line feeds with spaces
-		 * just like the Apache header input algorithms do for incoming headers
-		 *
-		 * this makes it impossible to have line feeds in values but that is
-		 * compliant with RFC 7230 (and impossible for regular headers due to Apache's
-		 * parsing of headers anyway) and fixes a security vulnerability on
-		 * overwriting/setting outgoing headers when used in proxy mode
-		 */
-		char *p = NULL;
-		while ((p = strchr(s_value, '\n')))
-			*p = OIDC_CHAR_SPACE;
+		char *s_value = oidc_http_hdr_value_sanitize(r, value);
 
 		oidc_debug(r, "%s: %s", name, s_value);
 		apr_table_set(table, name, s_value);
@@ -222,6 +229,17 @@ static void oidc_http_hdr_table_set(const request_rec *r, apr_table_t *table, co
 		oidc_debug(r, "unset %s", name);
 		apr_table_unset(table, name);
 	}
+}
+
+/*
+ * append a (sanitized) header to a table without the scan for an existing entry that apr_table_set()
+ * does, for callers that collect many headers and merge them into the request's table at once with
+ * apr_table_overlap(); the name and the value must live as long as the table
+ */
+void oidc_http_hdr_table_add(const request_rec *r, apr_table_t *table, const char *name, const char *value) {
+	char *s_value = oidc_http_hdr_value_sanitize(r, value);
+	oidc_debug(r, "%s: %s", name, s_value);
+	apr_table_addn(table, name, s_value);
 }
 
 /*
@@ -244,6 +262,15 @@ static const char *oidc_http_hdr_out_get(const request_rec *r, const char *name)
 void oidc_http_hdr_err_out_add(const request_rec *r, const char *name, const char *value) {
 	oidc_debug(r, "%s: %s", name, value);
 	apr_table_add(r->err_headers_out, name, value);
+}
+
+/*
+ * mark a response that may carry tokens or other sensitive material as non-cacheable,
+ * on all responses including errors and redirects
+ */
+void oidc_http_set_no_cache_headers(const request_rec *r) {
+	oidc_http_hdr_err_out_add(r, OIDC_HTTP_HDR_CACHE_CONTROL, "no-cache, no-store");
+	oidc_http_hdr_err_out_add(r, OIDC_HTTP_HDR_PRAGMA, "no-cache");
 }
 
 /*
@@ -431,8 +458,8 @@ char *oidc_http_hdr_normalize_name(const request_rec *r, const char *str) {
 	const char *separators = "()<>@,;:\\\"/[]?={} \t";
 
 	char *ns = apr_pstrdup(r->pool, str);
-	size_t i;
-	for (i = 0; i < _oidc_strlen(ns); i++) {
+	const size_t len = _oidc_strlen(ns);
+	for (size_t i = 0; i < len; i++) {
 		if (ns[i] < 32 || ns[i] == 127)
 			ns[i] = '-';
 		else if (strchr(separators, ns[i]) != NULL)
@@ -441,20 +468,10 @@ char *oidc_http_hdr_normalize_name(const request_rec *r, const char *str) {
 	return ns;
 }
 
-/* buffer to hold HTTP call responses */
-typedef struct oidc_curl_resp_data_ctx_t {
-	request_rec *r;
-	char *memory;
-	size_t size;
-} oidc_curl_resp_data_ctx_t;
-
-/* maximum acceptable size of HTTP responses: 10 Mb */
-#define OIDC_CURL_RESPONSE_DATA_SIZE_MAX 1024 * 1024 * 10
-
 /*
  * callback for CURL to write bytes that come back from an HTTP call
  */
-static size_t oidc_http_response_data(void *contents, size_t size, size_t nmemb, void *userp) {
+size_t oidc_http_response_data(void *contents, size_t size, size_t nmemb, void *userp) {
 	size_t realsize = size * nmemb;
 	oidc_curl_resp_data_ctx_t *mem = (oidc_curl_resp_data_ctx_t *)userp;
 
@@ -485,20 +502,15 @@ static size_t oidc_http_response_data(void *contents, size_t size, size_t nmemb,
 	return realsize;
 }
 
-/* buffer to hold HTTP response headers */
-typedef struct oidc_curl_resp_hdr_ctx_t {
-	request_rec *r;
-	apr_hash_t *hdrs;
-} oidc_curl_resp_hdr_ctx_t;
-
 /*
  * callback for CURL to write response headers that come back from an HTTP call
  */
-static size_t oidc_http_response_header(char *buffer, size_t size, size_t nitems, void *userdata) {
+size_t oidc_http_response_header(const char *buffer, size_t size, size_t nitems, void *userdata) {
 	/* received header is nitems * size long in 'buffer' NOT ZERO TERMINATED */
 	oidc_curl_resp_hdr_ctx_t *ctx = (oidc_curl_resp_hdr_ctx_t *)userdata;
-	char *hdr = NULL, *value = NULL, *h_name = NULL;
-	apr_hash_index_t *hi = NULL;
+	const char *hdr = NULL;
+	char *value = NULL;
+	char *h_name = NULL;
 	apr_ssize_t h_len = 0;
 	int i = 0;
 
@@ -524,15 +536,13 @@ static size_t oidc_http_response_header(char *buffer, size_t size, size_t nitems
 		while (*value == ' ')
 			value++;
 		/* remove trailing /r/n */
-		i = _oidc_strlen(value) - 1;
-		while ((value[i] == '\r') || (value[i] == '\n'))
+		i = (int)_oidc_strlen(value) - 1;
+		while ((i >= 0) && ((value[i] == '\r') || (value[i] == '\n')))
 			value[i--] = '\0';
 	}
 
-	// TODO: would be faster to use all lowercase keys
-
 	/* check if the caller is interested in the value of the current response header */
-	for (hi = apr_hash_first(NULL, ctx->hdrs); hi; hi = apr_hash_next(hi)) {
+	for (apr_hash_index_t *hi = apr_hash_first(NULL, ctx->hdrs); hi; hi = apr_hash_next(hi)) {
 		apr_hash_this(hi, (const void **)&h_name, &h_len, NULL);
 		if (_oidc_strnatcasecmp(hdr, h_name) == 0) {
 			oidc_debug(ctx->r, "returning response header: %s: %s", h_name, value);
@@ -549,22 +559,219 @@ end:
 /* context structure for encoding parameters */
 typedef struct oidc_http_encode_t {
 	request_rec *r;
-	char *encoded_params;
+	/* the encoded "key=value" fragments, joined once with "&" by the callers below; accumulating
+	 * them into a growing string per parameter instead made the work quadratic in the number of
+	 * parameters, which a request-controlled parameter count can turn into an OOM (OSS-Fuzz 551746349) */
+	apr_array_header_t *elems;
 } oidc_http_encode_t;
+
+/*
+ * names of protocol parameters that carry secrets or tokens and must be redacted
+ * before a request URL/body is written to the debug log; the single source of truth
+ * for both the per-parameter check and the body redaction below
+ */
+static const char *_oidc_http_sensitive_params[] = {OIDC_PROTO_CLIENT_SECRET, OIDC_PROTO_CLIENT_ASSERTION,
+						    OIDC_PROTO_CODE, OIDC_PROTO_CODE_VERIFIER, OIDC_PROTO_REFRESH_TOKEN,
+						    OIDC_PROTO_ACCESS_TOKEN,
+						    /* inbound: the front-channel authorization response and the
+						     * back-channel logout request carry these */
+						    OIDC_PROTO_ID_TOKEN, OIDC_PROTO_LOGOUT_TOKEN, NULL};
+
+apr_byte_t oidc_http_param_is_sensitive(const char *key) {
+	for (int i = 0; _oidc_http_sensitive_params[i] != NULL; i++)
+		if (_oidc_strcmp(key, _oidc_http_sensitive_params[i]) == 0)
+			return TRUE;
+	return FALSE;
+}
+
+/*
+ * TRUE when the name_len-byte parameter name is one of _oidc_http_sensitive_params
+ */
+static apr_byte_t oidc_http_param_name_is_sensitive(const char *name, size_t name_len) {
+	for (int i = 0; _oidc_http_sensitive_params[i] != NULL; i++)
+		if ((_oidc_strlen(_oidc_http_sensitive_params[i]) == name_len) &&
+		    (_oidc_strncmp(name, _oidc_http_sensitive_params[i], name_len) == 0))
+			return TRUE;
+	return FALSE;
+}
+
+/*
+ * best-effort redaction of the well-known sensitive parameters listed in
+ * _oidc_http_sensitive_params inside a URL-form-encoded request body, for debug-log
+ * purposes; JSON request bodies do not carry these parameters in this codebase and
+ * are therefore left untouched
+ */
+const char *oidc_http_redact_body_for_log(request_rec *r, const char *data) {
+	size_t n_params = 1;
+
+	if (data == NULL)
+		return NULL;
+	/* OIDCDebugMaskSecrets Off, or no request pool to build the redacted copy in */
+	if ((r == NULL) || (oidc_util_log_mask_secrets(r) == FALSE))
+		return data;
+	apr_pool_t *pool = r->pool;
+
+	/*
+	 * one pass over the "&"-separated parameters into a single buffer: rewriting the whole
+	 * string with an apr_psprintf() per redacted value made the work quadratic in the number
+	 * of sensitive parameters, which a request-sized body turned into an OOM (OSS-Fuzz
+	 * 554483423); a redacted value only ever grows to the 3 bytes of "***", so the result fits
+	 * in the input length plus 3 bytes per parameter
+	 */
+	for (const char *c = data; *c != '\0'; c++)
+		if (*c == OIDC_CHAR_AMP)
+			n_params++;
+	char *result = apr_palloc(pool, _oidc_strlen(data) + (3 * n_params) + 1);
+	char *out = result;
+	const char *param = data;
+
+	for (;;) {
+		const char *param_end = strchr(param, OIDC_CHAR_AMP);
+		const size_t param_len = (param_end != NULL) ? (size_t)(param_end - param) : _oidc_strlen(param);
+		const char *eq = memchr(param, OIDC_CHAR_EQUAL, param_len);
+		/* only a "<name>=" at the parameter boundary is redacted, so that e.g. "xcode=" is not taken for
+		 * "code=" */
+		const apr_byte_t redact =
+		    ((eq != NULL) && (oidc_http_param_name_is_sensitive(param, (size_t)(eq - param)) == TRUE)) ? TRUE
+													       : FALSE;
+		/* everything up to and including the "<name>=" is kept */
+		const size_t keep = (redact == TRUE) ? (size_t)(eq - param) + 1 : param_len;
+
+		_oidc_memcpy(out, param, keep);
+		out += keep;
+		if (redact == TRUE) {
+			_oidc_memcpy(out, "***", 3);
+			out += 3;
+		}
+		if (param_end == NULL)
+			break;
+		*out = OIDC_CHAR_AMP;
+		out++;
+		param = param_end + 1;
+	}
+	*out = '\0';
+
+	return result;
+}
+
+/* Sensitive response members differ from the request parameters redacted above. */
+static const char *_oidc_http_sensitive_json_members[] = {OIDC_PROTO_ACCESS_TOKEN,     OIDC_PROTO_REFRESH_TOKEN,
+							  OIDC_PROTO_ID_TOKEN,	       OIDC_PROTO_CLIENT_SECRET,
+							  "registration_access_token", NULL};
+
+/*
+ * Redact quoted JSON members without parsing, so malformed or non-JSON responses remain
+ * loggable and otherwise unchanged. This scanner assumes a sensitive value has no escaped quote:
+ * the next quote terminates the value.
+ * The input is copied through into a single buffer with each value replaced as it is found:
+ * rewriting the whole string with an apr_psprintf() per member made the work quadratic in the
+ * number of sensitive members, which a response-sized body turned into an OOM (OSS-Fuzz
+ * 554483423). A match consumes at least the member name, the colon and the opening quote and
+ * adds at most the 3 bytes of "***", which bounds the size of the result.
+ */
+static const char *oidc_http_redact_json_member(apr_pool_t *pool, const char *data, const char *needle) {
+	const apr_size_t needle_len = _oidc_strlen(needle);
+	const apr_size_t data_len = _oidc_strlen(data);
+	char *result = apr_palloc(pool, data_len + (3 * ((data_len / (needle_len + 2)) + 1)) + 1);
+	char *out = result;
+	/* the input up to here has been copied to the output */
+	const char *copied = data;
+	/* the scan cursor */
+	const char *pos = data;
+	size_t len = 0;
+
+	for (;;) {
+		const char *match = _oidc_strstr(pos, needle);
+		if (match == NULL)
+			break;
+		/* step over the member name and expect ": " then a quoted value; anything
+		 * else (a non-string value, a member name appearing inside a value) is
+		 * skipped rather than guessed at */
+		const char *p = match + needle_len;
+		while ((*p == ' ') || (*p == '\t'))
+			p++;
+		if (*p != OIDC_CHAR_COLON) {
+			pos = match + needle_len;
+			continue;
+		}
+		p++;
+		while ((*p == ' ') || (*p == '\t'))
+			p++;
+		if (*p != OIDC_CHAR_DQUOTE) {
+			pos = match + needle_len;
+			continue;
+		}
+		p++;
+		/* copy everything up to and including the opening quote, then the mask */
+		len = (size_t)(p - copied);
+		_oidc_memcpy(out, copied, len);
+		out += len;
+		_oidc_memcpy(out, "***", 3);
+		out += 3;
+		/* If the closing quote is missing, mask to the end rather than leak a partial token; the
+		 * closing quote itself is copied with the next chunk and the scan resumes after the mask. */
+		const char *value_end = strchr(p, OIDC_CHAR_DQUOTE);
+		copied = (value_end != NULL) ? value_end : p + _oidc_strlen(p);
+		pos = copied;
+	}
+
+	len = _oidc_strlen(copied);
+	_oidc_memcpy(out, copied, len);
+	out += len;
+	*out = '\0';
+
+	return result;
+}
+
+const char *oidc_http_redact_json_for_log(request_rec *r, const char *data) {
+	const char *result = NULL;
+
+	if (data == NULL)
+		return NULL;
+	/* OIDCDebugMaskSecrets Off, or no request pool to build the redacted copy in */
+	if ((r == NULL) || (oidc_util_log_mask_secrets(r) == FALSE))
+		return data;
+	apr_pool_t *pool = r->pool;
+
+	result = data;
+	for (int i = 0; _oidc_http_sensitive_json_members[i] != NULL; i++)
+		result = oidc_http_redact_json_member(
+		    pool, result, apr_pstrcat(pool, "\"", _oidc_http_sensitive_json_members[i], "\"", NULL));
+
+	return result;
+}
 
 /*
  * add a url-form-encoded name/value pair
  */
 static int oidc_http_add_form_url_encoded_param(void *rec, const char *key, const char *value) {
 	oidc_http_encode_t *ctx = (oidc_http_encode_t *)rec;
-	oidc_debug(ctx->r, "processing: %s=%s", key,
-		   (_oidc_strncmp(key, OIDC_PROTO_CLIENT_SECRET, _oidc_strlen(OIDC_PROTO_CLIENT_SECRET)) == 0)
-		       ? "***"
-		       : (value ? value : ""));
-	const char *sep = ctx->encoded_params ? OIDC_STR_AMP : "";
-	ctx->encoded_params = apr_psprintf(ctx->r->pool, "%s%s%s=%s", ctx->encoded_params ? ctx->encoded_params : "",
-					   sep, oidc_http_url_encode(ctx->r, key), oidc_http_url_encode(ctx->r, value));
+	APR_ARRAY_PUSH(ctx->elems, const char *) =
+	    apr_psprintf(ctx->r->pool, "%s=%s", oidc_http_url_encode(ctx->r, key), oidc_http_url_encode(ctx->r, value));
 	return 1;
+}
+
+/*
+ * add a name/value pair to a form-encoded string used only for debug logging, redacting
+ * the value when the parameter name is a known secret/token
+ */
+static int oidc_http_add_form_encoded_param_for_log(void *rec, const char *key, const char *value) {
+	oidc_http_encode_t *ctx = (oidc_http_encode_t *)rec;
+	const char *safe_value = value ? value : "";
+	const char *v = oidc_http_param_is_sensitive(key) ? "***" : safe_value;
+	APR_ARRAY_PUSH(ctx->elems, const char *) = apr_psprintf(ctx->r->pool, "%s=%s", key, v);
+	return 1;
+}
+
+/*
+ * run one of the per-parameter encoders above over a table and join the collected "key=value"
+ * fragments into a single "&"-separated string in one allocation; returns NULL when there are none
+ */
+static char *oidc_http_encode_params(request_rec *r, const apr_table_t *params,
+				     int (*encoder)(void *, const char *, const char *)) {
+	oidc_http_encode_t ctx = {r, apr_array_make(r->pool, apr_table_elts(params)->nelts, sizeof(const char *))};
+	apr_table_do(encoder, &ctx, params, NULL);
+	return (ctx.elems->nelts > 0) ? apr_array_pstrcat(r->pool, ctx.elems, OIDC_CHAR_AMP) : NULL;
 }
 
 /*
@@ -577,17 +784,18 @@ char *oidc_http_query_encoded_url(request_rec *r, const char *url, const apr_tab
 		return NULL;
 	}
 	if ((params != NULL) && (apr_table_elts(params)->nelts > 0)) {
-		oidc_http_encode_t data = {r, NULL};
-		apr_table_do(oidc_http_add_form_url_encoded_param, &data, params, NULL);
+		const char *encoded_params = oidc_http_encode_params(r, params, oidc_http_add_form_url_encoded_param);
 		const char *sep = NULL;
-		if (data.encoded_params)
+		if (encoded_params)
 			sep = strchr(url, OIDC_CHAR_QUERY) != NULL ? OIDC_STR_AMP : OIDC_STR_QUERY;
-		result = apr_psprintf(r->pool, "%s%s%s", url, sep ? sep : "",
-				      data.encoded_params ? data.encoded_params : "");
+		result = apr_psprintf(r->pool, "%s%s%s", url, sep ? sep : "", encoded_params ? encoded_params : "");
+
+		const char *log_params = oidc_http_encode_params(r, params, oidc_http_add_form_encoded_param_for_log);
+		oidc_debug(r, "url=%s%s%s", url, sep ? sep : "", log_params ? log_params : "");
 	} else {
 		result = apr_pstrdup(r->pool, url);
+		oidc_debug(r, "url=%s", result);
 	}
-	oidc_debug(r, "url=%s", result);
 	return result;
 }
 
@@ -597,11 +805,13 @@ char *oidc_http_query_encoded_url(request_rec *r, const char *url, const apr_tab
 char *oidc_http_form_encoded_data(request_rec *r, const apr_table_t *params) {
 	char *data = NULL;
 	if ((params != NULL) && (apr_table_elts(params)->nelts > 0)) {
-		oidc_http_encode_t encode_data = {r, NULL};
-		apr_table_do(oidc_http_add_form_url_encoded_param, &encode_data, params, NULL);
-		data = encode_data.encoded_params;
+		data = oidc_http_encode_params(r, params, oidc_http_add_form_url_encoded_param);
+
+		const char *log_params = oidc_http_encode_params(r, params, oidc_http_add_form_encoded_param_for_log);
+		oidc_debug(r, "data=%s", log_params ? log_params : "(null)");
+	} else {
+		oidc_debug(r, "data=(null)");
 	}
-	oidc_debug(r, "data=%s", data);
 	return data;
 }
 
@@ -618,8 +828,6 @@ char *oidc_http_form_encoded_data(request_rec *r, const apr_table_t *params) {
 /*
  * set libcurl SSL options
  */
-
-#define OIDC_CURLOPT_SSL_OPTIONS_ENV_VAR_NAME "CURLOPT_SSL_OPTIONS"
 
 #define OIDC_HTTP_CURL_SETOPT_SSL(option, value)                                                                       \
 	if (_oidc_strstr(env_var_value, #value) != NULL) {                                                             \
@@ -668,12 +876,10 @@ static void oidc_http_set_curl_ssl_options(request_rec *r, CURL *curl) {
 #endif
 }
 
-#define OIDC_USER_AGENT_ENV_VAR "OIDC_USER_AGENT"
-
 /*
  * construct our User-Agent header for outgoing requests
  */
-static const char *oidc_http_user_agent(request_rec *r) {
+const char *oidc_http_user_agent(request_rec *r) {
 	const char *s_useragent = apr_table_get(r->subprocess_env, OIDC_USER_AGENT_ENV_VAR);
 	if (s_useragent == NULL) {
 		s_useragent = apr_psprintf(r->pool, "[%s:%u:%lu] %s", r->server->server_hostname,
@@ -684,13 +890,154 @@ static const char *oidc_http_user_agent(request_rec *r) {
 	return s_useragent;
 }
 
-#define OIDC_CURL_INTERFACE_ENV_VAR "OIDC_CURL_INTERFACE"
-
 /*
  * construct our local address/interface for outgoing requests
  */
-static const char *oidc_http_interface(request_rec *r) {
+const char *oidc_http_interface(const request_rec *r) {
 	return apr_table_get(r->subprocess_env, OIDC_CURL_INTERFACE_ENV_VAR);
+}
+
+/*
+ * configure the CA bundle for SSL server certificate verification, falling
+ * back to the system curl-ca-bundle.crt on Windows when no explicit bundle
+ * was configured
+ */
+static void oidc_http_request_setup_ca_bundle(request_rec *r, CURL *curl, const oidc_cfg_t *c) {
+	// NB: the variable names r, curl, and code are used in the OIDC_HTTP_CURL_SETOPT macro
+	CURLcode code = CURLE_OK;
+
+	if (oidc_cfg_ca_bundle_path_get(c) != NULL) {
+		OIDC_HTTP_CURL_SETOPT(CURLOPT_CAINFO, oidc_cfg_ca_bundle_path_get(c));
+		return;
+	}
+
+#ifdef WIN32
+	DWORD buflen;
+	char *ptr = NULL;
+	char *retval = (char *)malloc(sizeof(TCHAR) * (MAX_PATH + 1));
+	retval[0] = '\0';
+	buflen = SearchPath(NULL, "curl-ca-bundle.crt", NULL, MAX_PATH + 1, retval, &ptr);
+	if (buflen > 0) {
+		OIDC_HTTP_CURL_SETOPT(CURLOPT_CAINFO, retval);
+	} else {
+		oidc_warn(r, "no curl-ca-bundle.crt file found in path");
+	}
+	free(retval);
+#endif
+}
+
+/*
+ * configure the curl handle to use the optional outgoing proxy, including
+ * its credentials and authentication type when supplied
+ */
+static void oidc_http_request_setup_proxy(request_rec *r, CURL *curl,
+					  const oidc_http_outgoing_proxy_t *outgoing_proxy) {
+	// NB: the variable names r, curl, and code are used in the OIDC_HTTP_CURL_SETOPT macro
+	CURLcode code = CURLE_OK;
+
+	if (outgoing_proxy->host_port == NULL)
+		return;
+
+	OIDC_HTTP_CURL_SETOPT(CURLOPT_PROXY, outgoing_proxy->host_port);
+	if (outgoing_proxy->username_password) {
+		OIDC_HTTP_CURL_SETOPT(CURLOPT_PROXYUSERPWD, outgoing_proxy->username_password);
+	}
+	if (outgoing_proxy->auth_type != (unsigned long)OIDC_CONFIG_POS_INT_UNSET) {
+		OIDC_HTTP_CURL_SETOPT(CURLOPT_PROXYAUTH, outgoing_proxy->auth_type);
+	}
+}
+
+/*
+ * build the list of custom request headers (authorization, content-type,
+ * traceparent, DPoP) to pass on to curl
+ */
+struct curl_slist *oidc_http_request_build_header_list(request_rec *r, const oidc_cfg_t *c, const char *content_type,
+						       const char *access_token, const char *dpop) {
+	struct curl_slist *h_list = NULL;
+
+	/* see if we need to add token in the Bearer/DPoP Authorization header */
+	if (access_token != NULL)
+		h_list = curl_slist_append(h_list, apr_psprintf(r->pool, "%s: %s %s", OIDC_HTTP_HDR_AUTHORIZATION,
+								dpop ? "DPoP" : "Bearer", access_token));
+
+	if (content_type != NULL)
+		h_list = curl_slist_append(h_list,
+					   apr_psprintf(r->pool, "%s: %s", OIDC_HTTP_HDR_CONTENT_TYPE, content_type));
+
+	const char *traceparent = oidc_http_hdr_in_traceparent_get(r);
+	if (traceparent && oidc_cfg_trace_parent_get(c) != OIDC_TRACE_PARENT_OFF) {
+		oidc_debug(r, "propagating traceparent header: %s", traceparent);
+		h_list =
+		    curl_slist_append(h_list, apr_psprintf(r->pool, "%s: %s", OIDC_HTTP_HDR_TRACE_PARENT, traceparent));
+	}
+
+	if (dpop != NULL) {
+		oidc_debug(r, "appending DPoP header (len=%d)", (int)_oidc_strlen(dpop));
+		h_list = curl_slist_append(h_list, apr_psprintf(r->pool, "%s: %s", OIDC_HTTP_HDR_DPOP, dpop));
+	}
+
+	return h_list;
+}
+
+/*
+ * pass cookies from the incoming request through to the curl handle by
+ * concatenating the configured cookies into a single Cookie header value
+ */
+static void oidc_http_request_pass_cookies(request_rec *r, CURL *curl, const apr_array_header_t *pass_cookies) {
+	// NB: the variable names r, curl, and code are used in the OIDC_HTTP_CURL_SETOPT macro
+	CURLcode code = CURLE_OK;
+	char *cookie_string = NULL;
+
+	if (pass_cookies == NULL)
+		return;
+
+	for (int i = 0; i < pass_cookies->nelts; i++) {
+		const char *cookie_name = APR_ARRAY_IDX(pass_cookies, i, const char *);
+		char *cookie_value = oidc_http_get_cookie(r, cookie_name);
+		if (cookie_value == NULL)
+			continue;
+		cookie_string = (cookie_string == NULL)
+				    ? apr_psprintf(r->pool, "%s=%s", cookie_name, cookie_value)
+				    : apr_psprintf(r->pool, "%s; %s=%s", cookie_string, cookie_name, cookie_value);
+	}
+
+	if (cookie_string == NULL)
+		return;
+
+	oidc_debug(r, "passing browser cookies on backend call: %s", cookie_string);
+	OIDC_HTTP_CURL_SETOPT(CURLOPT_COOKIE, cookie_string);
+}
+
+/*
+ * execute the curl request honoring the configured retry policy; retries
+ * are skipped on a request/transfer timeout and short-circuited on success
+ */
+static apr_byte_t oidc_http_request_perform_with_retries(request_rec *r, const oidc_cfg_t *c, CURL *curl,
+							 const char *url, const char *curl_err,
+							 const oidc_http_timeout_t *http_timeout) {
+	CURLcode res = CURLE_OK;
+
+	for (int i = 0; i <= http_timeout->retries; i++) {
+		res = curl_easy_perform(curl);
+		if (res == CURLE_OK)
+			return TRUE;
+		if (res == CURLE_OPERATION_TIMEDOUT) {
+			/* in case of a request/transfer timeout (which includes the connect timeout) we'll not retry */
+			oidc_error(r, "curl_easy_perform failed with a timeout for %s: [%s]; won't retry", url,
+				   curl_err[0] ? curl_err : "<n/a>");
+			OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_CONNECT_ERROR,
+						       curl_err[0] ? curl_err : "timeout");
+			return FALSE;
+		}
+		oidc_error(r, "curl_easy_perform(%d/%d) failed for %s with: [%s]", i + 1, http_timeout->retries + 1,
+			   url, curl_err[0] ? curl_err : "<n/a>");
+		OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_CONNECT_ERROR, curl_err[0] ? curl_err : "undefined");
+		/* in case of a connectivity/network glitch we'll back off before retrying */
+		if (i < http_timeout->retries)
+			apr_sleep(apr_time_from_msec(http_timeout->retry_interval));
+	}
+
+	return FALSE;
 }
 
 /*
@@ -699,7 +1046,7 @@ static const char *oidc_http_interface(request_rec *r) {
 static apr_byte_t oidc_http_request(request_rec *r, const char *url, const char *data, const char *content_type,
 				    const char *basic_auth, const char *access_token, const char *dpop,
 				    int ssl_validate_server, char **response, long *response_code,
-				    apr_hash_t *response_hdrs, oidc_http_timeout_t *http_timeout,
+				    apr_hash_t *response_hdrs, const oidc_http_timeout_t *http_timeout,
 				    const oidc_http_outgoing_proxy_t *outgoing_proxy,
 				    const apr_array_header_t *pass_cookies, const char *ssl_cert, const char *ssl_key,
 				    const char *ssl_key_pwd) {
@@ -711,26 +1058,31 @@ static apr_byte_t oidc_http_request(request_rec *r, const char *url, const char 
 	oidc_curl_resp_data_ctx_t d_buf = {r, NULL, 0};
 	oidc_curl_resp_hdr_ctx_t h_buf = {r, response_hdrs};
 	struct curl_slist *h_list = NULL;
-	int i = 0;
-	CURLcode res = CURLE_OK;
 	long http_code = 0;
 	apr_byte_t rv = FALSE;
-	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+	const oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 
 	/* do some logging about the inputs */
 	oidc_debug(r,
 		   "url=%s, data=%s, content_type=%s, basic_auth=%s, access_token=%s, dpop=%s, ssl_validate_server=%d, "
 		   "request_timeout=%d, connect_timeout=%d, retries=%d, retry_interval=%d, outgoing_proxy=%s:%s:%d, "
 		   "pass_cookies=%pp, ssl_cert=%s, ssl_key=%s, ssl_key_pwd=%s",
-		   url, data, content_type, basic_auth ? "****" : "null", access_token, dpop, ssl_validate_server,
-		   http_timeout->request_timeout, http_timeout->connect_timeout, http_timeout->retries,
-		   http_timeout->retry_interval, outgoing_proxy->host_port,
-		   outgoing_proxy->username_password ? "****" : "(null)", (int)outgoing_proxy->auth_type, pass_cookies,
-		   ssl_cert, ssl_key, ssl_key_pwd ? "****" : "(null)");
+		   url, oidc_http_redact_body_for_log(r, data), content_type, basic_auth ? "****" : "null",
+		   oidc_util_mask_value(r, access_token), dpop, ssl_validate_server, http_timeout->request_timeout,
+		   http_timeout->connect_timeout, http_timeout->retries, http_timeout->retry_interval,
+		   outgoing_proxy->host_port, outgoing_proxy->username_password ? "****" : "(null)",
+		   (int)outgoing_proxy->auth_type, pass_cookies, ssl_cert, ssl_key, ssl_key_pwd ? "****" : "(null)");
 
-	curl = curl_easy_init();
+	/* an endpoint that is not configured is a caller error, not a transfer failure: fail here rather
+	 * than hand curl a NULL URL and then back off and retry a request that can never be sent */
+	if (url == NULL) {
+		oidc_error(r, "no URL to send the request to: the endpoint is not configured");
+		return FALSE;
+	}
+
+	curl = oidc_http_curl_acquire();
 	if (curl == NULL) {
-		oidc_error(r, "curl_easy_init() error");
+		oidc_error(r, "could not obtain a curl handle");
 		goto end;
 	}
 
@@ -741,6 +1093,8 @@ static apr_byte_t oidc_http_request(request_rec *r, const char *url, const char 
 	OIDC_HTTP_CURL_SETOPT(CURLOPT_HEADER, 0L);
 	OIDC_HTTP_CURL_SETOPT(CURLOPT_NOPROGRESS, 1L);
 	OIDC_HTTP_CURL_SETOPT(CURLOPT_NOSIGNAL, 1L);
+	/* keep reused connections alive across the (potentially long) intervals between calls */
+	OIDC_HTTP_CURL_SETOPT(CURLOPT_TCP_KEEPALIVE, 1L);
 	OIDC_HTTP_CURL_SETOPT(CURLOPT_ERRORBUFFER, curl_err);
 	OIDC_HTTP_CURL_SETOPT(CURLOPT_FOLLOWLOCATION, 1L);
 	OIDC_HTTP_CURL_SETOPT(CURLOPT_MAXREDIRS, 5L);
@@ -775,25 +1129,7 @@ static apr_byte_t oidc_http_request(request_rec *r, const char *url, const char 
 
 	oidc_http_set_curl_ssl_options(r, curl);
 
-	if (oidc_cfg_ca_bundle_path_get(c) != NULL) {
-		OIDC_HTTP_CURL_SETOPT(CURLOPT_CAINFO, oidc_cfg_ca_bundle_path_get(c));
-	}
-
-#ifdef WIN32
-	else {
-		DWORD buflen;
-		char *ptr = NULL;
-		char *retval = (char *)malloc(sizeof(TCHAR) * (MAX_PATH + 1));
-		retval[0] = '\0';
-		buflen = SearchPath(NULL, "curl-ca-bundle.crt", NULL, MAX_PATH + 1, retval, &ptr);
-		if (buflen > 0) {
-			OIDC_HTTP_CURL_SETOPT(CURLOPT_CAINFO, retval);
-		} else {
-			oidc_warn(r, "no curl-ca-bundle.crt file found in path");
-		}
-		free(retval);
-	}
-#endif
+	oidc_http_request_setup_ca_bundle(r, curl, c);
 
 	/* identify this HTTP client */
 	const char *s_useragent = oidc_http_user_agent(r);
@@ -815,22 +1151,7 @@ static apr_byte_t oidc_http_request(request_rec *r, const char *url, const char 
 #endif
 	}
 
-	/* set optional outgoing proxy for the local network */
-	if (outgoing_proxy->host_port) {
-		OIDC_HTTP_CURL_SETOPT(CURLOPT_PROXY, outgoing_proxy->host_port);
-		if (outgoing_proxy->username_password) {
-			OIDC_HTTP_CURL_SETOPT(CURLOPT_PROXYUSERPWD, outgoing_proxy->username_password);
-		}
-		if (outgoing_proxy->auth_type != OIDC_CONFIG_POS_INT_UNSET) {
-			OIDC_HTTP_CURL_SETOPT(CURLOPT_PROXYAUTH, outgoing_proxy->auth_type);
-		}
-	}
-
-	/* see if we need to add token in the Bearer/DPoP Authorization header */
-	if (access_token != NULL) {
-		h_list = curl_slist_append(h_list, apr_psprintf(r->pool, "%s: %s %s", OIDC_HTTP_HDR_AUTHORIZATION,
-								dpop ? "DPoP" : "Bearer", access_token));
-	}
+	oidc_http_request_setup_proxy(r, curl, outgoing_proxy);
 
 	/* see if we need to perform HTTP basic authentication to the remote site */
 	if (basic_auth != NULL) {
@@ -849,82 +1170,23 @@ static apr_byte_t oidc_http_request(request_rec *r, const char *url, const char 
 	}
 
 	if (data != NULL) {
-		/* set POST data */
+		/* set POST data and switch HTTP method to POST */
 		OIDC_HTTP_CURL_SETOPT(CURLOPT_POSTFIELDS, data);
-		/* set HTTP method to POST */
 		OIDC_HTTP_CURL_SETOPT(CURLOPT_POST, 1L);
 	}
 
-	if (content_type != NULL) {
-		/* set content type */
-		h_list = curl_slist_append(h_list,
-					   apr_psprintf(r->pool, "%s: %s", OIDC_HTTP_HDR_CONTENT_TYPE, content_type));
-	}
-
-	const char *traceparent = oidc_http_hdr_in_traceparent_get(r);
-	if (traceparent && oidc_cfg_trace_parent_get(c) != OIDC_TRACE_PARENT_OFF) {
-		oidc_debug(r, "propagating traceparent header: %s", traceparent);
-		h_list =
-		    curl_slist_append(h_list, apr_psprintf(r->pool, "%s: %s", OIDC_HTTP_HDR_TRACE_PARENT, traceparent));
-	}
-
-	if (dpop != NULL) {
-		oidc_debug(r, "appending DPoP header (len=%d)", (int)_oidc_strlen(dpop));
-		h_list = curl_slist_append(h_list, apr_psprintf(r->pool, "%s: %s", OIDC_HTTP_HDR_DPOP, dpop));
-	}
-
-	/* see if we need to add any custom headers */
+	h_list = oidc_http_request_build_header_list(r, c, content_type, access_token, dpop);
 	if (h_list != NULL) {
 		OIDC_HTTP_CURL_SETOPT(CURLOPT_HTTPHEADER, h_list);
 	}
 
-	if (pass_cookies != NULL) {
-		/* gather cookies that we need to pass on from the incoming request */
-		char *cookie_string = NULL;
-		for (i = 0; i < pass_cookies->nelts; i++) {
-			const char *cookie_name = APR_ARRAY_IDX(pass_cookies, i, const char *);
-			char *cookie_value = oidc_http_get_cookie(r, cookie_name);
-			if (cookie_value != NULL) {
-				cookie_string =
-				    (cookie_string == NULL)
-					? apr_psprintf(r->pool, "%s=%s", cookie_name, cookie_value)
-					: apr_psprintf(r->pool, "%s; %s=%s", cookie_string, cookie_name, cookie_value);
-			}
-		}
-
-		/* see if we need to pass any cookies */
-		if (cookie_string != NULL) {
-			oidc_debug(r, "passing browser cookies on backend call: %s", cookie_string);
-			OIDC_HTTP_CURL_SETOPT(CURLOPT_COOKIE, cookie_string);
-		}
-	}
+	oidc_http_request_pass_cookies(r, curl, pass_cookies);
 
 	/* set the target URL */
 	OIDC_HTTP_CURL_SETOPT(CURLOPT_URL, url);
 
 	/* call it and record the result */
-	for (i = 0; i <= http_timeout->retries; i++) {
-		res = curl_easy_perform(curl);
-		if (res == CURLE_OK) {
-			rv = TRUE;
-			break;
-		}
-		if (res == CURLE_OPERATION_TIMEDOUT) {
-			/* in case of a request/transfer timeout (which includes the connect timeout) we'll not
-			 * retry */
-			oidc_error(r, "curl_easy_perform failed with a timeout for %s: [%s]; won't retry", url,
-				   curl_err[0] ? curl_err : "<n/a>");
-			OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_CONNECT_ERROR,
-						       curl_err[0] ? curl_err : "timeout")
-			break;
-		}
-		oidc_error(r, "curl_easy_perform(%d/%d) failed for %s with: [%s]", i + 1, http_timeout->retries + 1,
-			   url, curl_err[0] ? curl_err : "<n/a>");
-		OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_CONNECT_ERROR, curl_err[0] ? curl_err : "undefined")
-		/* in case of a connectivity/network glitch we'll back off before retrying */
-		if (i < http_timeout->retries)
-			apr_sleep(apr_time_from_msec(http_timeout->retry_interval));
-	}
+	rv = oidc_http_request_perform_with_retries(r, c, curl, url, curl_err, http_timeout);
 	if (rv == FALSE)
 		goto end;
 
@@ -937,16 +1199,17 @@ static apr_byte_t oidc_http_request(request_rec *r, const char *url, const char 
 	if (response_code)
 		*response_code = http_code;
 
-	/* set and log the response */
-	oidc_debug(r, "response=%s", *response ? *response : "");
+	/* set and log the response; the token, introspection and registration responses carry
+	 * credentials, so redact them the way the request body above already is */
+	oidc_debug(r, "response=%s", oidc_http_redact_json_for_log(r, *response ? *response : ""));
 
 end:
 
-	/* cleanup and return the result */
+	/* cleanup and return the result; a handle that performed successfully goes back to the
+	 * pool with its connection kept alive for the next request to the same endpoint */
 	if (h_list != NULL)
 		curl_slist_free_all(h_list);
-	if (curl != NULL)
-		curl_easy_cleanup(curl);
+	oidc_http_curl_release(curl, rv);
 
 	return rv;
 }
@@ -956,10 +1219,10 @@ end:
  */
 apr_byte_t oidc_http_get(request_rec *r, const char *url, const apr_table_t *params, const char *basic_auth,
 			 const char *access_token, const char *dpop, int ssl_validate_server, char **response,
-			 long *response_code, apr_hash_t *response_hdrs, oidc_http_timeout_t *http_timeout,
+			 long *response_code, apr_hash_t *response_hdrs, const oidc_http_timeout_t *http_timeout,
 			 const oidc_http_outgoing_proxy_t *outgoing_proxy, const apr_array_header_t *pass_cookies,
 			 const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd) {
-	char *query_url = oidc_http_query_encoded_url(r, url, params);
+	const char *query_url = oidc_http_query_encoded_url(r, url, params);
 	return oidc_http_request(r, query_url, NULL, NULL, basic_auth, access_token, dpop, ssl_validate_server,
 				 response, response_code, response_hdrs, http_timeout, outgoing_proxy, pass_cookies,
 				 ssl_cert, ssl_key, ssl_key_pwd);
@@ -970,10 +1233,10 @@ apr_byte_t oidc_http_get(request_rec *r, const char *url, const apr_table_t *par
  */
 apr_byte_t oidc_http_post_form(request_rec *r, const char *url, const apr_table_t *params, const char *basic_auth,
 			       const char *access_token, const char *dpop, int ssl_validate_server, char **response,
-			       long *response_code, apr_hash_t *response_hdrs, oidc_http_timeout_t *http_timeout,
+			       long *response_code, apr_hash_t *response_hdrs, const oidc_http_timeout_t *http_timeout,
 			       const oidc_http_outgoing_proxy_t *outgoing_proxy, const apr_array_header_t *pass_cookies,
 			       const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd) {
-	char *data = oidc_http_form_encoded_data(r, params);
+	const char *data = oidc_http_form_encoded_data(r, params);
 	return oidc_http_request(r, url, data, OIDC_HTTP_CONTENT_TYPE_FORM_ENCODED, basic_auth, access_token, dpop,
 				 ssl_validate_server, response, response_code, response_hdrs, http_timeout,
 				 outgoing_proxy, pass_cookies, ssl_cert, ssl_key, ssl_key_pwd);
@@ -982,12 +1245,13 @@ apr_byte_t oidc_http_post_form(request_rec *r, const char *url, const apr_table_
 /*
  * execute HTTP POST request with JSON-encoded data
  */
-apr_byte_t oidc_http_post_json(request_rec *r, const char *url, json_t *json, const char *basic_auth,
+apr_byte_t oidc_http_post_json(request_rec *r, const char *url, const oidc_json_t *json, const char *basic_auth,
 			       const char *access_token, const char *dpop, int ssl_validate_server, char **response,
-			       long *response_code, apr_hash_t *response_hdrs, oidc_http_timeout_t *http_timeout,
+			       long *response_code, apr_hash_t *response_hdrs, const oidc_http_timeout_t *http_timeout,
 			       const oidc_http_outgoing_proxy_t *outgoing_proxy, const apr_array_header_t *pass_cookies,
 			       const char *ssl_cert, const char *ssl_key, const char *ssl_key_pwd) {
-	char *data = json != NULL ? oidc_util_json_encode(r->pool, json, JSON_PRESERVE_ORDER | JSON_COMPACT) : NULL;
+	const char *data =
+	    json != NULL ? oidc_json_encode(r->pool, json, OIDC_JSON_PRESERVE_ORDER | OIDC_JSON_COMPACT) : NULL;
 	return oidc_http_request(r, url, data, OIDC_HTTP_CONTENT_TYPE_JSON, basic_auth, access_token, dpop,
 				 ssl_validate_server, response, response_code, response_hdrs, http_timeout,
 				 outgoing_proxy, pass_cookies, ssl_cert, ssl_key, ssl_key_pwd);
@@ -998,7 +1262,7 @@ apr_byte_t oidc_http_post_json(request_rec *r, const char *url, json_t *json, co
  */
 static char *oidc_http_get_path(request_rec *r) {
 	size_t i;
-	char *p;
+	const char *p;
 	p = r->parsed_uri.path;
 	if ((p == NULL) || (p[0] == '\0'))
 		return apr_pstrdup(r->pool, OIDC_STR_FORWARD_SLASH);
@@ -1067,7 +1331,7 @@ static const char *oidc_http_set_cookie_append_value(request_rec *r) {
 void oidc_http_set_cookie(request_rec *r, const char *cookieName, const char *cookieValue, apr_time_t expires,
 			  const char *ext) {
 
-	oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+	const oidc_cfg_t *c = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 	char *headerString = NULL;
 	char *expiresString = NULL;
 	const char *appendString = NULL;
@@ -1127,7 +1391,7 @@ void oidc_http_set_cookie(request_rec *r, const char *cookieName, const char *co
  * get a cookie from the HTTP request
  */
 char *oidc_http_get_cookie(request_rec *r, const char *cookieName) {
-	char *cookie = NULL;
+	const char *cookie = NULL;
 	char *tokenizerCtx = NULL;
 	char *rv = NULL;
 
@@ -1161,13 +1425,19 @@ char *oidc_http_get_cookie(request_rec *r, const char *cookieName) {
 	}
 
 	/* log what we've found */
-	oidc_debug(r, "returning \"%s\" = %s", cookieName, rv ? apr_psprintf(r->pool, "\"%s\"", rv) : "<null>");
+	/* in client-cookie session mode the value is the whole session credential */
+	oidc_debug(r, "returning \"%s\" = %s", cookieName,
+		   rv ? apr_psprintf(r->pool, "\"%s\"", oidc_util_mask_value(r, rv)) : "<null>");
 
 	return rv;
 }
 
 #define OIDC_HTTP_COOKIE_CHUNKS_SEPARATOR "_"
 #define OIDC_HTTP_COOKIE_CHUNKS_POSTFIX "chunks"
+
+/* the largest number of chunks a chunked cookie may be split over; the counter cookie holds it as
+ * a decimal number, so this bounds both what is written and what is accepted on the way back in */
+#define OIDC_HTTP_COOKIE_CHUNKS_MAX 99
 
 /*
  * get the name of the cookie that contains the number of chunks
@@ -1182,7 +1452,7 @@ static char *oidc_http_get_chunk_count_name(request_rec *r, const char *cookieNa
  */
 static int oidc_http_get_chunked_count(request_rec *r, const char *cookieName) {
 	int chunkCount = 0;
-	char *chunkCountValue = oidc_http_get_cookie(r, oidc_http_get_chunk_count_name(r, cookieName));
+	const char *chunkCountValue = oidc_http_get_cookie(r, oidc_http_get_chunk_count_name(r, cookieName));
 	chunkCount = _oidc_str_to_int(chunkCountValue, 0);
 	return chunkCount;
 }
@@ -1198,22 +1468,25 @@ static char *oidc_http_get_chunk_cookie_name(request_rec *r, const char *cookieN
  * get a cookie value that is split over a number of chunked cookies
  */
 char *oidc_http_get_chunked_cookie(request_rec *r, const char *cookieName, int chunkSize) {
-	char *cookieValue = NULL, *chunkValue = NULL;
-	int chunkCount = 0, i = 0;
+	char *cookieValue = NULL;
+	char *chunkValue = NULL;
+	int chunkCount = 0;
 	if (chunkSize == 0)
 		return oidc_http_get_cookie(r, cookieName);
 	chunkCount = oidc_http_get_chunked_count(r, cookieName);
 	if (chunkCount == 0)
 		return oidc_http_get_cookie(r, cookieName);
-	if ((chunkCount < 0) || (chunkCount > 99)) {
+	if ((chunkCount < 0) || (chunkCount > OIDC_HTTP_COOKIE_CHUNKS_MAX)) {
 		oidc_warn(r, "chunk count out of bounds: %d", chunkCount);
 		return NULL;
 	}
-	for (i = 0; i < chunkCount; i++) {
+	for (int i = 0; i < chunkCount; i++) {
 		chunkValue = oidc_http_get_cookie(r, oidc_http_get_chunk_cookie_name(r, cookieName, i));
 		if (chunkValue == NULL) {
+			/* refuse a partial assembly: a truncated value would fail session decode (or worse)
+			 * and leave the browser stuck resubmitting the broken cookie set */
 			oidc_warn(r, "could not find chunk %d; aborting", i);
-			break;
+			return NULL;
 		}
 		cookieValue = apr_psprintf(r->pool, "%s%s", cookieValue ? cookieValue : "", chunkValue);
 	}
@@ -1225,10 +1498,9 @@ char *oidc_http_get_chunked_cookie(request_rec *r, const char *cookieName, int c
  */
 static void oidc_http_clear_chunked_cookie(request_rec *r, const char *cookieName, apr_time_t expires,
 					   const char *ext) {
-	int i = 0;
 	int chunkCount = oidc_http_get_chunked_count(r, cookieName);
 	if (chunkCount > 0) {
-		for (i = 0; i < chunkCount; i++)
+		for (int i = 0; i < chunkCount; i++)
 			oidc_http_set_cookie(r, oidc_http_get_chunk_cookie_name(r, cookieName, i), "", expires, ext);
 		oidc_http_set_cookie(r, oidc_http_get_chunk_count_name(r, cookieName), "", expires, ext);
 	}
@@ -1237,30 +1509,42 @@ static void oidc_http_clear_chunked_cookie(request_rec *r, const char *cookieNam
 /*
  * set a cookie value that is split over a number of chunked cookies
  */
-void oidc_http_set_chunked_cookie(request_rec *r, const char *cookieName, const char *cookieValue, apr_time_t expires,
-				  int chunkSize, const char *ext) {
-	int i = 0;
-	int cookieLength = _oidc_strlen(cookieValue);
-	char *chunkValue = NULL;
+apr_byte_t oidc_http_set_chunked_cookie(request_rec *r, const char *cookieName, const char *cookieValue,
+					apr_time_t expires, int chunkSize, const char *ext) {
+	int cookieLength = (int)_oidc_strlen(cookieValue);
+	const char *chunkValue = NULL;
 
 	/* see if we need to chunk at all */
 	if ((chunkSize == 0) || ((cookieLength > 0) && (cookieLength < chunkSize))) {
 		oidc_http_set_cookie(r, cookieName, cookieValue, expires, ext);
 		oidc_http_clear_chunked_cookie(r, cookieName, expires, ext);
-		return;
+		return TRUE;
 	}
 
 	/* see if we need to clear a possibly chunked cookie */
 	if (cookieLength == 0) {
 		oidc_http_set_cookie(r, cookieName, "", expires, ext);
 		oidc_http_clear_chunked_cookie(r, cookieName, expires, ext);
-		return;
+		return TRUE;
 	}
 
-	/* set a chunked cookie */
-	int chunkCountValue = cookieLength / chunkSize + 1;
+	/* Use ceil division without advertising a trailing empty chunk for exact multiples. */
+	int chunkCountValue = (cookieLength + chunkSize - 1) / chunkSize;
+
+	/* refuse to write what oidc_http_get_chunked_cookie would refuse to read back: writing it
+	 * anyway leaves the browser holding a value that is dropped on the next request, which for a
+	 * client-side session means authenticating over and over rather than a visible failure */
+	if (chunkCountValue > OIDC_HTTP_COOKIE_CHUNKS_MAX) {
+		oidc_error(r,
+			   "cookie \"%s\" would have to be split over %d chunks, which is more than the maximum of "
+			   "%d; increase " OIDCSessionCookieChunkSize " (currently %d) or store the session in a "
+			   "server-side cache with " OIDCSessionType " \"server-cache\"",
+			   cookieName, chunkCountValue, OIDC_HTTP_COOKIE_CHUNKS_MAX, chunkSize);
+		return FALSE;
+	}
+
 	const char *ptr = cookieValue;
-	for (i = 0; i < chunkCountValue; i++) {
+	for (int i = 0; i < chunkCountValue; i++) {
 		chunkValue = apr_pstrndup(r->pool, ptr, chunkSize);
 		ptr += chunkSize;
 		oidc_http_set_cookie(r, oidc_http_get_chunk_cookie_name(r, cookieName, i), chunkValue, expires, ext);
@@ -1268,6 +1552,8 @@ void oidc_http_set_chunked_cookie(request_rec *r, const char *cookieName, const 
 	oidc_http_set_cookie(r, oidc_http_get_chunk_count_name(r, cookieName),
 			     apr_psprintf(r->pool, "%d", chunkCountValue), expires, ext);
 	oidc_http_set_cookie(r, cookieName, "", expires, ext);
+
+	return TRUE;
 }
 
 /*
@@ -1316,4 +1602,90 @@ void oidc_http_init(void) {
  */
 void oidc_http_cleanup(void) {
 	curl_global_cleanup();
+}
+
+/* Pool reset handles to retain their connection, DNS, and TLS caches. */
+#define OIDC_HTTP_CURL_POOL_MAX 16
+
+static CURL *_oidc_http_curl_pool[OIDC_HTTP_CURL_POOL_MAX];
+static int _oidc_http_curl_pool_num = 0;
+static apr_byte_t _oidc_http_curl_pool_enabled = FALSE;
+#if APR_HAS_THREADS
+static apr_thread_mutex_t *_oidc_http_curl_pool_mutex = NULL;
+#endif
+
+static void oidc_http_curl_pool_lock(void) {
+#if APR_HAS_THREADS
+	apr_thread_mutex_lock(_oidc_http_curl_pool_mutex);
+#endif
+}
+
+static void oidc_http_curl_pool_unlock(void) {
+#if APR_HAS_THREADS
+	apr_thread_mutex_unlock(_oidc_http_curl_pool_mutex);
+#endif
+}
+
+static apr_status_t oidc_http_curl_pool_cleanup(void *data) {
+	for (int i = 0; i < _oidc_http_curl_pool_num; i++)
+		curl_easy_cleanup(_oidc_http_curl_pool[i]);
+	_oidc_http_curl_pool_num = 0;
+	_oidc_http_curl_pool_enabled = FALSE;
+#if APR_HAS_THREADS
+	_oidc_http_curl_pool_mutex = NULL;
+#endif
+	return APR_SUCCESS;
+}
+
+void oidc_http_curl_pool_init(apr_pool_t *pool) {
+	if (_oidc_http_curl_pool_enabled == TRUE)
+		return;
+#if APR_HAS_THREADS
+	if (apr_thread_mutex_create(&_oidc_http_curl_pool_mutex, APR_THREAD_MUTEX_DEFAULT, pool) != APR_SUCCESS)
+		return;
+#endif
+	_oidc_http_curl_pool_num = 0;
+	_oidc_http_curl_pool_enabled = TRUE;
+	apr_pool_cleanup_register(pool, NULL, oidc_http_curl_pool_cleanup, apr_pool_cleanup_null);
+}
+
+/*
+ * forget any handles inherited over fork(): their connections share file descriptors and TLS
+ * state with the parent, so the child must neither use nor curl_easy_cleanup them (a cleanup
+ * would write a TLS close-notify into a socket the parent may still be using)
+ */
+void oidc_http_curl_pool_child_init(void) {
+	_oidc_http_curl_pool_num = 0;
+}
+
+static CURL *oidc_http_curl_acquire(void) {
+	CURL *curl = NULL;
+	if (_oidc_http_curl_pool_enabled == FALSE)
+		return curl_easy_init();
+	oidc_http_curl_pool_lock();
+	if (_oidc_http_curl_pool_num > 0)
+		curl = _oidc_http_curl_pool[--_oidc_http_curl_pool_num];
+	oidc_http_curl_pool_unlock();
+	return (curl != NULL) ? curl : curl_easy_init();
+}
+
+/*
+ * return a handle to the pool after a successful request: the reset clears its options but
+ * keeps the connection/DNS/TLS-session caches; a handle whose request failed is destroyed
+ * rather than reused so a poisoned connection state cannot carry over
+ */
+static void oidc_http_curl_release(CURL *curl, apr_byte_t reuse) {
+	if (curl == NULL)
+		return;
+	if ((reuse == TRUE) && (_oidc_http_curl_pool_enabled == TRUE)) {
+		curl_easy_reset(curl);
+		oidc_http_curl_pool_lock();
+		if (_oidc_http_curl_pool_num < OIDC_HTTP_CURL_POOL_MAX) {
+			_oidc_http_curl_pool[_oidc_http_curl_pool_num++] = curl;
+			curl = NULL;
+		}
+		oidc_http_curl_pool_unlock();
+	}
+	if (curl != NULL)
+		curl_easy_cleanup(curl);
 }

@@ -44,8 +44,19 @@ restrictions:
 #define OIDC_UTIL_REGEXP_MATCH_SIZE 30
 #define OIDC_UTIL_REGEXP_MATCH_NR 1
 
+/* first guess at the size of a substitution result; PCRE2_SUBSTITUTE_OVERFLOW_LENGTH reports what
+ * is actually needed when this falls short, so it is a starting point and not a limit */
+#define OIDC_PCRE_SUBST_INITIAL_BUF_LEN 1024
+
+/* the longest input oidc_util_regexp_substitute will operate on: a bound on the work that a single
+ * (possibly attacker-influenced) claim value can cause, not a constraint of the library */
+#define OIDC_PCRE_SUBST_MAX_INPUT_LEN 4096
+
 struct oidc_pcre;
 
+/* compile `regexp`; `error_str` is optional (pass NULL to not have a failure message built). Nothing
+ * is allocated from `pool` unless the compile succeeds, so failing is free for a caller that hands
+ * in a long-lived pool */
 struct oidc_pcre *oidc_pcre_compile(apr_pool_t *pool, const char *regexp, char **error_str);
 char *oidc_pcre_subst(apr_pool_t *pool, const struct oidc_pcre *, const char *, int, const char *);
 int oidc_pcre_exec(apr_pool_t *, struct oidc_pcre *, const char *, int, char **);

@@ -41,6 +41,7 @@
  */
 
 #include "util/util.h"
+#include "util/util_cfg.h"
 
 #include <http_protocol.h>
 
@@ -179,18 +180,19 @@ const char *oidc_util_url_cur_host(request_rec *r, oidc_hdr_x_forwarded_t x_forw
 	if (host_str == NULL)
 		host_str = oidc_http_hdr_in_host_get(r);
 	if (host_str) {
-		host_str = apr_pstrdup(r->pool, host_str);
+		char *dup = apr_pstrdup(r->pool, host_str);
 
-		if (host_str[0] == '[') {
-			p = strchr(host_str, ']');
+		if (dup[0] == '[') {
+			p = strchr(dup, ']');
 			if (p)
 				p = strchr(p, OIDC_CHAR_COLON);
 		} else {
-			p = strchr(host_str, OIDC_CHAR_COLON);
+			p = strchr(dup, OIDC_CHAR_COLON);
 		}
 
 		if (p != NULL)
 			*p = '\0';
+		host_str = dup;
 	} else {
 		/* no Host header, HTTP 1.0 */
 		host_str = ap_get_server_name(r);
@@ -215,7 +217,7 @@ static const char *_oidc_util_url_base_cur(request_rec *r, oidc_hdr_x_forwarded_
 	port_str = _oidc_util_url_cur_port(r, scheme_str, x_forwarded_headers);
 	port_str = port_str ? apr_psprintf(r->pool, ":%s", port_str) : "";
 
-	char *url = apr_pstrcat(r->pool, scheme_str, "://", host_str, port_str, NULL);
+	const char *url = apr_pstrcat(r->pool, scheme_str, "://", host_str, port_str, NULL);
 
 	return url;
 }
@@ -231,7 +233,7 @@ char *oidc_util_url_cur(request_rec *r, oidc_hdr_x_forwarded_t x_forwarded_heade
 	path = r->uri;
 
 	/* check if we're dealing with a forward proxying secenario i.e. a non-relative URL */
-	if ((path) && (path[0] != '/')) {
+	if (path && (path[0] != '/')) {
 		_oidc_memset(&uri, 0, sizeof(apr_uri_t));
 		if (apr_uri_parse(r->pool, r->uri, &uri) == APR_SUCCESS)
 			path = apr_pstrcat(r->pool, uri.path, (r->args != NULL && *r->args != '\0' ? "?" : ""), r->args,
@@ -253,7 +255,7 @@ char *oidc_util_url_cur(request_rec *r, oidc_hdr_x_forwarded_t x_forwarded_heade
 /*
  * infer a full absolute URL from the (optional) relative one
  */
-const char *oidc_util_url_abs(request_rec *r, oidc_cfg_t *cfg, const char *url) {
+const char *oidc_util_url_abs(request_rec *r, const oidc_cfg_t *cfg, const char *url) {
 	if ((url != NULL) && (url[0] == OIDC_CHAR_FORWARD_SLASH)) {
 		url =
 		    apr_pstrcat(r->pool, _oidc_util_url_base_cur(r, oidc_cfg_x_forwarded_headers_get(cfg)), url, NULL);
@@ -265,14 +267,14 @@ const char *oidc_util_url_abs(request_rec *r, oidc_cfg_t *cfg, const char *url) 
 /*
  * check if the request is on a secure HTTPs (TLS) connection
  */
-apr_byte_t oidc_util_url_cur_is_secure(request_rec *r, oidc_cfg_t *c) {
+apr_byte_t oidc_util_url_cur_is_secure(const request_rec *r, const oidc_cfg_t *c) {
 	return (_oidc_strnatcasecmp("https", _oidc_util_url_cur_scheme(r, oidc_cfg_x_forwarded_headers_get(c))) == 0);
 }
 
 /*
  * return absolute Redirect URI
  */
-const char *oidc_util_url_redirect_uri(request_rec *r, oidc_cfg_t *cfg) {
+const char *oidc_util_url_redirect_uri(request_rec *r, const oidc_cfg_t *cfg) {
 	return oidc_util_url_abs(r, cfg, oidc_cfg_dir_redirect_uri_get(r));
 }
 
@@ -293,7 +295,7 @@ apr_byte_t oidc_util_url_cur_matches(request_rec *r, const char *url) {
 /*
  * see if the currently accessed path matches the Redirect URI
  */
-apr_byte_t oidc_util_url_matches_redirect_uri(request_rec *r, oidc_cfg_t *cfg) {
+apr_byte_t oidc_util_url_matches_redirect_uri(request_rec *r, const oidc_cfg_t *cfg) {
 	return oidc_util_url_cur_matches(r, oidc_util_url_redirect_uri(r, cfg));
 }
 
@@ -313,7 +315,7 @@ apr_byte_t oidc_util_url_has_parameter(request_rec *r, const char *param) {
  */
 apr_byte_t oidc_util_url_parameter_get(request_rec *r, char *name, char **value) {
 	char *tokenizer_ctx = NULL;
-	char *p = NULL;
+	const char *p = NULL;
 	char *args = NULL;
 	const char *k_param = apr_psprintf(r->pool, "%s=", name);
 	const size_t k_param_sz = _oidc_strlen(k_param);
@@ -326,14 +328,17 @@ apr_byte_t oidc_util_url_parameter_get(request_rec *r, char *name, char **value)
 	/* not sure why we do this, but better be safe than sorry */
 	args = apr_pstrmemdup(r->pool, r->args, _oidc_strlen(r->args));
 
+	/* a while() (not a do/while): when r->args is only separators, e.g. "&", the first apr_strtok
+	 * returns NULL without setting tokenizer_ctx, and a further apr_strtok(NULL, ...) would then
+	 * dereference a NULL context -- a crash reachable from any query-parameter read */
 	p = apr_strtok(args, OIDC_STR_AMP, &tokenizer_ctx);
-	do {
-		if (p && _oidc_strncmp(p, k_param, k_param_sz) == 0) {
+	while (p != NULL) {
+		if (_oidc_strncmp(p, k_param, k_param_sz) == 0) {
 			*value = apr_pstrdup(r->pool, p + k_param_sz);
 			*value = oidc_http_url_decode(r, *value);
 		}
 		p = apr_strtok(NULL, OIDC_STR_AMP, &tokenizer_ctx);
-	} while (p);
+	}
 
 	return (*value != NULL ? TRUE : FALSE);
 }

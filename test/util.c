@@ -44,10 +44,63 @@
 #include "util.h"
 #include "cfg/cfg_int.h"
 #include "cfg/dir.h"
+#include "handle/handle.h"
+#include "metadata.h"
+#include "proto/proto.h"
+#include "session.h"
+#include "util/util.h"
 #include <openssl/evp.h>
 
+/* Per-test fixture state; module-level test statics need their own CK_FORK=no reset. */
 static apr_pool_t *pool = NULL;
 static request_rec *request = NULL;
+
+/* Cache PBKDF2 by secret across tests; direct KDF tests bypass this optimization. */
+#define OIDC_TEST_KDF_CACHE_MAX 32
+static struct {
+	char secret[128];
+	unsigned char key[OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN];
+} oidc_test_kdf_cache[OIDC_TEST_KDF_CACHE_MAX];
+static int oidc_test_kdf_cache_n = 0;
+
+static apr_byte_t oidc_test_key_derive_cached(const char *secret, unsigned char *out) {
+	int i;
+	for (i = 0; i < oidc_test_kdf_cache_n; i++) {
+		if (_oidc_strcmp(oidc_test_kdf_cache[i].secret, secret) == 0) {
+			_oidc_memcpy(out, oidc_test_kdf_cache[i].key, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN);
+			return TRUE;
+		}
+	}
+	if (oidc_util_key_derive_passphrase_key(secret, out, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN) == FALSE)
+		return FALSE;
+	if ((oidc_test_kdf_cache_n < OIDC_TEST_KDF_CACHE_MAX) &&
+	    (_oidc_strlen(secret) < sizeof(oidc_test_kdf_cache[0].secret))) {
+		_oidc_strcpy(oidc_test_kdf_cache[oidc_test_kdf_cache_n].secret, secret);
+		_oidc_memcpy(oidc_test_kdf_cache[oidc_test_kdf_cache_n].key, out,
+			     OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN);
+		oidc_test_kdf_cache_n++;
+	}
+	return TRUE;
+}
+
+/*
+ * test-only drop-in for oidc_cfg_crypto_passphrase_derive_keys()/oidc_crypto_passphrase_derive_keys()
+ * that routes the actual KDF work through the cache above; same semantics (skips a slot whose
+ * *_set flag is already TRUE, treats an empty secret as "not configured").
+ */
+static apr_byte_t oidc_test_crypto_passphrase_derive_keys_cached(oidc_crypto_passphrase_t *cp) {
+	if ((cp->secret1 != NULL) && (_oidc_strlen(cp->secret1) > 0) && (cp->derived_key1_set == FALSE)) {
+		if (oidc_test_key_derive_cached(cp->secret1, cp->derived_key1) == FALSE)
+			return FALSE;
+		cp->derived_key1_set = TRUE;
+	}
+	if ((cp->secret2 != NULL) && (_oidc_strlen(cp->secret2) > 0) && (cp->derived_key2_set == FALSE)) {
+		if (oidc_test_key_derive_cached(cp->secret2, cp->derived_key2) == FALSE)
+			return FALSE;
+		cp->derived_key2_set = TRUE;
+	}
+	return TRUE;
+}
 
 static request_rec *oidc_test_request_init(apr_pool_t *pool) {
 	const unsigned int kIdx = 0;
@@ -76,6 +129,10 @@ static request_rec *oidc_test_request_init(apr_pool_t *pool) {
 	request->connection = apr_pcalloc(pool, sizeof(struct conn_rec));
 	request->connection->bucket_alloc = apr_bucket_alloc_create(pool);
 	request->connection->local_addr = apr_pcalloc(pool, sizeof(apr_sockaddr_t));
+	/* minimal output filter carrying the request so the ap_pass_brigade stub
+	 * can capture sent response bodies into the "sent_body" request state */
+	request->output_filters = apr_pcalloc(pool, sizeof(ap_filter_t));
+	request->output_filters->r = request;
 
 	apr_pool_userdata_set("https", "scheme", NULL, request->pool);
 	request->server->server_hostname = "www.example.com";
@@ -109,15 +166,34 @@ static request_rec *oidc_test_request_init(apr_pool_t *pool) {
 	cfg->private_keys = apr_array_make(request->server->process->pconf, 1, sizeof(const char *));
 
 	cfg->crypto_passphrase.secret1 = "12345678901234567890123456789012";
+	if (oidc_test_crypto_passphrase_derive_keys_cached(&cfg->crypto_passphrase) == FALSE) {
+		fprintf(stderr, "oidc_cfg_crypto_passphrase_derive_keys failed!\n");
+		exit(-1);
+	}
 	cfg->cache.impl = &oidc_cache_shm;
 	cfg->cache.cfg = NULL;
 	cfg->cache.shm_size_max = 500;
+	const char *shm_size = getenv("OIDC_TEST_SHM_SIZE");
+	if (shm_size != NULL) {
+		char *end = NULL;
+		long parsed = strtol(shm_size, &end, 10);
+		if ((end != shm_size) && (*end == '\0') && (parsed >= 128) && (parsed <= 1000000))
+			cfg->cache.shm_size_max = (int)parsed;
+	}
 	cfg->cache.shm_entry_size_max = 16384 + 255 + 17;
 	cfg->cache.encrypt = 1;
-	if (cfg->cache.impl->post_config(request->server->process->pconf, request->server) != OK) {
-		fprintf(stderr, "cfg->cache.impl->post_config failed!\n");
+	/* full post-config so the cache backend AND the shared refresh-grant mutex get set up */
+	if (oidc_cfg_post_config(request->server->process->pconf, cfg, request->server) != OK) {
+		fprintf(stderr, "oidc_cfg_post_config failed!\n");
 		exit(-1);
 	}
+
+	if (oidc_cfg_dir_post_config(request->server) != OK) {
+		fprintf(stderr, "oidc_cfg_dir_post_config failed!\n");
+		exit(-1);
+	}
+
+	oidc_http_curl_pool_init(request->server->process->pconf);
 
 	return request;
 }
@@ -125,24 +201,34 @@ static request_rec *oidc_test_request_init(apr_pool_t *pool) {
 void oidc_test_setup(void) {
 	apr_initialize();
 	oidc_pre_config_init();
+	/* reset the stubbed AuthType so a test that changed it does not leak into
+	 * the next one under CK_FORK=no */
+	oidc_test_set_auth_type(NULL);
 	apr_pool_create(&pool, NULL);
 	request = oidc_test_request_init(pool);
 }
 
 void oidc_test_teardown(void) {
+	/* release the process-wide refresh mutex before apr_terminate frees its pool */
+	if (request != NULL) {
+		oidc_cfg_t *cfg = oidc_test_cfg_get();
+		oidc_cfg_process_cleanup(cfg, request->server);
+	}
 	EVP_cleanup();
 	apr_terminate();
+	request = NULL;
+	pool = NULL;
 }
 
-apr_pool_t *oidc_test_pool_get() {
+apr_pool_t *oidc_test_pool_get(void) {
 	return pool;
 }
 
-request_rec *oidc_test_request_get() {
+request_rec *oidc_test_request_get(void) {
 	return request;
 }
 
-oidc_cfg_t *oidc_test_cfg_get() {
+oidc_cfg_t *oidc_test_cfg_get(void) {
 	return (oidc_cfg_t *)ap_get_module_config(request->server->module_config, &auth_openidc_module);
 }
 
@@ -155,4 +241,14 @@ cmd_parms *oidc_test_cmd_get(const char *primitive) {
 	cmd->directive = apr_pcalloc(cmd->pool, sizeof(ap_directive_t));
 	cmd->directive->directive = primitive;
 	return cmd;
+}
+
+/* Re-derive keys after tests directly replace passphrase secrets at runtime. */
+void oidc_test_crypto_passphrase_rederive(oidc_cfg_t *cfg) {
+	cfg->crypto_passphrase.derived_key1_set = FALSE;
+	cfg->crypto_passphrase.derived_key2_set = FALSE;
+	if (oidc_test_crypto_passphrase_derive_keys_cached(&cfg->crypto_passphrase) == FALSE) {
+		fprintf(stderr, "oidc_cfg_crypto_passphrase_derive_keys failed!\n");
+		exit(-1);
+	}
 }

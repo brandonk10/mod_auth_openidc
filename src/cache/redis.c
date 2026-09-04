@@ -45,6 +45,7 @@
 
 #include "cache/redis.h"
 #include "cfg/cfg_int.h"
+#include "metrics.h"
 
 #define REDIS_CONNECT_TIMEOUT_DEFAULT 5
 #define REDIS_TIMEOUT_DEFAULT 5
@@ -67,6 +68,12 @@ static oidc_cache_cfg_redis_t *oidc_cache_redis_cfg_create(apr_pool_t *pool) {
 	context->host_str = NULL;
 	context->port = 0;
 	context->rctx = NULL;
+	/*
+	 * Derived backends start in serialized mode and leave this false. Plain Redis post-config
+	 * enables request-scoped connections unless OIDC_REDIS_MUTEX_GLOBAL selects the legacy mode.
+	 */
+	context->request_scoped = FALSE;
+	context->idle_num = 0;
 	return context;
 }
 
@@ -74,10 +81,10 @@ int oidc_cache_redis_post_config(apr_pool_t *pool, server_rec *s, oidc_cfg_t *cf
 	oidc_cache_cfg_redis_t *context = oidc_cache_redis_cfg_create(pool);
 	cfg->cache.cfg = context;
 
-	/* parse the host:post tuple from the configuration */
+	/* check that a Redis server has been configured */
 	if (cfg->cache.redis_server == NULL) {
-		oidc_serror(s,
-			    "cache type is set to \"redis\", but no valid " OIDCRedisCacheServer " setting was found");
+		oidc_serror(s, "cache type is set to \"%s\", but no valid " OIDCRedisCacheServer " setting was found",
+			    name);
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
@@ -120,9 +127,37 @@ apr_status_t oidc_cache_redis_disconnect(oidc_cache_cfg_redis_t *context) {
 }
 
 /*
- * initialize the Redis struct the specified Redis server
+ * return a copy of a (comma-separated) OIDCRedisCacheServer value with the credentials part of
+ * each tuple - everything up to the last '@' in it - replaced by a placeholder, so that a
+ * password configured there is never written to the log, not even when the value failed to parse
  */
-static int oidc_cache_redis_post_config_impl(apr_pool_t *pool, server_rec *s) {
+const char *oidc_cache_redis_redact(apr_pool_t *pool, const char *str) {
+	const char *rv = NULL;
+	const char *tuple = NULL;
+	char *token = NULL;
+	const char *at = NULL;
+
+	if (str == NULL)
+		return NULL;
+
+	/* tokenize a copy: apr_strtok modifies its input in place */
+	tuple = apr_strtok(apr_pstrdup(pool, str), ",", &token);
+	while (tuple != NULL) {
+		at = strrchr(tuple, '@');
+		rv = apr_pstrcat(pool, (rv != NULL) ? rv : "", (rv != NULL) ? "," : "",
+				 (at != NULL) ? "<credentials>@" : "", (at != NULL) ? at + 1 : tuple, NULL);
+		tuple = apr_strtok(NULL, ",", &token);
+	}
+
+	return (rv != NULL) ? rv : "";
+}
+
+/*
+ * the oidc_cache_t post_config hook: initialize the offline config through
+ * oidc_cache_redis_post_config (which validates that a server is configured),
+ * then parse the server address and wire the connecting Redis operations
+ */
+static int oidc_cache_redis_post_config_hook(apr_pool_t *pool, server_rec *s) {
 	apr_status_t rv = APR_SUCCESS;
 	oidc_cache_cfg_redis_t *context = NULL;
 	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(s->module_config, &auth_openidc_module);
@@ -135,22 +170,18 @@ static int oidc_cache_redis_post_config_impl(apr_pool_t *pool, server_rec *s) {
 
 	context = (oidc_cache_cfg_redis_t *)cfg->cache.cfg;
 
-	/* parse the host:post tuple from the configuration */
-	if (cfg->cache.redis_server == NULL) {
-		oidc_serror(s,
-			    "cache type is set to \"redis\", but no valid " OIDCRedisCacheServer " setting was found");
-		return HTTP_INTERNAL_SERVER_ERROR;
-	}
-
+	/* parse the host:port tuple from the configuration */
 	char *scope_id;
 	rv = apr_parse_addr_port(&context->host_str, &scope_id, &context->port, cfg->cache.redis_server, pool);
 	if (rv != APR_SUCCESS) {
-		oidc_serror(s, "failed to parse cache server: '%s'", cfg->cache.redis_server);
+		oidc_serror(s, "failed to parse cache server: '%s'",
+			    oidc_cache_redis_redact(pool, cfg->cache.redis_server));
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
 	if (context->host_str == NULL) {
-		oidc_serror(s, "failed to parse cache server, no hostname specified: '%s'", cfg->cache.redis_server);
+		oidc_serror(s, "failed to parse cache server, no hostname specified: '%s'",
+			    oidc_cache_redis_redact(pool, cfg->cache.redis_server));
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
@@ -160,6 +191,7 @@ static int oidc_cache_redis_post_config_impl(apr_pool_t *pool, server_rec *s) {
 	context->connect = oidc_cache_redis_connect;
 	context->command = oidc_cache_redis_command;
 	context->disconnect = oidc_cache_redis_disconnect;
+	context->request_scoped = getenv(OIDC_REDIS_MUTEX_GLOBAL_ENV_VAR) ? FALSE : TRUE;
 
 	return OK;
 }
@@ -181,10 +213,6 @@ int oidc_cache_redis_child_init(apr_pool_t *p, server_rec *s) {
 /*
  * assemble single key name based on section/key input
  */
-static char *oidc_cache_redis_get_key(apr_pool_t *pool, const char *section, const char *key) {
-	return apr_psprintf(pool, "%s:%s", section, key);
-}
-
 /*
  * free and nullify a reply object
  */
@@ -311,48 +339,170 @@ redisContext *oidc_cache_redis_connect_with_timeout(request_rec *r, const char *
 	return rctx;
 }
 
-/*
- * connect to Redis server
- */
-static apr_status_t oidc_cache_redis_connect(request_rec *r, oidc_cache_cfg_redis_t *context) {
+#define OIDC_CACHE_REDIS_CONN_USERDATA "oidc_cache_redis_conn"
+
+/* the connection a request checked out of the idle pool; returned at request-pool cleanup */
+typedef struct oidc_cache_redis_conn_t {
+	redisContext *rctx;
+	oidc_cache_cfg_redis_t *context;
+	server_rec *s;
+	apr_pool_t *pool;
+} oidc_cache_redis_conn_t;
+
+/* request-pool cleanup: put a healthy connection back on the idle pool, drop a broken one */
+static apr_status_t oidc_cache_redis_conn_return(void *data) {
+	oidc_cache_redis_conn_t *conn = (oidc_cache_redis_conn_t *)data;
+	oidc_cache_cfg_redis_t *context = conn->context;
+
+	if (conn->rctx == NULL)
+		return APR_SUCCESS;
+
+	if ((conn->rctx->err == 0) && (oidc_cache_mutex_lock(conn->pool, conn->s, context->mutex) == TRUE)) {
+		if (context->idle_num < OIDC_CACHE_REDIS_POOL_MAX) {
+			context->idle[context->idle_num++] = conn->rctx;
+			conn->rctx = NULL;
+		}
+		oidc_cache_mutex_unlock(conn->pool, conn->s, context->mutex);
+	}
+
+	if (conn->rctx != NULL) {
+		redisFree(conn->rctx);
+		conn->rctx = NULL;
+	}
+
+	return APR_SUCCESS;
+}
+
+/* obtain the request's connection checkout, creating (and registering) it on first use */
+static oidc_cache_redis_conn_t *oidc_cache_redis_conn_get(request_rec *r, oidc_cache_cfg_redis_t *context) {
+	oidc_cache_redis_conn_t *conn = NULL;
+	apr_pool_userdata_get((void **)&conn, OIDC_CACHE_REDIS_CONN_USERDATA, r->pool);
+	if (conn == NULL) {
+		conn = apr_pcalloc(r->pool, sizeof(oidc_cache_redis_conn_t));
+		conn->context = context;
+		conn->s = r->server;
+		conn->pool = r->pool;
+		apr_pool_userdata_set(conn, OIDC_CACHE_REDIS_CONN_USERDATA, NULL, r->pool);
+		apr_pool_cleanup_register(r->pool, conn, oidc_cache_redis_conn_return, apr_pool_cleanup_null);
+	}
+	return conn;
+}
+
+/* establish (and authenticate) a fresh connection into the provided slot */
+static apr_status_t oidc_cache_redis_rctx_connect(request_rec *r, const oidc_cache_cfg_redis_t *context,
+						  redisContext **rctx) {
 
 	apr_status_t rv = APR_EGENERAL;
 
-	if (context->rctx != NULL)
-		return APR_SUCCESS;
-
-	context->rctx = oidc_cache_redis_connect_with_timeout(r, context->host_str, context->port,
-							      context->connect_timeout, context->timeout, NULL);
-	if (context->rctx == NULL)
+	*rctx = oidc_cache_redis_connect_with_timeout(r, context->host_str, context->port, context->connect_timeout,
+						      context->timeout, NULL);
+	if (*rctx == NULL)
 		goto end;
 
-	if (oidc_cache_redis_set_keepalive(r, context->rctx, context->keepalive) == FALSE)
+	if (oidc_cache_redis_set_keepalive(r, *rctx, context->keepalive) == FALSE)
 		goto end;
 
-	if (oidc_cache_redis_set_auth(r, context->rctx, context->username, context->passwd) == FALSE)
+	if (oidc_cache_redis_set_auth(r, *rctx, context->username, context->passwd) == FALSE)
 		goto end;
 
-	if (oidc_cache_redis_set_database(r, context->rctx, context->database) == FALSE)
+	if (oidc_cache_redis_set_database(r, *rctx, context->database) == FALSE)
 		goto end;
 
 	rv = APR_SUCCESS;
 
 end:
 
-	if (rv != APR_SUCCESS)
-		context->disconnect(context);
+	if ((rv != APR_SUCCESS) && (*rctx != NULL)) {
+		redisFree(*rctx);
+		*rctx = NULL;
+	}
 
 	return rv;
 }
 
+/*
+ * connect to Redis server
+ */
+static apr_status_t oidc_cache_redis_connect(request_rec *r, oidc_cache_cfg_redis_t *context) {
+
+	if (context->request_scoped == FALSE) {
+
+		/* legacy model: one shared connection, serialized by the caller-held mutex */
+		if (context->rctx != NULL)
+			return APR_SUCCESS;
+
+		return oidc_cache_redis_rctx_connect(r, context, &context->rctx);
+	}
+
+	oidc_cache_redis_conn_t *conn = oidc_cache_redis_conn_get(r, context);
+
+	if (conn->rctx != NULL) {
+		if (conn->rctx->err == 0)
+			return APR_SUCCESS;
+		/* the checked-out connection failed earlier in this request: drop and reconnect */
+		redisFree(conn->rctx);
+		conn->rctx = NULL;
+	}
+
+	/* prefer an idle pooled connection over establishing (and authenticating) a fresh one */
+	if (oidc_cache_mutex_lock(r->pool, r->server, context->mutex) == TRUE) {
+		if (context->idle_num > 0)
+			conn->rctx = context->idle[--context->idle_num];
+		oidc_cache_mutex_unlock(r->pool, r->server, context->mutex);
+	}
+
+	if (conn->rctx != NULL) {
+		if (conn->rctx->err == 0)
+			return APR_SUCCESS;
+		redisFree(conn->rctx);
+		conn->rctx = NULL;
+	}
+
+	return oidc_cache_redis_rctx_connect(r, context, &conn->rctx);
+}
+
+/* Flush the LIFO idle pool when checkout finds a dead connection; older sockets are likely dead too. */
+static void oidc_cache_redis_idle_flush(request_rec *r, oidc_cache_cfg_redis_t *context) {
+	if (oidc_cache_mutex_lock(r->pool, r->server, context->mutex) != TRUE)
+		return;
+	if (context->idle_num > 0)
+		oidc_debug(r, "dropping %d idle pooled connection(s)", context->idle_num);
+	while (context->idle_num > 0)
+		redisFree(context->idle[--context->idle_num]);
+	oidc_cache_mutex_unlock(r->pool, r->server, context->mutex);
+}
+
 redisReply *oidc_cache_redis_command(request_rec *r, oidc_cache_cfg_redis_t *context, char **errstr, const char *format,
 				     va_list ap) {
-	redisReply *reply = redisvCommand(context->rctx, format, ap);
-	*errstr = apr_pstrdup(r->pool, context->rctx->errstr);
+	redisReply *reply = NULL;
+	redisContext *rctx = context->rctx;
+
+	if (context->request_scoped == TRUE)
+		rctx = oidc_cache_redis_conn_get(r, context)->rctx;
+
+	if (rctx == NULL) {
+		*errstr = apr_pstrdup(r->pool, "not connected");
+		return NULL;
+	}
+
+	reply = redisvCommand(rctx, format, ap);
+	*errstr = apr_pstrdup(r->pool, rctx->errstr);
+
+	/* in request-scoped mode the (no request context) disconnect callback is a no-op, so a
+	 * connection-level failure tears the checked-out connection down right here; the retry
+	 * in oidc_cache_redis_exec then reconnects through oidc_cache_redis_connect */
+	if ((context->request_scoped == TRUE) && (rctx->err != 0)) {
+		oidc_cache_redis_conn_t *conn = oidc_cache_redis_conn_get(r, context);
+		redisFree(conn->rctx);
+		conn->rctx = NULL;
+		/* A peer may close every idle socket without setting err; flush them before retrying. */
+		oidc_cache_redis_idle_flush(r, context);
+	}
+
 	return reply;
 }
 
-static int oidc_cache_redis_env2int(request_rec *r, const char *env_var_name, const int default_value) {
+static int oidc_cache_redis_env2int(const request_rec *r, const char *env_var_name, const int default_value) {
 	const char *s = r->subprocess_env ? apr_table_get(r->subprocess_env, env_var_name) : NULL;
 	return _oidc_str_to_int(s, default_value);
 }
@@ -370,14 +520,28 @@ static int oidc_cache_redis_env2int(request_rec *r, const char *env_var_name, co
 		oidc_error(r, ##__VA_ARGS__);                                                                          \
 	}
 
+/* Release the shared-connection mutex during retry delay, then reacquire it before returning. */
+static apr_byte_t oidc_cache_redis_backoff(request_rec *r, const oidc_cache_cfg_redis_t *context, apr_time_t interval) {
+	oidc_debug(r, "wait before retrying: %" APR_TIME_T_FMT " (msec)", apr_time_as_msec(interval));
+	if (context->request_scoped == FALSE)
+		oidc_cache_mutex_unlock(r->pool, r->server, context->mutex);
+	apr_sleep(interval);
+	if (context->request_scoped == FALSE)
+		return oidc_cache_mutex_lock(r->pool, r->server, context->mutex);
+	return TRUE;
+}
+
 /*
- * execute Redis command and deal with return value
+ * Serialized callers hold context->mutex. Retries release it while sleeping and clear
+ * *mutex_held if reacquisition fails, preventing a second unlock of the shared connection.
  */
-static redisReply *oidc_cache_redis_exec(request_rec *r, oidc_cache_cfg_redis_t *context, const char *format, ...) {
+static redisReply *oidc_cache_redis_exec(request_rec *r, oidc_cache_cfg_redis_t *context, apr_byte_t *mutex_held,
+					 const char *format, ...) {
 
 	redisReply *reply = NULL;
 	char *errstr = NULL;
 	va_list ap;
+	const oidc_cfg_t *cfg = ap_get_module_config(r->server->module_config, &auth_openidc_module);
 	int retries = oidc_cache_redis_env2int(r, OIDC_REDIS_MAX_TRIES_ENV_VAR, OIDC_REDIS_MAX_TRIES_DEFAULT);
 	apr_time_t interval = apr_time_from_msec(
 	    oidc_cache_redis_env2int(r, OIDC_REDIS_RETRY_INTERVAL_ENV_VAR, OIDC_REDIS_RETRY_INTERVAL_DEFAULT));
@@ -385,14 +549,16 @@ static redisReply *oidc_cache_redis_exec(request_rec *r, oidc_cache_cfg_redis_t 
 	/* try to execute a command at max n times while reconnecting */
 	for (int i = 1; i <= retries; i++) {
 
+		if (i > 1)
+			OIDC_METRICS_COUNTER_INC(r, cfg, OM_CACHE_RETRY);
+
 		/* connect */
 		if (context->connect(r, context) != APR_SUCCESS) {
 			OIDC_REDIS_WARN_OR_ERROR(i < retries, r, "Redis connect (attempt=%d/%d to %s:%d) failed", i,
 						 retries, context->host_str, context->port);
-			if (i < retries) {
-				oidc_debug(r, "wait before retrying: %" APR_TIME_T_FMT " (msec)",
-					   apr_time_as_msec(interval));
-				apr_sleep(interval);
+			if ((i < retries) && (oidc_cache_redis_backoff(r, context, interval) == FALSE)) {
+				*mutex_held = FALSE;
+				return NULL;
 			}
 			continue;
 		}
@@ -431,13 +597,15 @@ apr_byte_t oidc_cache_redis_get(request_rec *r, const char *section, const char 
 	oidc_cache_cfg_redis_t *context = (oidc_cache_cfg_redis_t *)cfg->cache.cfg;
 	redisReply *reply = NULL;
 	apr_byte_t rv = FALSE;
+	apr_byte_t mutex_held = TRUE;
 
-	/* grab the processlock */
-	if (oidc_cache_mutex_lock(r->pool, r->server, context->mutex) == FALSE)
+	/* grab the process lock, except in request-scoped connection mode where each request
+	 * has its own connection and the mutex only guards the idle pool */
+	if ((context->request_scoped == FALSE) && (oidc_cache_mutex_lock(r->pool, r->server, context->mutex) == FALSE))
 		return FALSE;
 
 	/* get */
-	reply = oidc_cache_redis_exec(r, context, "GET %s", oidc_cache_redis_get_key(r->pool, section, key));
+	reply = oidc_cache_redis_exec(r, context, &mutex_held, "GET %s", oidc_cache_section_key(r->pool, section, key));
 
 	if (reply == NULL)
 		goto end;
@@ -454,10 +622,11 @@ apr_byte_t oidc_cache_redis_get(request_rec *r, const char *section, const char 
 		goto end;
 	}
 
-	/* do a sanity check on the returned value */
+	/* do a sanity check on the returned value; report the two lengths but not the value
+	 * itself, which is cached (session) data that must not be written to the log */
 	if ((reply->str == NULL) || (reply->len != _oidc_strlen(reply->str))) {
-		oidc_error(r, "redisCommand reply->len (%d) != _oidc_strlen(reply->str): '%s'", (int)reply->len,
-			   reply->str);
+		oidc_error(r, "redisCommand reply->len (%d) != _oidc_strlen(reply->str) (%d)", (int)reply->len,
+			   (int)_oidc_strlen(reply->str));
 		goto end;
 	}
 
@@ -472,8 +641,9 @@ end:
 	/* free the reply object resources */
 	oidc_cache_redis_reply_free(&reply);
 
-	/* unlock the process mutex */
-	oidc_cache_mutex_unlock(r->pool, r->server, context->mutex);
+	/* unlock the process mutex, unless the retry backoff released it and could not get it back */
+	if ((context->request_scoped == FALSE) && (mutex_held == TRUE))
+		oidc_cache_mutex_unlock(r->pool, r->server, context->mutex);
 
 	/* return the status */
 	return rv;
@@ -489,17 +659,20 @@ apr_byte_t oidc_cache_redis_set(request_rec *r, const char *section, const char 
 	oidc_cache_cfg_redis_t *context = (oidc_cache_cfg_redis_t *)cfg->cache.cfg;
 	redisReply *reply = NULL;
 	apr_byte_t rv = FALSE;
+	apr_byte_t mutex_held = TRUE;
 	apr_uint32_t timeout;
 
-	/* grab the process lock */
-	if (oidc_cache_mutex_lock(r->pool, r->server, context->mutex) == FALSE)
+	/* grab the process lock, except in request-scoped connection mode where each request
+	 * has its own connection and the mutex only guards the idle pool */
+	if ((context->request_scoped == FALSE) && (oidc_cache_mutex_lock(r->pool, r->server, context->mutex) == FALSE))
 		return FALSE;
 
 	/* see if we should be clearing this entry */
 	if (value == NULL) {
 
 		/* delete it */
-		reply = oidc_cache_redis_exec(r, context, "DEL %s", oidc_cache_redis_get_key(r->pool, section, key));
+		reply = oidc_cache_redis_exec(r, context, &mutex_held, "DEL %s",
+					      oidc_cache_section_key(r->pool, section, key));
 
 	} else {
 
@@ -507,8 +680,8 @@ apr_byte_t oidc_cache_redis_set(request_rec *r, const char *section, const char 
 		timeout = (apr_uint32_t)apr_time_sec(expiry - apr_time_now());
 
 		/* store it */
-		reply = oidc_cache_redis_exec(r, context, "SET %s %s EX %d",
-					      oidc_cache_redis_get_key(r->pool, section, key), value, timeout);
+		reply = oidc_cache_redis_exec(r, context, &mutex_held, "SET %s %s EX %d",
+					      oidc_cache_section_key(r->pool, section, key), value, timeout);
 	}
 
 	rv = (reply != NULL) && (reply->type != REDIS_REPLY_ERROR);
@@ -516,20 +689,25 @@ apr_byte_t oidc_cache_redis_set(request_rec *r, const char *section, const char 
 	/* free the reply object resources */
 	oidc_cache_redis_reply_free(&reply);
 
-	/* unlock the process mutex */
-	oidc_cache_mutex_unlock(r->pool, r->server, context->mutex);
+	/* unlock the process mutex, unless the retry backoff released it and could not get it back */
+	if ((context->request_scoped == FALSE) && (mutex_held == TRUE))
+		oidc_cache_mutex_unlock(r->pool, r->server, context->mutex);
 
 	/* return the status */
 	return rv;
 }
 
-static int oidc_cache_redis_destroy_impl(apr_pool_t *pool, server_rec *s) {
+int oidc_cache_redis_destroy(apr_pool_t *pool, server_rec *s) {
 	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(s->module_config, &auth_openidc_module);
 	oidc_cache_cfg_redis_t *context = (oidc_cache_cfg_redis_t *)cfg->cache.cfg;
 
 	if (context != NULL) {
 		oidc_cache_mutex_lock(pool, s, context->mutex);
 		context->disconnect(context);
+		/* release any idle pooled connections kept for request-scoped connection mode */
+		for (int i = 0; i < context->idle_num; i++)
+			redisFree(context->idle[i]);
+		context->idle_num = 0;
 		oidc_cache_mutex_unlock(pool, s, context->mutex);
 		if (oidc_cache_mutex_destroy(s, context->mutex) != TRUE) {
 			oidc_serror(s, "oidc_cache_mutex_destroy on refresh mutex failed");
@@ -545,11 +723,11 @@ static int oidc_cache_redis_destroy_impl(apr_pool_t *pool, server_rec *s) {
 oidc_cache_t oidc_cache_redis = {
 	"redis",
 	1,
-	oidc_cache_redis_post_config_impl,
+	oidc_cache_redis_post_config_hook,
 	oidc_cache_redis_child_init,
 	oidc_cache_redis_get,
 	oidc_cache_redis_set,
-	oidc_cache_redis_destroy_impl
+	oidc_cache_redis_destroy
 };
 
 // clang-format on

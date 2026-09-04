@@ -1,0 +1,5 @@
+/protected/index.html
+Host: www.example.com:8443
+X-Forwarded-Proto: https
+X-Forwarded-Host: front.example.com
+X-Forwarded-Port: 443

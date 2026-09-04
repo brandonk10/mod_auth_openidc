@@ -42,42 +42,15 @@
 
 #include "proto/proto.h"
 #include "util/util.h"
-
-/*
- * return the serialized header part of a A256GCM encrypted JWT (input)
- */
-static const char *oidc_util_jwt_hdr_dir_a256gcm(request_rec *r, char *input) {
-	char *compact_encoded_jwt = NULL;
-	char *p = NULL;
-	static const char *_oidc_jwt_hdr_dir_a256gcm = NULL;
-	static oidc_crypto_passphrase_t passphrase;
-
-	if (_oidc_jwt_hdr_dir_a256gcm != NULL)
-		return _oidc_jwt_hdr_dir_a256gcm;
-
-	if (input == NULL) {
-		passphrase.secret1 = "needs_non_empty_string";
-		passphrase.secret2 = NULL;
-		oidc_util_jwt_create(r, &passphrase, "some_string", &compact_encoded_jwt);
-	} else {
-		compact_encoded_jwt = input;
-	}
-
-	p = _oidc_strstr(compact_encoded_jwt, "..");
-	if (p) {
-		_oidc_jwt_hdr_dir_a256gcm = apr_pstrndup(r->server->process->pool, compact_encoded_jwt,
-							 _oidc_strlen(compact_encoded_jwt) - _oidc_strlen(p) + 2);
-		oidc_debug(r, "saved _oidc_jwt_hdr_dir_a256gcm header: %s", _oidc_jwt_hdr_dir_a256gcm);
-	}
-	return _oidc_jwt_hdr_dir_a256gcm;
-}
+#include "util/util_cfg.h"
 
 #define OIDC_JWT_INTERNAL_NO_COMPRESS_ENV_VAR "OIDC_JWT_INTERNAL_NO_COMPRESS"
 
 /*
  * helper function to override a variable value with an optionally provided environment variable
  */
-static apr_byte_t oidc_util_env_var_override(request_rec *r, const char *env_var_name, apr_byte_t return_when_set) {
+static apr_byte_t oidc_util_env_var_override(const request_rec *r, const char *env_var_name,
+					     apr_byte_t return_when_set) {
 	const char *s = NULL;
 	if (r->subprocess_env == NULL)
 		return !return_when_set;
@@ -88,19 +61,30 @@ static apr_byte_t oidc_util_env_var_override(request_rec *r, const char *env_var
 /*
  * check if we need to compress (internal) encrypted JWTs or not
  */
-static apr_byte_t oidc_util_jwt_internal_compress(request_rec *r) {
+static apr_byte_t oidc_util_jwt_internal_compress(const request_rec *r) {
 	// avoid compressing JWTs that need to be compatible with external producers/consumers
 	return oidc_util_env_var_override(r, OIDC_JWT_INTERNAL_NO_COMPRESS_ENV_VAR, FALSE);
 }
 
-#define OIDC_JWT_INTERNAL_STRIP_HDR_ENV_VAR "OIDC_JWT_INTERNAL_STRIP_HDR"
-
 /*
- * check if we need to strip the header from (internal) encrypted JWTs or not
+ * wrap the precomputed PBKDF2-derived key material for a crypto passphrase into a JWK; the
+ * expensive stretching itself happens once, at post_config time (see
+ * oidc_cfg_crypto_passphrase_derive_keys()), not on every request
  */
-static apr_byte_t oidc_util_jwt_internal_strip_header(request_rec *r) {
-	// avoid stripping JWT headers that need to be compatible with external producers/consumers
-	return oidc_util_env_var_override(r, OIDC_JWT_INTERNAL_STRIP_HDR_ENV_VAR, TRUE);
+static apr_byte_t oidc_util_jwt_key_from_derived(request_rec *r, const unsigned char *derived_key,
+						 apr_byte_t derived_key_set, oidc_jwk_t **jwk) {
+	oidc_jose_error_t err;
+	if (derived_key_set == FALSE) {
+		oidc_error(r, "no derived key material available for the configured passphrase");
+		return FALSE;
+	}
+	*jwk = oidc_jwk_create_symmetric_key(r->pool, NULL, derived_key, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN, FALSE,
+					     &err);
+	if (*jwk == NULL) {
+		oidc_error(r, "oidc_jwk_create_symmetric_key failed: %s", oidc_jose_e2s(r->pool, err));
+		return FALSE;
+	}
+	return TRUE;
 }
 
 /*
@@ -122,17 +106,18 @@ apr_byte_t oidc_util_jwt_create(request_rec *r, const oidc_crypto_passphrase_t *
 		goto end;
 	}
 
-	if (oidc_util_key_symmetric_create(r, passphrase->secret1, 0, OIDC_JOSE_ALG_SHA256, FALSE, &jwk) == FALSE)
+	if (oidc_util_jwt_key_from_derived(r, passphrase->derived_key1, passphrase->derived_key1_set, &jwk) == FALSE)
 		goto end;
 
 	if (oidc_util_jwt_internal_compress(r)) {
-		if (oidc_jose_compress(r->pool, s_payload, _oidc_strlen(s_payload), &cser, &cser_len, &err) == FALSE) {
+		if (oidc_jose_compress(r->pool, s_payload, (int)_oidc_strlen(s_payload), &cser, &cser_len, &err) ==
+		    FALSE) {
 			oidc_error(r, "oidc_jose_compress failed: %s", oidc_jose_e2s(r->pool, err));
 			goto end;
 		}
 	} else {
 		cser = apr_pstrdup(r->pool, s_payload);
-		cser_len = _oidc_strlen(s_payload);
+		cser_len = (int)_oidc_strlen(s_payload);
 	}
 
 	jwe = oidc_jwt_new(r->pool, TRUE, FALSE);
@@ -141,8 +126,8 @@ apr_byte_t oidc_util_jwt_create(request_rec *r, const oidc_crypto_passphrase_t *
 		goto end;
 	}
 
-	jwe->header.alg = apr_pstrdup(r->pool, CJOSE_HDR_ALG_DIR);
-	jwe->header.enc = apr_pstrdup(r->pool, CJOSE_HDR_ENC_A256GCM);
+	jwe->header.alg = apr_pstrdup(r->pool, OIDC_JOSE_HDR_ALG_DIR);
+	jwe->header.enc = apr_pstrdup(r->pool, OIDC_JOSE_HDR_ENC_A256GCM);
 	if (passphrase->secret2 != NULL)
 		jwe->header.kid = apr_pstrdup(r->pool, "1");
 
@@ -150,9 +135,6 @@ apr_byte_t oidc_util_jwt_create(request_rec *r, const oidc_crypto_passphrase_t *
 		oidc_error(r, "encrypting JWT failed: %s", oidc_jose_e2s(r->pool, err));
 		goto end;
 	}
-
-	if ((*compact_encoded_jwt != NULL) && (oidc_util_jwt_internal_strip_header(r)))
-		*compact_encoded_jwt += _oidc_strlen(oidc_util_jwt_hdr_dir_a256gcm(r, *compact_encoded_jwt));
 
 	rv = TRUE;
 
@@ -184,12 +166,8 @@ apr_byte_t oidc_util_jwt_verify(request_rec *r, const oidc_crypto_passphrase_t *
 	char *enc = NULL;
 	char *kid = NULL;
 
-	if (oidc_util_jwt_internal_strip_header(r))
-		compact_encoded_jwt =
-		    apr_pstrcat(r->pool, oidc_util_jwt_hdr_dir_a256gcm(r, NULL), compact_encoded_jwt, NULL);
-
 	oidc_proto_jwt_header_peek(r, compact_encoded_jwt, &alg, &enc, &kid);
-	if ((_oidc_strcmp(alg, CJOSE_HDR_ALG_DIR) != 0) || (_oidc_strcmp(enc, CJOSE_HDR_ENC_A256GCM) != 0)) {
+	if ((_oidc_strcmp(alg, OIDC_JOSE_HDR_ALG_DIR) != 0) || (_oidc_strcmp(enc, OIDC_JOSE_HDR_ENC_A256GCM) != 0)) {
 		oidc_error(r, "corrupted JWE header, alg=\"%s\" enc=\"%s\"", alg, enc);
 		goto end;
 	}
@@ -197,33 +175,26 @@ apr_byte_t oidc_util_jwt_verify(request_rec *r, const oidc_crypto_passphrase_t *
 	keys = apr_hash_make(r->pool);
 
 	if ((passphrase->secret2 != NULL) && (kid == NULL)) {
-		if (oidc_util_key_symmetric_create(r, passphrase->secret2, 0, OIDC_JOSE_ALG_SHA256, FALSE, &jwk) ==
+		if (oidc_util_jwt_key_from_derived(r, passphrase->derived_key2, passphrase->derived_key2_set, &jwk) ==
 		    FALSE)
 			goto end;
 	} else {
-		if (oidc_util_key_symmetric_create(r, passphrase->secret1, 0, OIDC_JOSE_ALG_SHA256, FALSE, &jwk) ==
+		if (oidc_util_jwt_key_from_derived(r, passphrase->derived_key1, passphrase->derived_key1_set, &jwk) ==
 		    FALSE)
 			goto end;
 	}
 	apr_hash_set(keys, "1", APR_HASH_KEY_STRING, jwk);
 
-	if (oidc_jwe_decrypt(r->pool, compact_encoded_jwt, keys, &plaintext, &plaintext_len, &err, FALSE) == FALSE) {
+	/* Require JWE import so a matching header cannot make unauthenticated input pass verification. */
+	if (oidc_jwe_decrypt(r->pool, compact_encoded_jwt, keys, &plaintext, &plaintext_len, &err, TRUE) == FALSE) {
 		oidc_error(r, "decrypting JWE failed: %s", oidc_jose_e2s(r->pool, err));
 		goto end;
 	}
 
-	if (oidc_util_jwt_internal_compress(r)) {
-
-		if (oidc_jose_uncompress(r->pool, (char *)plaintext, plaintext_len, &payload, &payload_len, &err) ==
-		    FALSE) {
-			oidc_error(r, "oidc_jose_uncompress failed: %s", oidc_jose_e2s(r->pool, err));
-			goto end;
-		}
-
-	} else {
-
-		payload = plaintext;
-		payload_len = plaintext_len;
+	/* Always detect on read; OIDC_JWT_INTERNAL_NO_COMPRESS controls only future writes. */
+	if (oidc_jose_uncompress(r->pool, plaintext, plaintext_len, &payload, &payload_len, &err) == FALSE) {
+		oidc_error(r, "oidc_jose_uncompress failed: %s", oidc_jose_e2s(r->pool, err));
+		goto end;
 	}
 
 	*s_payload = apr_pstrndup(r->pool, payload, payload_len);

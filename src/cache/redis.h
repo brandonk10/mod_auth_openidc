@@ -56,6 +56,9 @@ typedef redisReply *(*oidc_cache_redis_command_function_t)(request_rec *, struct
 							   const char *format, va_list ap);
 typedef apr_status_t (*oidc_cache_redis_disconnect_function_t)(struct oidc_cache_cfg_redis_t *);
 
+/* maximum number of idle connections kept per process in request-scoped connection mode */
+#define OIDC_CACHE_REDIS_POOL_MAX 16
+
 typedef struct oidc_cache_cfg_redis_t {
 	oidc_cache_mutex_t *mutex;
 	char *username;
@@ -70,10 +73,18 @@ typedef struct oidc_cache_cfg_redis_t {
 	oidc_cache_redis_connect_function_t connect;
 	oidc_cache_redis_command_function_t command;
 	oidc_cache_redis_disconnect_function_t disconnect;
+	/*
+	 * Request-scoped pooling avoids serializing network I/O for plain Redis. Backends managing
+	 * their own connections must retain the serialized model.
+	 */
+	apr_byte_t request_scoped;
+	redisContext *idle[OIDC_CACHE_REDIS_POOL_MAX];
+	int idle_num;
 } oidc_cache_cfg_redis_t;
 
 int oidc_cache_redis_post_config(apr_pool_t *pool, server_rec *s, oidc_cfg_t *cfg, const char *name);
 int oidc_cache_redis_child_init(apr_pool_t *p, server_rec *s);
+int oidc_cache_redis_destroy(apr_pool_t *pool, server_rec *s);
 redisReply *oidc_cache_redis_command(request_rec *r, oidc_cache_cfg_redis_t *context, char **errstr, const char *format,
 				     va_list ap);
 apr_byte_t oidc_cache_redis_get(request_rec *r, const char *section, const char *key, char **value);
@@ -81,6 +92,7 @@ apr_byte_t oidc_cache_redis_set(request_rec *r, const char *section, const char 
 				apr_time_t expiry);
 apr_status_t oidc_cache_redis_disconnect(oidc_cache_cfg_redis_t *context);
 
+const char *oidc_cache_redis_redact(apr_pool_t *pool, const char *str);
 apr_byte_t oidc_cache_redis_set_keepalive(request_rec *r, redisContext *rctx, const int keepalive);
 apr_byte_t oidc_cache_redis_set_auth(request_rec *r, redisContext *rctx, const char *username, const char *password);
 apr_byte_t oidc_cache_redis_set_database(request_rec *r, redisContext *rctx, const int database);

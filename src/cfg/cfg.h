@@ -51,47 +51,12 @@
 
 #include "cache/cache.h"
 
+/* names of the OIDC* configuration directives */
+#include "cfg/directives.h"
+
 #define OIDC_CONFIG_POS_INT_UNSET -1
 /* -1 might be used for unlimited timeout */
 #define OIDC_CONFIG_POS_TIMEOUT_UNSET (apr_interval_time_t) - 2
-
-#define OIDCPublicKeyFiles "OIDCPublicKeyFiles"
-#define OIDCDefaultLoggedOutURL "OIDCDefaultLoggedOutURL"
-#define OIDCCookieHTTPOnly "OIDCCookieHTTPOnly"
-#define OIDCCookieSameSite "OIDCCookieSameSite"
-#define OIDCOutgoingProxy "OIDCOutgoingProxy"
-#define OIDCClaimDelimiter "OIDCClaimDelimiter"
-#define OIDCHTTPTimeoutLong "OIDCHTTPTimeoutLong"
-#define OIDCHTTPTimeoutShort "OIDCHTTPTimeoutShort"
-#define OIDCStateTimeout "OIDCStateTimeout"
-#define OIDCStateMaxNumberOfCookies "OIDCStateMaxNumberOfCookies"
-#define OIDCSessionInactivityTimeout "OIDCSessionInactivityTimeout"
-#define OIDCMetadataDir "OIDCMetadataDir"
-#define OIDCSessionCacheFallbackToCookie "OIDCSessionCacheFallbackToCookie"
-#define OIDCSessionCookieChunkSize "OIDCSessionCookieChunkSize"
-#define OIDCPreservePostTemplates "OIDCPreservePostTemplates"
-#define OIDCProviderMetadataRefreshInterval "OIDCProviderMetadataRefreshInterval"
-#define OIDCBlackListedClaims "OIDCBlackListedClaims"
-#define OIDCStateInputHeaders "OIDCStateInputHeaders"
-#define OIDCRedirectURLsAllowed "OIDCRedirectURLsAllowed"
-#define OIDCCABundlePath "OIDCCABundlePath"
-#define OIDCLogoutXFrameOptions "OIDCLogoutXFrameOptions"
-#define OIDCXForwardedHeaders "OIDCXForwardedHeaders"
-#define OIDCFilterClaimsExpr "OIDCFilterClaimsExpr"
-#define OIDCTraceParent "OIDCTraceParent"
-#define OIDCPrivateKeyFiles "OIDCPrivateKeyFiles"
-#define OIDCRedirectURI "OIDCRedirectURI"
-#define OIDCDefaultURL "OIDCDefaultURL"
-#define OIDCCookieDomain "OIDCCookieDomain"
-#define OIDCClaimPrefix "OIDCClaimPrefix"
-#define OIDCRemoteUserClaim "OIDCRemoteUserClaim"
-#define OIDCOAuthRemoteUserClaim "OIDCOAuthRemoteUserClaim"
-#define OIDCSessionType "OIDCSessionType"
-#define OIDCInfoHook "OIDCInfoHook"
-#define OIDCMetricsData "OIDCMetricsData"
-#define OIDCMetricsPublish "OIDCMetricsPublish"
-#define OIDCWhiteListedClaims "OIDCWhiteListedClaims"
-#define OIDCCryptoPassphrase "OIDCCryptoPassphrase"
 
 typedef enum {
 	OIDC_STATE_INPUT_HEADERS_NONE = 0,
@@ -145,9 +110,18 @@ typedef struct oidc_apr_expr_t {
 	char *str;
 } oidc_apr_expr_t;
 
+#define OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN 32
+
 typedef struct oidc_crypto_passphrase_t {
 	const char *secret1;
 	const char *secret2;
+	/* PBKDF2-stretched key material derived from secret{1,2}, computed once at post_config
+	 * time (see oidc_cfg_crypto_passphrase_post_config); *_set indicates the corresponding
+	 * secret was non-NULL and the derived key is valid to use */
+	unsigned char derived_key1[OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN];
+	apr_byte_t derived_key1_set;
+	unsigned char derived_key2[OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN];
+	apr_byte_t derived_key2_set;
 } oidc_crypto_passphrase_t;
 
 typedef struct oidc_remote_user_claim_t {
@@ -175,35 +149,48 @@ typedef struct oidc_pass_user_info_as_t {
 /* actions to be taken on access token / userinfo refresh error */
 typedef enum { OIDC_ON_ERROR_502 = 0, OIDC_ON_ERROR_LOGOUT = 1, OIDC_ON_ERROR_AUTH = 2 } oidc_on_error_action_t;
 
-#define OIDC_CFG_OPTIONS_SIZE(options) sizeof(options) / sizeof(oidc_cfg_option_t)
+#define OIDC_CFG_OPTIONS_SIZE(options) ((int)(sizeof(options) / sizeof(oidc_cfg_option_t)))
 
 typedef struct oidc_provider_t oidc_provider_t;
 typedef struct oidc_cfg_t oidc_cfg_t;
 
 void oidc_cfg_x_forwarded_headers_check(request_rec *r, oidc_hdr_x_forwarded_t x_forwarded_headers);
-const char *oidc_cfg_remote_user_claim_name_get(oidc_cfg_t *cfg);
+const char *oidc_cfg_remote_user_claim_name_get(const oidc_cfg_t *cfg);
 
 oidc_provider_t *oidc_cfg_provider_get(oidc_cfg_t *);
-int oidc_cfg_merged_get(oidc_cfg_t *cfg);
+int oidc_cfg_merged_get(const oidc_cfg_t *cfg);
+/* whether OIDCRedirectURI was inherited from the base server instead of set on this server itself */
+int oidc_cfg_redirect_uri_inherited_get(const oidc_cfg_t *cfg);
 
-void oidc_pre_config_init();
+void oidc_pre_config_init(void);
 
 void *oidc_cfg_server_create(apr_pool_t *pool, server_rec *s);
 void *oidc_cfg_server_merge(apr_pool_t *pool, void *BASE, void *ADD);
+oidc_cfg_t *oidc_cfg_request_view(apr_pool_t *pool, const oidc_cfg_t *c);
 apr_byte_t oidc_cfg_server_destroy(apr_pool_t *pool, server_rec *s, oidc_cfg_t *cfg);
 int oidc_cfg_post_config(apr_pool_t *pool, oidc_cfg_t *cfg, server_rec *s);
-void oidc_cfg_child_init(apr_pool_t *pool, oidc_cfg_t *cfg, server_rec *s);
+void oidc_cfg_child_init(apr_pool_t *pool, const oidc_cfg_t *cfg, server_rec *s);
 void oidc_cfg_process_cleanup(oidc_cfg_t *cfg, server_rec *s);
 const char *oidc_cfg_string_list_add(apr_pool_t *pool, apr_array_header_t **list, const char *arg);
-const char *oidc_cfg_endpoint_auth_set(apr_pool_t *pool, oidc_cfg_t *cfg, const char *arg, char **auth, char **alg);
+const char *oidc_cfg_endpoint_auth_set(apr_pool_t *pool, const oidc_cfg_t *cfg, const char *arg, char **auth,
+				       char **alg);
 void oidc_cfg_crypto_passphrase_secret1_set(oidc_cfg_t *cfg, const char *secret);
+apr_byte_t oidc_crypto_passphrase_derive_keys(oidc_crypto_passphrase_t *cp);
+apr_byte_t oidc_cfg_crypto_passphrase_derive_keys(oidc_cfg_t *cfg);
+apr_byte_t oidc_crypto_passphrase_derive_keys_cached(apr_pool_t *pool, apr_hash_t *kdf_cache,
+						     oidc_crypto_passphrase_t *cp);
+apr_byte_t oidc_cfg_crypto_passphrase_derive_keys_cached(apr_pool_t *pool, apr_hash_t *kdf_cache, oidc_cfg_t *cfg);
 
-#define OIDC_CFG_MEMBER_FUNC_NAME(member, type, method) oidc_##type##_##member##_##method
+/*
+ * Generate directive-handler and getter declarations from each oidc_cfg_t member. Bodies are
+ * generated in cfg_int.h/cfg.c; token-pasted names require a preprocessing-aware index.
+ */
 
-#define OIDC_CFG_MEMBER_FUNC_GET_DECL(member, type) type OIDC_CFG_MEMBER_FUNC_NAME(member, cfg, get)(oidc_cfg_t * cfg);
+/* const char *oidc_cmd_<member>_set(cmd_parms *, void *, ...) */
+#define OIDC_CMD_MEMBER_FUNC_DECL(member, ...) const char *oidc_cmd_##member##_set(cmd_parms *, void *, ##__VA_ARGS__);
 
-#define OIDC_CMD_MEMBER_FUNC_DECL(member, ...)                                                                         \
-	const char *OIDC_CFG_MEMBER_FUNC_NAME(member, cmd, set)(cmd_parms *, void *, ##__VA_ARGS__);
+/* <type> oidc_cfg_<member>_get(const oidc_cfg_t *) */
+#define OIDC_CFG_MEMBER_FUNC_GET_DECL(member, type) type oidc_cfg_##member##_get(const oidc_cfg_t *cfg);
 
 #define OIDC_CFG_MEMBER_FUNCS_DECL(member, type, ...)                                                                  \
 	OIDC_CMD_MEMBER_FUNC_DECL(member, const char *, ##__VA_ARGS__);                                                \
@@ -229,6 +216,7 @@ OIDC_CFG_MEMBER_FUNCS_DECL(session_inactivity_timeout, int)
 OIDC_CFG_MEMBER_FUNCS_DECL(metadata_dir, const char *)
 OIDC_CFG_MEMBER_FUNCS_DECL(session_type, int)
 OIDC_CFG_MEMBER_FUNCS_DECL(session_cache_fallback_to_cookie, int)
+OIDC_CFG_MEMBER_FUNCS_DECL(debug_mask_secrets, int)
 OIDC_CFG_MEMBER_FUNCS_DECL(session_cookie_chunk_size, int)
 OIDC_CFG_MEMBER_FUNCS_DECL(html_error_template, const char *)
 OIDC_CFG_MEMBER_FUNCS_DECL(provider_metadata_refresh_interval, int)
@@ -240,6 +228,7 @@ OIDC_CFG_MEMBER_FUNCS_DECL(black_listed_claims, apr_hash_t *)
 OIDC_CFG_MEMBER_FUNCS_DECL(white_listed_claims, apr_hash_t *)
 OIDC_CFG_MEMBER_FUNCS_DECL(state_input_headers, oidc_state_input_hdrs_t)
 OIDC_CFG_MEMBER_FUNCS_DECL(redirect_urls_allowed, apr_hash_t *)
+OIDC_CFG_MEMBER_FUNCS_DECL(discover_issuers_allowed, apr_hash_t *)
 OIDC_CFG_MEMBER_FUNCS_DECL(ca_bundle_path, const char *)
 OIDC_CFG_MEMBER_FUNCS_DECL(logout_x_frame_options, const char *)
 OIDC_CFG_MEMBER_FUNCS_DECL(x_forwarded_headers, oidc_hdr_x_forwarded_t)
@@ -256,8 +245,11 @@ OIDC_CFG_MEMBER_FUNC_GET_DECL(cookie_same_site_state, oidc_samesite_cookie_t)
 OIDC_CFG_MEMBER_FUNC_GET_DECL(cookie_same_site_discovery_csrf, oidc_samesite_cookie_t)
 OIDC_CFG_MEMBER_FUNCS_DECL(remote_user_claim, const oidc_remote_user_claim_t *, const char *, const char *)
 OIDC_CFG_MEMBER_FUNCS_DECL(outgoing_proxy, const oidc_http_outgoing_proxy_t *, const char *, const char *)
-OIDC_CFG_MEMBER_FUNCS_DECL(http_timeout_short, oidc_http_timeout_t *, const char *, const char *)
-OIDC_CFG_MEMBER_FUNCS_DECL(http_timeout_long, oidc_http_timeout_t *, const char *, const char *)
+/* NB: the http_timeout getters lazily initialize the timeout struct in-config, so cfg cannot be const here */
+const char *oidc_cmd_http_timeout_short_set(cmd_parms *, void *, const char *, const char *, const char *);
+oidc_http_timeout_t *oidc_cfg_http_timeout_short_get(oidc_cfg_t *cfg);
+const char *oidc_cmd_http_timeout_long_set(cmd_parms *, void *, const char *, const char *, const char *);
+oidc_http_timeout_t *oidc_cfg_http_timeout_long_get(oidc_cfg_t *cfg);
 
 // ifdefs
 #ifdef USE_LIBJQ

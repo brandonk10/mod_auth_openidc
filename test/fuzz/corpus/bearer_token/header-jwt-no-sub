@@ -1,0 +1,1 @@
+Bearer {"iss": "https://as.example.com", "aud": "fuzz-resource", "iat": 0, "exp": 0}

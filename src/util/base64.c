@@ -46,7 +46,8 @@
 /*
  * base64url encode a string
  */
-int oidc_util_base64url_encode(request_rec *r, char **dst, const char *src, int src_len, int remove_padding) {
+int oidc_util_base64url_encode(request_rec *r, char **dst, const char *src, int src_len,
+			       oidc_base64url_padding_t padding) {
 	if ((src == NULL) || (src_len <= 0)) {
 		oidc_error(r, "not encoding anything; src=NULL and/or src_len<1");
 		return -1;
@@ -64,26 +65,29 @@ int oidc_util_base64url_encode(request_rec *r, char **dst, const char *src, int 
 			enc[i] = ',';
 		i++;
 	}
-	if (remove_padding) {
-		/* remove /0 and padding */
-		if (enc_len > 0)
-			enc_len--;
-		if ((enc_len > 0) && (enc[enc_len - 1] == ','))
-			enc_len--;
-		if ((enc_len > 0) && (enc[enc_len - 1] == ','))
-			enc_len--;
-		enc[enc_len] = '\0';
+	if (padding == OIDC_BASE64URL_PADDING_STRIP) {
+		/* the loop above already walked to the terminator, so `i` is the encoded length; drop the
+		 * padding from it (base64 emits at most two '=', rewritten to ',' above). Deriving the
+		 * index from the walk rather than from apr_base64_encode_len() also keeps it provably in
+		 * bounds - the length function is opaque to gcc -fanalyzer, which flagged the previous
+		 * enc_len arithmetic as a possible over-read. */
+		while ((i > 0) && (enc[i - 1] == ','))
+			i--;
+		enc[i] = '\0';
+		enc_len = i;
 	}
 	*dst = enc;
 	return enc_len;
 }
 
 /*
- * parse a base64 encoded binary value from the provided string
+ * parse a base64 encoded binary value from the provided string;
+ * returns NULL on success and writes the decoded bytes and length into
+ * *output / *output_len, or returns an error string on failure
  */
 char *oidc_util_base64_decode(apr_pool_t *pool, const char *input, char **output, int *output_len) {
-	if ((input == NULL) || (output == NULL) || (output_len == 0))
-		return apr_psprintf(pool, "base64-decoding of failed: invalid parameters");
+	if ((input == NULL) || (output == NULL) || (output_len == NULL))
+		return apr_psprintf(pool, "base64-decoding failed: invalid parameters");
 
 	*output = apr_pcalloc(pool, apr_base64_decode_len(input));
 	*output_len = apr_base64_decode(*output, input);
@@ -94,9 +98,7 @@ char *oidc_util_base64_decode(apr_pool_t *pool, const char *input, char **output
 	return NULL;
 }
 
-/*
- * base64url decode a string
- */
+/* Base64url decode length or a non-positive error. Callers must use a signed result type. */
 int oidc_util_base64url_decode(apr_pool_t *pool, char **dst, const char *src) {
 	if (src == NULL) {
 		return -1;

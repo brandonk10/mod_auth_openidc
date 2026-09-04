@@ -43,10 +43,8 @@
 #include "proto/proto.h"
 #include "cfg/dir.h"
 #include "cfg/parse.h"
-#include "handle/handle.h"
 #include "metadata.h"
 #include "metrics.h"
-#include "mod_auth_openidc.h"
 #include "util/util.h"
 
 #include <openssl/opensslconf.h>
@@ -95,8 +93,7 @@ apr_array_header_t *oidc_proto_supported_flows(apr_pool_t *pool) {
  */
 apr_byte_t oidc_proto_flow_is_supported(apr_pool_t *pool, const char *flow) {
 	apr_array_header_t *flows = oidc_proto_supported_flows(pool);
-	int i;
-	for (i = 0; i < flows->nelts; i++) {
+	for (int i = 0; i < flows->nelts; i++) {
 		if (oidc_util_spaced_string_equals(pool, flow, APR_ARRAY_IDX(flows, i, const char *)))
 			return TRUE;
 	}
@@ -107,7 +104,7 @@ apr_byte_t oidc_proto_flow_is_supported(apr_pool_t *pool, const char *flow) {
  * set the WWW-Authenticate response header according to https://tools.ietf.org/html/rfc6750#section-3
  */
 int oidc_proto_return_www_authenticate(request_rec *r, const char *error, const char *error_description) {
-	apr_byte_t accept_token_in = oidc_cfg_dir_oauth_accept_token_in_get(r);
+	apr_byte_t accept_token_in = (apr_byte_t)oidc_cfg_dir_oauth_accept_token_in_get(r);
 	char *hdr;
 	if (accept_token_in == OIDC_OAUTH_ACCEPT_TOKEN_IN_BASIC) {
 		hdr = apr_psprintf(r->pool, "%s", OIDC_PROTO_BASIC);

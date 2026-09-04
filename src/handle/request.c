@@ -45,9 +45,11 @@
 #include "mod_auth_openidc.h"
 #include "proto/proto.h"
 #include "state.h"
+#include "util/request_state.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
 
-apr_byte_t oidc_request_check_cookie_domain(request_rec *r, oidc_cfg_t *c, const char *original_url) {
+apr_byte_t oidc_request_check_cookie_domain(request_rec *r, const oidc_cfg_t *c, const char *original_url) {
 	/*
 	 * printout errors if Cookie settings are not going to work
 	 */
@@ -68,17 +70,14 @@ apr_byte_t oidc_request_check_cookie_domain(request_rec *r, oidc_cfg_t *c, const
 	}
 
 	if (oidc_cfg_cookie_domain_get(c) == NULL) {
-		if (_oidc_strnatcasecmp(o_uri.hostname, r_uri.hostname) != 0) {
-			const char *p = oidc_util_strcasestr(o_uri.hostname, r_uri.hostname);
-			if ((p == NULL) || (_oidc_strnatcasecmp(r_uri.hostname, p) != 0)) {
-				oidc_error(r,
-					   "the URL hostname (%s) of the configured " OIDCRedirectURI
-					   " does not match the URL hostname of the URL being accessed (%s): the "
-					   "\"state\" and \"session\" cookies will not be shared between the two!",
-					   r_uri.hostname, o_uri.hostname);
-				OIDC_METRICS_COUNTER_INC(r, c, OM_AUTHN_REQUEST_ERROR_URL);
-				return FALSE;
-			}
+		if (oidc_util_hostname_endswith(o_uri.hostname, r_uri.hostname) == FALSE) {
+			oidc_error(r,
+				   "the URL hostname (%s) of the configured " OIDCRedirectURI
+				   " does not match the URL hostname of the URL being accessed (%s): the "
+				   "\"state\" and \"session\" cookies will not be shared between the two!",
+				   r_uri.hostname, o_uri.hostname);
+			OIDC_METRICS_COUNTER_INC(r, c, OM_AUTHN_REQUEST_ERROR_URL);
+			return FALSE;
 		}
 	} else {
 		if (!oidc_util_cookie_domain_valid(o_uri.hostname, oidc_cfg_cookie_domain_get(c))) {
@@ -95,7 +94,7 @@ apr_byte_t oidc_request_check_cookie_domain(request_rec *r, oidc_cfg_t *c, const
 	return TRUE;
 }
 
-static const char *oidc_request_samesite_state_cookie(request_rec *r, struct oidc_cfg_t *c) {
+static const char *oidc_request_samesite_state_cookie(const request_rec *r, const struct oidc_cfg_t *c) {
 	const char *rv = NULL;
 	switch (oidc_cfg_cookie_same_site_state_get(c)) {
 	case OIDC_SAMESITE_COOKIE_STRICT:
@@ -116,14 +115,14 @@ static const char *oidc_request_samesite_state_cookie(request_rec *r, struct oid
  * set the state that is maintained between an authorization request and an authorization response
  * in a cookie in the browser that is cryptographically bound to that state
  */
-static int oidc_request_authorization_set_cookie(request_rec *r, oidc_cfg_t *c, const char *state,
-						 oidc_proto_state_t *proto_state) {
+static int oidc_request_authorization_set_cookie(request_rec *r, const oidc_cfg_t *c, const char *state,
+						 const oidc_proto_state_t *proto_state) {
 	/*
 	 * create a cookie consisting of 8 elements:
 	 * random value, original URL, original method, issuer, response_type, response_mod, prompt and timestamp
 	 * encoded as JSON, encrypting the resulting JSON value
 	 */
-	char *cookieValue = oidc_proto_state_to_cookie(r, c, proto_state);
+	const char *cookieValue = oidc_proto_state_to_cookie(r, c, proto_state);
 	if (cookieValue == NULL)
 		return HTTP_INTERNAL_SERVER_ERROR;
 
@@ -150,6 +149,148 @@ static int oidc_request_authorization_set_cookie(request_rec *r, oidc_cfg_t *c, 
 
 	return OK;
 }
+/* context structure for encoding parameters */
+typedef struct oidc_request_form_post_ctx_t {
+	request_rec *r;
+	/* the "<input ...>" lines, joined once by the caller below; growing the whole body per parameter
+	 * instead made the work quadratic in the number of parameters, which a request-controlled
+	 * parameter count can turn into an OOM (OSS-Fuzz 551746349) */
+	apr_array_header_t *inputs;
+} oidc_request_form_post_ctx_t;
+
+/*
+ * add a key/value pair post parameter
+ */
+static int oidc_request_form_post_param_add(void *rec, const char *key, const char *value) {
+	oidc_request_form_post_ctx_t *ctx = (oidc_request_form_post_ctx_t *)rec;
+	oidc_debug(ctx->r, "processing: %s=%s", key, value);
+	APR_ARRAY_PUSH(ctx->inputs, const char *) =
+	    apr_psprintf(ctx->r->pool, "      <input type=\"hidden\" name=\"%s\" value=\"%s\">\n",
+			 oidc_util_html_escape(ctx->r->pool, key), oidc_util_html_escape(ctx->r->pool, value));
+	return 1;
+}
+
+/*
+ * make the browser POST parameters through Javascript auto-submit
+ */
+static const char *oidc_request_html_post(request_rec *r, const char *url, const apr_table_t *params) {
+
+	oidc_debug(r, "enter");
+
+	oidc_request_form_post_ctx_t data = {
+	    r, apr_array_make(r->pool, params ? apr_table_elts(params)->nelts : 0, sizeof(const char *))};
+	apr_table_do(oidc_request_form_post_param_add, &data, params, NULL);
+
+	/* the action is the provider's authorization endpoint, i.e. it comes from provider
+	 * metadata rather than from us; escape it like the parameters added above already are */
+	return apr_psprintf(r->pool,
+			    "    <p>Submitting Authentication Request...</p>\n"
+			    "    <form method=\"post\" action=\"%s\">\n"
+			    "      <p>\n"
+			    "%s"
+			    "      </p>\n"
+			    "    </form>\n",
+			    oidc_util_html_escape(r->pool, url), apr_array_pstrcat(r->pool, data.inputs, '\0'));
+}
+/*
+ * send the authentication request via an HTML form auto-POST page
+ */
+static int oidc_request_auth_send_post(request_rec *r, const struct oidc_provider_t *provider,
+				       const apr_table_t *params) {
+	/* construct a HTML POST auto-submit page with the authorization request parameters */
+	const char *html_body =
+	    oidc_request_html_post(r, oidc_cfg_provider_authorization_endpoint_url_get(provider), params);
+
+	/* signal this to the content handler */
+	return oidc_util_html_content_prep(r, OIDC_REQUEST_STATE_KEY_AUTHN_POST, "Submitting...", NULL,
+					   "HTMLFormElement.prototype.submit.call(document.forms[0])", html_body);
+}
+
+/*
+ * send the authentication request via an HTTP redirect (or a Javascript-based preserve page)
+ */
+static int oidc_request_auth_send_get(request_rec *r, const struct oidc_provider_t *provider,
+				      const apr_table_t *params) {
+
+	/* construct the full authorization request URL */
+	const char *authorization_request =
+	    oidc_http_query_encoded_url(r, oidc_cfg_provider_authorization_endpoint_url_get(provider), params);
+
+	char *javascript = NULL;
+
+	/* see if we need to preserve POST parameters through Javascript/HTML5 storage */
+	if (oidc_response_post_preserve_javascript(r, authorization_request, &javascript, NULL) == FALSE) {
+		/* add the redirect location header */
+		oidc_http_hdr_out_location_set(r, authorization_request);
+		/* and tell Apache to return an HTTP Redirect (302) message */
+		return HTTP_MOVED_TEMPORARILY;
+	}
+
+	// NB: if a template is in use, we should not override
+	// OIDC_REQUEST_STATE_KEY_HTTP with OIDC_REQUEST_STATE_KEY_AUTHN_PRESERVE
+	if (oidc_request_state_get(r, OIDC_REQUEST_STATE_KEY_HTTP) != NULL)
+		return OK;
+
+	/* signal this to the content handler */
+	return oidc_util_html_content_prep(r, OIDC_REQUEST_STATE_KEY_AUTHN_PRESERVE, "Preserving...", javascript,
+					   "preserveOnLoad()", "<p>Preserving...</p>");
+}
+
+/*
+ * send an OpenID Connect authorization request to the specified provider
+ */
+int oidc_request_auth(request_rec *r, oidc_cfg_t *cfg, const struct oidc_provider_t *provider, const char *login_hint,
+		      const char *redirect_uri, const char *state, oidc_proto_state_t *proto_state,
+		      const char *id_token_hint, const char *code_challenge, const char *auth_request_params,
+		      const char *path_scope) {
+	int rv;
+
+	/* log some stuff */
+	oidc_debug(r,
+		   "enter, issuer=%s, redirect_uri=%s, state=%s, proto_state=%s, code_challenge=%s, "
+		   "auth_request_params=%s, path_scope=%s",
+		   oidc_cfg_provider_issuer_get(provider), redirect_uri, state,
+		   oidc_proto_state_to_string(r, proto_state), code_challenge, auth_request_params, path_scope);
+
+	if (oidc_cfg_provider_client_id_get(provider) == NULL) {
+		oidc_error(r, "no Client ID set for the provider: perhaps you are accessing an endpoint protected with "
+			      "\"AuthType openid-connect\" instead of \"AuthType oauth20\"?)");
+		return HTTP_INTERNAL_SERVER_ERROR;
+	}
+
+	/* assemble parameters to call the authorization endpoint */
+	apr_table_t *params = apr_table_make(r->pool, 4);
+	oidc_proto_request_auth_params_set(r, cfg, provider, login_hint, redirect_uri, state, proto_state,
+					   id_token_hint, code_challenge, auth_request_params, path_scope, params);
+
+	/* send the full authentication request via POST, PAR or GET */
+	switch (oidc_proto_profile_auth_request_method_get(provider)) {
+	case OIDC_AUTH_REQUEST_METHOD_POST:
+		rv = oidc_request_auth_send_post(r, provider, params);
+		break;
+	case OIDC_AUTH_REQUEST_METHOD_PAR:
+		rv = oidc_proto_request_auth_push(r, cfg, provider, params);
+		break;
+	case OIDC_AUTH_REQUEST_METHOD_GET:
+		rv = oidc_request_auth_send_get(r, provider, params);
+		break;
+	default:
+		oidc_error(r, "oidc_cfg_provider_auth_request_method_get(provider) set to an unknown value: %d",
+			   oidc_proto_profile_auth_request_method_get(provider));
+		return HTTP_INTERNAL_SERVER_ERROR;
+	}
+
+	/* cleanup */
+	oidc_proto_state_destroy(proto_state);
+
+	/* no cache */
+	oidc_http_hdr_err_out_add(r, OIDC_HTTP_HDR_CACHE_CONTROL, "no-cache, no-store, max-age=0");
+
+	/* log our exit code */
+	oidc_debug(r, "return: %d", rv);
+
+	return rv;
+}
 
 /*
  * authenticate the user to the selected OP, if the OP is not selected yet perform discovery first
@@ -166,8 +307,8 @@ int oidc_request_authenticate_user(request_rec *r, oidc_cfg_t *c, oidc_provider_
 
 	if (provider == NULL) {
 
-		// TODO: should we use an explicit redirect to the discovery endpoint (maybe a "discovery" param to the
-		// redirect_uri)?
+		// NB: discovery is deferred to the content handler below rather than via an explicit redirect to a
+		// discovery endpoint
 		if (oidc_cfg_metadata_dir_get(c) != NULL) {
 			/*
 			 * No authentication done but request not allowed without authentication
@@ -217,6 +358,7 @@ int oidc_request_authenticate_user(request_rec *r, oidc_cfg_t *c, oidc_provider_
 		oidc_error(
 		    r, "could not store the current URL in the state: most probably you need to ensure that it does "
 		       "not contain unencoded Unicode characters e.g. by forcing IE 11 to encode all URL characters");
+		oidc_proto_state_destroy(proto_state);
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
@@ -231,6 +373,13 @@ int oidc_request_authenticate_user(request_rec *r, oidc_cfg_t *c, oidc_provider_
 		oidc_proto_state_set_prompt(proto_state, prompt);
 	if (pkce_state)
 		oidc_proto_state_set_pkce_state(proto_state, pkce_state);
+	/* Preserve per-path settings only when session management may need them for silent reauthentication. */
+	if (oidc_cfg_provider_check_session_iframe_get(provider) != NULL) {
+		if (auth_request_params)
+			oidc_proto_state_set_auth_request_params(proto_state, auth_request_params);
+		if (path_scope)
+			oidc_proto_state_set_path_scope(proto_state, path_scope);
+	}
 
 	/* get a hash value that fingerprints the browser concatenated with the random input */
 	const char *state = oidc_state_browser_fingerprint(r, c, nonce);
@@ -251,9 +400,8 @@ int oidc_request_authenticate_user(request_rec *r, oidc_cfg_t *c, oidc_provider_
 	}
 
 	/* send off to the OpenID Connect Provider */
-	// TODO: maybe show intermediate/progress screen "redirecting to"
-	rc = oidc_proto_request_auth(r, provider, login_hint, oidc_util_url_redirect_uri(r, c), state, proto_state,
-				     id_token_hint, code_challenge, auth_request_params, path_scope);
+	rc = oidc_request_auth(r, c, provider, login_hint, oidc_util_url_redirect_uri(r, c), state, proto_state,
+			       id_token_hint, code_challenge, auth_request_params, path_scope);
 
 	OIDC_METRICS_TIMING_ADD(r, c, OM_AUTHN_REQUEST);
 

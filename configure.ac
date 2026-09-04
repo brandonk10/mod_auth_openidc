@@ -1,4 +1,4 @@
-AC_INIT([mod_auth_openidc],[2.4.19.3dev],[hans.zandbelt@openidc.com])
+AC_INIT([mod_auth_openidc],[2.4.20.3],[hans.zandbelt@openidc.com])
 
 AC_SUBST(NAMEVER, AC_PACKAGE_TARNAME()-AC_PACKAGE_VERSION())
 
@@ -80,6 +80,10 @@ AC_SUBST(JANSSON_LIBS)
 PKG_CHECK_MODULES(CJOSE, cjose)
 AC_SUBST(CJOSE_CFLAGS)
 AC_SUBST(CJOSE_LIBS)
+# the linked cjose version, for the test suite to gate seeds that trip a
+# version-specific cjose bug (see test/fuzz/run-fuzzers.sh)
+CJOSE_VERSION=`$PKG_CONFIG --modversion cjose 2>/dev/null`
+AC_SUBST(CJOSE_VERSION)
 
 # PCRE
 PKG_CHECK_MODULES([PCRE2], libpcre2-8, [
@@ -144,7 +148,7 @@ AC_SUBST([ZLIB_LIBS])
 AC_ARG_WITH([hiredis],
 	[AS_HELP_STRING([--with-hiredis],
 	[support Redis @<:@default=check@:>@])],
-	[],
+	[with_hiredis_explicit=yes],
 	[with_hiredis=yes])
 AS_CASE(["$with_hiredis"],
 	[yes], [
@@ -152,6 +156,14 @@ AS_CASE(["$with_hiredis"],
 	],
 	[no], [HAVE_LIBHIREDIS=0],
 	[PKG_CHECK_MODULES([HIREDIS], [hiredis], [HAVE_LIBHIREDIS=1], [HAVE_LIBHIREDIS=0])])
+
+# an explicit --with-hiredis is a request, not a probe: fail rather than silently
+# handing back a module without Redis support. The unflagged default stays "check",
+# which is what the help string above advertises, and --without-hiredis is honoured.
+if test "x$with_hiredis_explicit" = "xyes" && test "x$with_hiredis" != "xno" && test "x$HAVE_LIBHIREDIS" = "x0" ; then
+	AC_MSG_ERROR([--with-hiredis was given but hiredis was not found: install the hiredis development package, or omit --with-hiredis to build without Redis support])
+fi
+
 AM_CONDITIONAL(HAVE_LIBHIREDIS, [test x"$HAVE_LIBHIREDIS" = "x1"])
 AC_SUBST(HIREDIS_CFLAGS)
 AC_SUBST(HIREDIS_LIBS)
@@ -161,7 +173,7 @@ HAVE_LIBJQ=0
 
 AC_ARG_WITH([jq], AS_HELP_STRING([--with-jq=PATH], [location of libjq development headers]),)
 
-if test -n "$with_jq"
+if test -n "$with_jq" && test "x$with_jq" != "xno"
 then
 	if test "$JQ_CFLAGS" == ""; then
 		if test "$with_jq" == "yes"; then
@@ -178,13 +190,20 @@ then
 		fi
 	fi
 
+	old_CPPFLAGS=$CPPFLAGS
+	old_LDFLAGS=$LDFLAGS
+
 	CPPFLAGS="$JQ_CFLAGS $CPPFLAGS"
 	AC_CHECK_HEADER([jq.h], [HAVE_LIBJQ=1], [HAVE_LIBJQ=0])
 
 	LDFLAGS="$JQ_LIBS $LDFLAGS"
 	AC_CHECK_LIB([jq], [jq_init], [HAVE_LIBJQ=1], [HAVE_LIBJQ=0])
-	if test "x$have_jq" = "x0" ; then
-		AC_MSG_WARN("cannot find library for -ljq.")
+
+	CPPFLAGS=$old_CPPFLAGS
+	LDFLAGS=$old_LDFLAGS
+
+	if test "x$HAVE_LIBJQ" = "x0" ; then
+		AC_MSG_ERROR([--with-jq was given but libjq was not found: install the libjq development package, or omit --with-jq to build without claims-expression support])
 	fi
 fi
 

@@ -42,6 +42,7 @@
 
 #include "proto/proto.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
 
 #define OIDC_PROTO_STATE_ISSUER "i"
 #define OIDC_PROTO_STATE_ORIGINAL_URL "ou"
@@ -53,112 +54,141 @@
 #define OIDC_PROTO_STATE_PROMPT "pr"
 #define OIDC_PROTO_STATE_PKCE_STATE "ps"
 #define OIDC_PROTO_STATE_STATE "s"
+#define OIDC_PROTO_STATE_AUTH_REQUEST_PARAMS "arp"
+#define OIDC_PROTO_STATE_PATH_SCOPE "psc"
 
 /*
  * retrieve a string from the state object
  */
-static const char *oidc_proto_state_get_string_value(oidc_proto_state_t *proto_state, const char *name) {
-	json_t *v = json_object_get(proto_state, name);
-	return v ? json_string_value(v) : NULL;
+static const char *oidc_proto_state_get_string_value(const oidc_proto_state_t *proto_state, const char *name) {
+	const oidc_json_t *v = oidc_json_object_get(proto_state, name);
+	return v ? oidc_json_string_value(v) : NULL;
 }
 
 /*
  * set a string value in the state object
  */
 static void oidc_proto_state_set_string_value(oidc_proto_state_t *proto_state, const char *name, const char *value) {
-	json_object_set_new(proto_state, name, json_string(value));
+	oidc_json_object_set_new(proto_state, name, oidc_json_string(value));
 }
 
 /*
  * create a new state object
  */
-oidc_proto_state_t *oidc_proto_state_new() {
-	return json_object();
+oidc_proto_state_t *oidc_proto_state_new(void) {
+	return oidc_json_object();
 }
 
 /*
  * free up resources allocated for a state object
  */
 void oidc_proto_state_destroy(oidc_proto_state_t *proto_state) {
-	json_decref(proto_state);
+	oidc_json_decref(proto_state);
 }
 
 /*
- * serialize a state object to a string (for logging/debugging purposes)
+ * serialize a state object to a string (for logging/debugging purposes); the nonce and
+ * PKCE code_verifier are redacted since they are security-sensitive values that should
+ * not end up in full in a log file
  */
-char *oidc_proto_state_to_string(request_rec *r, oidc_proto_state_t *proto_state) {
-	return oidc_util_json_encode(r->pool, proto_state, JSON_COMPACT);
+char *oidc_proto_state_to_string(request_rec *r, const oidc_proto_state_t *proto_state) {
+	oidc_proto_state_t *copy = oidc_json_deep_copy(proto_state);
+	char *result = NULL;
+
+	if (oidc_json_object_get(copy, OIDC_PROTO_STATE_NONCE) != NULL)
+		oidc_proto_state_set_string_value(copy, OIDC_PROTO_STATE_NONCE, "***");
+	if (oidc_json_object_get(copy, OIDC_PROTO_STATE_PKCE_STATE) != NULL)
+		oidc_proto_state_set_string_value(copy, OIDC_PROTO_STATE_PKCE_STATE, "***");
+
+	result = oidc_json_encode(r->pool, copy, OIDC_JSON_COMPACT);
+	oidc_json_decref(copy);
+
+	return result;
 }
 
 /*
  * retrieve the issuer value from the state object
  */
-const char *oidc_proto_state_get_issuer(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_issuer(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_ISSUER);
 }
 
 /*
  * retrieve the nonce value from the state object
  */
-const char *oidc_proto_state_get_nonce(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_nonce(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_NONCE);
 }
 
 /*
  * retrieve the timestamp value from the state object
  */
-apr_time_t oidc_proto_state_get_timestamp(oidc_proto_state_t *proto_state) {
-	json_t *v = json_object_get(proto_state, OIDC_PROTO_STATE_TIMESTAMP);
-	return v ? apr_time_from_sec(json_integer_value(v)) : -1;
+apr_time_t oidc_proto_state_get_timestamp(const oidc_proto_state_t *proto_state) {
+	const oidc_json_t *v = oidc_json_object_get(proto_state, OIDC_PROTO_STATE_TIMESTAMP);
+	return v ? apr_time_from_sec(oidc_json_integer_value(v)) : -1;
 }
 
 /*
  * retrieve the prompt value from the state object
  */
-const char *oidc_proto_state_get_prompt(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_prompt(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_PROMPT);
 }
 
 /*
  * retrieve the response type value from the state object
  */
-const char *oidc_proto_state_get_response_type(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_response_type(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_RESPONSE_TYPE);
 }
 
 /*
  * retrieve the response mode value from the state object
  */
-const char *oidc_proto_state_get_response_mode(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_response_mode(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_RESPONSE_MODE);
 }
 
 /*
  * retrieve the original URL value from the state object
  */
-const char *oidc_proto_state_get_original_url(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_original_url(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_ORIGINAL_URL);
 }
 
 /*
  * retrieve the original HTTP method value from the state object
  */
-const char *oidc_proto_state_get_original_method(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_original_method(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_ORIGINAL_METHOD);
 }
 
 /*
  * retrieve the state (URL parameter) value from the state object
  */
-const char *oidc_proto_state_get_state(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_state(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_STATE);
 }
 
 /*
  * retrieve the PKCE state value from the state object
  */
-const char *oidc_proto_state_get_pkce_state(oidc_proto_state_t *proto_state) {
+const char *oidc_proto_state_get_pkce_state(const oidc_proto_state_t *proto_state) {
 	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_PKCE_STATE);
+}
+
+/*
+ * retrieve the per-path authentication request parameters from the state object
+ */
+const char *oidc_proto_state_get_auth_request_params(const oidc_proto_state_t *proto_state) {
+	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_AUTH_REQUEST_PARAMS);
+}
+
+/*
+ * retrieve the per-path scope from the state object
+ */
+const char *oidc_proto_state_get_path_scope(const oidc_proto_state_t *proto_state) {
+	return oidc_proto_state_get_string_value(proto_state, OIDC_PROTO_STATE_PATH_SCOPE);
 }
 
 /*
@@ -225,29 +255,44 @@ void oidc_proto_state_set_pkce_state(oidc_proto_state_t *proto_state, const char
 }
 
 /*
+ * set the per-path authentication request parameters in the state object
+ */
+void oidc_proto_state_set_auth_request_params(oidc_proto_state_t *proto_state, const char *auth_request_params) {
+	oidc_proto_state_set_string_value(proto_state, OIDC_PROTO_STATE_AUTH_REQUEST_PARAMS, auth_request_params);
+}
+
+/*
+ * set the per-path scope in the state object
+ */
+void oidc_proto_state_set_path_scope(oidc_proto_state_t *proto_state, const char *path_scope) {
+	oidc_proto_state_set_string_value(proto_state, OIDC_PROTO_STATE_PATH_SCOPE, path_scope);
+}
+
+/*
  * set the current time as timestamp value in the state object
  */
 void oidc_proto_state_set_timestamp_now(oidc_proto_state_t *proto_state) {
-	json_object_set_new(proto_state, OIDC_PROTO_STATE_TIMESTAMP, json_integer(apr_time_sec(apr_time_now())));
+	oidc_json_object_set_new(proto_state, OIDC_PROTO_STATE_TIMESTAMP,
+				 oidc_json_integer(apr_time_sec(apr_time_now())));
 }
 
 /*
  * parse a state object from the provided cookie value
  */
-oidc_proto_state_t *oidc_proto_state_from_cookie(request_rec *r, oidc_cfg_t *c, const char *cookieValue) {
+oidc_proto_state_t *oidc_proto_state_from_cookie(request_rec *r, const oidc_cfg_t *c, const char *cookieValue) {
 	char *s_payload = NULL;
-	json_t *result = NULL;
+	oidc_json_t *result = NULL;
 	oidc_util_jwt_verify(r, oidc_cfg_crypto_passphrase_get(c), cookieValue, &s_payload);
-	oidc_util_json_decode_object(r, s_payload, &result);
+	oidc_json_decode_object(r, s_payload, &result);
 	return result;
 }
 
 /*
  * serialize a state object to a signed JWT cookie value
  */
-char *oidc_proto_state_to_cookie(request_rec *r, oidc_cfg_t *c, oidc_proto_state_t *proto_state) {
+char *oidc_proto_state_to_cookie(request_rec *r, const oidc_cfg_t *c, const oidc_proto_state_t *proto_state) {
 	char *cookieValue = NULL;
 	oidc_util_jwt_create(r, oidc_cfg_crypto_passphrase_get(c),
-			     oidc_util_json_encode(r->pool, proto_state, JSON_COMPACT), &cookieValue);
+			     oidc_json_encode(r->pool, proto_state, OIDC_JSON_COMPACT), &cookieValue);
 	return cookieValue;
 }

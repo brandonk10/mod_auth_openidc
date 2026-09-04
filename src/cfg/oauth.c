@@ -46,40 +46,60 @@
 #include "jose.h"
 #include "proto/proto.h"
 
+/*
+ * Generate the declaration, initialization, and merge logic for simple OAuth members. Members
+ * with special ownership or merge rules remain explicit below.
+ */
+#define OIDC_OAUTH_CFG_SIMPLE_MEMBERS(PTR, INT)                                                                        \
+	PTR(char *, metadata_url)                                                                                      \
+	PTR(char *, verify_jwks_uri)                                                                                   \
+	PTR(apr_array_header_t *, verify_aud_values)                                                                   \
+	PTR(char *, verify_issuer)                                                                                     \
+	PTR(apr_hash_t *, verify_shared_keys)                                                                          \
+	PTR(apr_hash_t *, decrypt_shared_keys)                                                                         \
+	PTR(char *, client_id)                                                                                         \
+	PTR(char *, client_secret)                                                                                     \
+	PTR(char *, introspection_endpoint_url)                                                                        \
+	INT(introspection_endpoint_method)                                                                             \
+	PTR(char *, introspection_token_param_name)                                                                    \
+	PTR(char *, introspection_endpoint_params)                                                                     \
+	PTR(char *, introspection_endpoint_auth)                                                                       \
+	PTR(char *, introspection_endpoint_auth_alg)                                                                   \
+	PTR(const char *, introspection_client_auth_bearer_token)                                                      \
+	PTR(char *, introspection_endpoint_tls_client_key)                                                             \
+	PTR(char *, introspection_endpoint_tls_client_key_pwd)                                                         \
+	PTR(char *, introspection_endpoint_tls_client_cert)                                                            \
+	INT(ssl_validate_server)
+
+#define OIDC_OAUTH_M_DECL_PTR(type, name) type name;
+#define OIDC_OAUTH_M_DECL_INT(name) int name;
+#define OIDC_OAUTH_M_CREATE_PTR(type, name) o->name = NULL;
+#define OIDC_OAUTH_M_CREATE_INT(name) o->name = OIDC_CONFIG_POS_INT_UNSET;
+#define OIDC_OAUTH_M_MERGE_PTR(type, name) dst->name = _oidc_cfg_merge_ptr(add->name, base->name);
+#define OIDC_OAUTH_M_MERGE_INT(name) dst->name = _oidc_cfg_merge_pos_int(add->name, base->name);
+
 struct oidc_oauth_t {
 
-	char *metadata_url;
+	OIDC_OAUTH_CFG_SIMPLE_MEMBERS(OIDC_OAUTH_M_DECL_PTR, OIDC_OAUTH_M_DECL_INT)
 
-	char *verify_jwks_uri;
-
-	apr_hash_t *verify_shared_keys;
+	/* special semantics, handled by hand in create/merge: deep-copied on merge */
 	apr_array_header_t *verify_public_keys;
-
-	char *client_id;
-	char *client_secret;
-
-	char *introspection_endpoint_url;
-	int introspection_endpoint_method;
-	char *introspection_token_param_name;
-	char *introspection_endpoint_params;
-	char *introspection_endpoint_auth;
-	char *introspection_endpoint_auth_alg;
-	char *introspection_client_auth_bearer_token;
-	char *introspection_endpoint_tls_client_key;
-	char *introspection_endpoint_tls_client_key_pwd;
-	char *introspection_endpoint_tls_client_cert;
+	/* grouped: set/merged together with the format/required members below */
 	char *introspection_token_expiry_claim_name;
 	oidc_oauth_introspection_token_expiry_claim_format_t introspection_token_expiry_claim_format;
 	oidc_oauth_introspection_token_expiry_claim_required_t introspection_token_expiry_claim_required;
-
+	/* grouped: claim_name/reg_exp/replace are set/merged together */
 	oidc_remote_user_claim_t remote_user_claim;
-
-	int ssl_validate_server;
 };
 
-// helper
+/*
+ * Body generators for the OAuth resource-server (oidc_oauth_t) accessors
+ * declared in cfg/oauth.h: for member `foo` they emit oidc_cmd_oauth_foo_set(),
+ * oidc_cfg_oauth_foo_set() and oidc_cfg_oauth_foo_get(); those names are
+ * token-pasted here and so appear in no source line.
+ */
 #define OIDC_OAUTH_MEMBER_FUNC_GET(member, type)                                                                       \
-	type oidc_cfg_oauth_##member##_get(oidc_cfg_t *cfg) {                                                          \
+	type oidc_cfg_oauth_##member##_get(const oidc_cfg_t *cfg) {                                                    \
 		return cfg->oauth->member;                                                                             \
 	}
 
@@ -105,7 +125,7 @@ struct oidc_oauth_t {
 		return OIDC_CONFIG_DIR_RV(cmd, rv);                                                                    \
 	}                                                                                                              \
                                                                                                                        \
-	type oidc_cfg_oauth_##member##_get(oidc_cfg_t *cfg) {                                                          \
+	type oidc_cfg_oauth_##member##_get(const oidc_cfg_t *cfg) {                                                    \
 		if (cfg->oauth->member == OIDC_CONFIG_POS_INT_UNSET)                                                   \
 			return def_val;                                                                                \
 		return cfg->oauth->member;                                                                             \
@@ -122,12 +142,21 @@ struct oidc_oauth_t {
 	}                                                                                                              \
 	OIDC_OAUTH_MEMBER_FUNC_GET(member, const apr_array_header_t *)
 
+#define OIDC_OAUTH_MEMBER_FUNCS_STR_LIST(member)                                                                       \
+	const char *oidc_cmd_oauth_##member##_set(cmd_parms *cmd, void *ptr, const char *arg) {                        \
+		oidc_cfg_t *cfg =                                                                                      \
+		    (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);              \
+		const char *rv = oidc_cfg_string_list_add(cmd->pool, &cfg->oauth->member, arg);                        \
+		return OIDC_CONFIG_DIR_RV(cmd, rv);                                                                    \
+	}                                                                                                              \
+	OIDC_OAUTH_MEMBER_FUNC_GET(member, const apr_array_header_t *)
+
 #define OIDC_OAUTH_MEMBER_FUNCS_STR(member) OIDC_OAUTH_MEMBER_FUNCS_TYPE(member, const char *, NULL)
 #define OIDC_OAUTH_MEMBER_FUNCS_URL(member)                                                                            \
 	OIDC_OAUTH_MEMBER_FUNCS_TYPE(member, const char *, oidc_cfg_parse_is_valid_http_url(cmd->pool, arg))
 
 #define OIDC_OAUTH_MEMBER_FUNC_STR_GET_DEF(member, def_val)                                                            \
-	const char *oidc_cfg_oauth_##member##_get(oidc_cfg_t *cfg) {                                                   \
+	const char *oidc_cfg_oauth_##member##_get(const oidc_cfg_t *cfg) {                                             \
 		return cfg->oauth->member ? cfg->oauth->member : def_val;                                              \
 	}
 
@@ -157,12 +186,15 @@ OIDC_OAUTH_MEMBER_FUNCS_FILE(introspection_endpoint_tls_client_cert)
 OIDC_OAUTH_MEMBER_FUNCS_FILE(introspection_endpoint_tls_client_key)
 OIDC_OAUTH_MEMBER_FUNCS_PASSPHRASE(introspection_endpoint_tls_client_key_pwd)
 OIDC_OAUTH_MEMBER_FUNCS_KEYS(verify_public_keys)
+OIDC_OAUTH_MEMBER_FUNCS_STR_LIST(verify_aud_values)
+OIDC_OAUTH_MEMBER_FUNCS_STR(verify_issuer)
 OIDC_OAUTH_MEMBER_FUNC_GET(introspection_client_auth_bearer_token, const char *)
 OIDC_OAUTH_MEMBER_FUNC_GET(introspection_token_expiry_claim_format,
 			   oidc_oauth_introspection_token_expiry_claim_format_t)
 OIDC_OAUTH_MEMBER_FUNC_GET(introspection_token_expiry_claim_required,
 			   oidc_oauth_introspection_token_expiry_claim_required_t)
 OIDC_OAUTH_MEMBER_FUNC_GET(verify_shared_keys, apr_hash_t *)
+OIDC_OAUTH_MEMBER_FUNC_GET(decrypt_shared_keys, apr_hash_t *)
 
 #define OIDC_DEFAULT_OAUTH_SSL_VALIDATE_SERVER 1
 OIDC_OAUTH_MEMBER_FUNCS_BOOL(ssl_validate_server, OIDC_DEFAULT_OAUTH_SSL_VALIDATE_SERVER)
@@ -202,21 +234,21 @@ const char *oidc_cmd_oauth_introspection_endpoint_auth_set(cmd_parms *cmd, void 
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
-const char *oidc_cfg_oauth_introspection_endpoint_auth_get(oidc_cfg_t *cfg) {
+const char *oidc_cfg_oauth_introspection_endpoint_auth_get(const oidc_cfg_t *cfg) {
 	return cfg->oauth->introspection_endpoint_auth;
 }
 
-const char *oidc_cfg_oauth_introspection_endpoint_auth_alg_get(oidc_cfg_t *cfg) {
+const char *oidc_cfg_oauth_introspection_endpoint_auth_alg_get(const oidc_cfg_t *cfg) {
 	return cfg->oauth->introspection_endpoint_auth_alg;
 }
 
-oidc_remote_user_claim_t *oidc_cfg_oauth_remote_user_claim_get(oidc_cfg_t *cfg) {
+oidc_remote_user_claim_t *oidc_cfg_oauth_remote_user_claim_get(const oidc_cfg_t *cfg) {
 	return &cfg->oauth->remote_user_claim;
 }
 
 #define OIDC_DEFAULT_OAUTH_CLAIM_REMOTE_USER "sub"
 
-const char *oidc_cfg_oauth_remote_user_claim_name_get(oidc_cfg_t *cfg) {
+const char *oidc_cfg_oauth_remote_user_claim_name_get(const oidc_cfg_t *cfg) {
 	return cfg->oauth->remote_user_claim.claim_name != NULL ? cfg->oauth->remote_user_claim.claim_name
 								: OIDC_DEFAULT_OAUTH_CLAIM_REMOTE_USER;
 }
@@ -250,7 +282,7 @@ OIDC_OAUTH_MEMBER_FUNCS_INT(introspection_endpoint_method, oidc_parse_introspect
 const char *oidc_cmd_oauth_introspection_client_auth_bearer_token_set(cmd_parms *cmd, void *struct_ptr,
 								      const char *args) {
 	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);
-	char *w = ap_getword_conf(cmd->pool, &args);
+	const char *w = ap_getword_conf(cmd->pool, &args);
 	cfg->oauth->introspection_client_auth_bearer_token = (*w == '\0' || *args != 0) ? "" : w;
 	return NULL;
 }
@@ -291,18 +323,19 @@ const char *oidc_cmd_oauth_token_expiry_claim_set(cmd_parms *cmd, void *dummy, c
 }
 
 /*
- * add a shared key to a list of JWKs with shared keys
+ * parse a shared-key record from a directive value and add the resulting symmetric JWK to the given
+ * (lazily created) hash of shared keys
  */
-const char *oidc_cmd_oauth_verify_shared_keys_set(cmd_parms *cmd, void *struct_ptr, const char *arg) {
+static const char *oidc_cmd_oauth_shared_keys_add(cmd_parms *cmd, const char *arg, apr_hash_t **keys) {
 	oidc_jose_error_t err;
 	oidc_jwk_t *jwk = NULL;
 	char *use = NULL;
-
-	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);
-
-	char *kid = NULL, *secret = NULL;
+	char *kid = NULL;
+	char *secret = NULL;
 	int key_len = 0;
-	const char *rv = oidc_cfg_parse_key_record(cmd->pool, arg, &kid, &secret, &key_len, &use, TRUE);
+
+	const char *rv =
+	    oidc_cfg_parse_key_record(cmd->pool, arg, &kid, &secret, &key_len, &use, NULL, OIDC_KEY_RECORD_TRIPLET);
 	if (rv != NULL)
 		return rv;
 
@@ -312,13 +345,29 @@ const char *oidc_cmd_oauth_verify_shared_keys_set(cmd_parms *cmd, void *struct_p
 				    secret, oidc_jose_e2s(cmd->pool, err));
 	}
 
-	if (cfg->oauth->verify_shared_keys == NULL)
-		cfg->oauth->verify_shared_keys = apr_hash_make(cmd->pool);
+	if (*keys == NULL)
+		*keys = apr_hash_make(cmd->pool);
 	if (use)
 		jwk->use = apr_pstrdup(cmd->pool, use);
-	apr_hash_set(cfg->oauth->verify_shared_keys, jwk->kid, APR_HASH_KEY_STRING, jwk);
+	apr_hash_set(*keys, jwk->kid, APR_HASH_KEY_STRING, jwk);
 
 	return NULL;
+}
+
+/*
+ * add a shared key to a list of JWKs with shared keys
+ */
+const char *oidc_cmd_oauth_verify_shared_keys_set(cmd_parms *cmd, void *struct_ptr, const char *arg) {
+	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);
+	return oidc_cmd_oauth_shared_keys_add(cmd, arg, &cfg->oauth->verify_shared_keys);
+}
+
+/*
+ * add a shared key to the list of JWKs used to decrypt encrypted JWT access tokens
+ */
+const char *oidc_cmd_oauth_decrypt_shared_keys_set(cmd_parms *cmd, void *struct_ptr, const char *arg) {
+	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);
+	return oidc_cmd_oauth_shared_keys_add(cmd, arg, &cfg->oauth->decrypt_shared_keys);
 }
 
 /* default OAuth 2.0 non-spec compliant introspection expiry claim format */
@@ -328,64 +377,32 @@ const char *oidc_cmd_oauth_verify_shared_keys_set(cmd_parms *cmd, void *struct_p
 
 oidc_oauth_t *oidc_cfg_oauth_create(apr_pool_t *pool) {
 	oidc_oauth_t *o = apr_pcalloc(pool, sizeof(oidc_oauth_t));
-	o->ssl_validate_server = OIDC_CONFIG_POS_INT_UNSET;
-	o->metadata_url = NULL;
-	o->client_id = NULL;
-	o->client_secret = NULL;
-	o->introspection_endpoint_tls_client_cert = NULL;
-	o->introspection_endpoint_tls_client_key = NULL;
-	o->introspection_endpoint_url = NULL;
-	o->introspection_endpoint_method = OIDC_CONFIG_POS_INT_UNSET;
-	o->introspection_endpoint_params = NULL;
-	o->introspection_endpoint_auth = NULL;
-	o->introspection_endpoint_auth_alg = NULL;
-	o->introspection_client_auth_bearer_token = NULL;
-	o->introspection_token_param_name = NULL;
+	OIDC_OAUTH_CFG_SIMPLE_MEMBERS(OIDC_OAUTH_M_CREATE_PTR, OIDC_OAUTH_M_CREATE_INT)
+	o->verify_public_keys = NULL;
 	o->introspection_token_expiry_claim_name = NULL;
 	o->introspection_token_expiry_claim_format = OIDC_TOKEN_EXPIRY_CLAIM_FORMAT_RELATIVE;
 	o->introspection_token_expiry_claim_required = OIDC_TOKEN_EXPIRY_CLAIM_REQUIRED_MANDATORY;
 	o->remote_user_claim.claim_name = NULL;
 	o->remote_user_claim.reg_exp = NULL;
 	o->remote_user_claim.replace = NULL;
-	o->verify_jwks_uri = NULL;
-	o->verify_public_keys = NULL;
-	o->verify_shared_keys = NULL;
 	return o;
 }
 
+/* Shallow request copy for endpoint overrides; members still belong to the shared source. */
+oidc_oauth_t *oidc_cfg_oauth_shallow_copy(apr_pool_t *pool, const oidc_oauth_t *src) {
+	return apr_pmemdup(pool, src, sizeof(*src));
+}
+
 void oidc_cfg_oauth_merge(apr_pool_t *pool, oidc_oauth_t *dst, const oidc_oauth_t *base, const oidc_oauth_t *add) {
-	dst->ssl_validate_server = add->ssl_validate_server != OIDC_CONFIG_POS_INT_UNSET ? add->ssl_validate_server
-											 : base->ssl_validate_server;
-	dst->metadata_url = add->metadata_url != NULL ? add->metadata_url : base->metadata_url;
-	dst->client_id = add->client_id != NULL ? add->client_id : base->client_id;
-	dst->client_secret = add->client_secret != NULL ? add->client_secret : base->client_secret;
+	OIDC_OAUTH_CFG_SIMPLE_MEMBERS(OIDC_OAUTH_M_MERGE_PTR, OIDC_OAUTH_M_MERGE_INT)
+	/* introspection_endpoint_auth carries an optional ":<alg>" suffix parsed into
+	 * introspection_endpoint_auth_alg; merge the pair as a unit so a vhost that re-sets the method
+	 * takes its (possibly absent) alg instead of inheriting the base server's alg */
+	if (add->introspection_endpoint_auth != NULL)
+		dst->introspection_endpoint_auth_alg = add->introspection_endpoint_auth_alg;
 
-	dst->introspection_endpoint_tls_client_key = add->introspection_endpoint_tls_client_key != NULL
-							 ? add->introspection_endpoint_tls_client_key
-							 : base->introspection_endpoint_tls_client_key;
-	dst->introspection_endpoint_tls_client_cert = add->introspection_endpoint_tls_client_cert != NULL
-							  ? add->introspection_endpoint_tls_client_cert
-							  : base->introspection_endpoint_tls_client_cert;
-
-	dst->introspection_endpoint_url = add->introspection_endpoint_url != NULL ? add->introspection_endpoint_url
-										  : base->introspection_endpoint_url;
-	dst->introspection_endpoint_method = add->introspection_endpoint_method != OIDC_CONFIG_POS_INT_UNSET
-						 ? add->introspection_endpoint_method
-						 : base->introspection_endpoint_method;
-	dst->introspection_endpoint_params = add->introspection_endpoint_params != NULL
-						 ? add->introspection_endpoint_params
-						 : base->introspection_endpoint_params;
-	dst->introspection_endpoint_auth = add->introspection_endpoint_auth != NULL ? add->introspection_endpoint_auth
-										    : base->introspection_endpoint_auth;
-	dst->introspection_endpoint_auth_alg = add->introspection_endpoint_auth_alg != NULL
-						   ? add->introspection_endpoint_auth_alg
-						   : base->introspection_endpoint_auth_alg;
-	dst->introspection_client_auth_bearer_token = add->introspection_client_auth_bearer_token != NULL
-							  ? add->introspection_client_auth_bearer_token
-							  : base->introspection_client_auth_bearer_token;
-	dst->introspection_token_param_name = add->introspection_token_param_name != NULL
-						  ? add->introspection_token_param_name
-						  : base->introspection_token_param_name;
+	dst->verify_public_keys =
+	    oidc_jwk_list_copy(pool, _oidc_cfg_merge_ptr(add->verify_public_keys, base->verify_public_keys));
 
 	if (add->introspection_token_expiry_claim_name != NULL) {
 		dst->introspection_token_expiry_claim_name = add->introspection_token_expiry_claim_name;
@@ -398,19 +415,10 @@ void oidc_cfg_oauth_merge(apr_pool_t *pool, oidc_oauth_t *dst, const oidc_oauth_
 	}
 
 	if (add->remote_user_claim.claim_name != NULL) {
-		dst->remote_user_claim.claim_name = add->remote_user_claim.claim_name;
-		dst->remote_user_claim.reg_exp = add->remote_user_claim.reg_exp;
-		dst->remote_user_claim.replace = add->remote_user_claim.replace;
+		dst->remote_user_claim = add->remote_user_claim;
 	} else {
-		dst->remote_user_claim.claim_name = base->remote_user_claim.claim_name;
-		dst->remote_user_claim.reg_exp = base->remote_user_claim.reg_exp;
-		dst->remote_user_claim.replace = base->remote_user_claim.replace;
+		dst->remote_user_claim = base->remote_user_claim;
 	}
-
-	dst->verify_jwks_uri = add->verify_jwks_uri != NULL ? add->verify_jwks_uri : base->verify_jwks_uri;
-	dst->verify_public_keys = oidc_jwk_list_copy(pool, add->verify_public_keys != NULL ? add->verify_public_keys
-											   : base->verify_public_keys);
-	dst->verify_shared_keys = add->verify_shared_keys != NULL ? add->verify_shared_keys : base->verify_shared_keys;
 }
 
 void oidc_cfg_oauth_destroy(oidc_oauth_t *o) {
@@ -420,4 +428,6 @@ void oidc_cfg_oauth_destroy(oidc_oauth_t *o) {
 	o->verify_public_keys = NULL;
 	oidc_jwk_list_destroy_hash(o->verify_shared_keys);
 	o->verify_shared_keys = NULL;
+	oidc_jwk_list_destroy_hash(o->decrypt_shared_keys);
+	o->decrypt_shared_keys = NULL;
 }

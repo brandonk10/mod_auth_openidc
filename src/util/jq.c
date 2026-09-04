@@ -40,6 +40,7 @@
  * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
+#include "cache/cache.h"
 #include "util/util.h"
 
 #ifdef USE_LIBJQ
@@ -50,17 +51,24 @@
  */
 static const char *oidc_util_jq_exec(request_rec *r, jq_state *jq, struct jv_parser *parser) {
 	const char *rv = NULL;
-	jv value, elem, str, msg;
+	jv value;
+	jv elem;
+	jv str;
+	jv msg;
 
-	while (jv_is_valid((value = jv_parser_next(parser)))) {
+	value = jv_parser_next(parser);
+	while (jv_is_valid(value)) {
 		jq_start(jq, value, 0);
-		while (jv_is_valid(elem = jq_next(jq))) {
+		elem = jq_next(jq);
+		while (jv_is_valid(elem)) {
 			str = jv_dump_string(elem, 0);
 			rv = apr_pstrdup(r->pool, jv_string_value(str));
 			oidc_debug(r, "jv_dump_string: %s", rv);
 			jv_free(str);
+			elem = jq_next(jq);
 		}
 		jv_free(elem);
+		value = jv_parser_next(parser);
 	}
 
 	if (jv_invalid_has_msg(jv_copy(value))) {
@@ -80,7 +88,7 @@ static const char *oidc_util_jq_exec(request_rec *r, jq_state *jq, struct jv_par
 /*
  * return the JQ expression result cache expiry
  */
-static int oidc_jq_filter_cache_ttl(request_rec *r) {
+static int oidc_jq_filter_cache_ttl(const request_rec *r) {
 	const char *s_ttl = apr_table_get(r->subprocess_env, OIDC_JQ_FILTER_CACHE_TTL_ENVVAR);
 	return _oidc_str_to_int(s_ttl, OIDC_JQ_FILTER_EXPIRE_DEFAULT);
 }
@@ -90,10 +98,10 @@ static int oidc_jq_filter_cache_ttl(request_rec *r) {
 /*
  * apply a JQ expression/filter to the provided JSON input
  */
-const char *oidc_util_jq_filter(request_rec *r, json_t *json, const char *filter) {
+const char *oidc_util_jq_filter(request_rec *r, const oidc_json_t *json, const char *filter) {
 	const char *result = NULL;
 #ifdef USE_LIBJQ
-	const char *input = oidc_util_json_encode(r->pool, json, JSON_PRESERVE_ORDER | JSON_COMPACT);
+	const char *input = oidc_json_encode(r->pool, json, OIDC_JSON_PRESERVE_ORDER | OIDC_JSON_COMPACT);
 	jq_state *jq = NULL;
 	struct jv_parser *parser = NULL;
 	int ttl = 0;
@@ -149,11 +157,11 @@ const char *oidc_util_jq_filter(request_rec *r, json_t *json, const char *filter
 		goto end;
 	}
 
-	jv_parser_set_buf(parser, input, _oidc_strlen(input), 0);
+	jv_parser_set_buf(parser, input, (int)_oidc_strlen(input), 0);
 
 	result = oidc_util_jq_exec(r, jq, parser);
 
-	if ((result != NULL) && (ttl != 0)) {
+	if ((result != NULL) && (ttl > 0)) {
 		oidc_debug(r, "caching result: %s", result);
 		oidc_cache_set_jq_filter(r, key, result, apr_time_now() + apr_time_from_sec(ttl));
 	}
@@ -165,7 +173,7 @@ end:
 	if (jq)
 		jq_teardown(&jq);
 #else
-	result = oidc_util_json_encode(r->pool, json, JSON_PRESERVE_ORDER | JSON_COMPACT);
+	result = oidc_json_encode(r->pool, json, OIDC_JSON_PRESERVE_ORDER | OIDC_JSON_COMPACT);
 #endif
 
 	return result;

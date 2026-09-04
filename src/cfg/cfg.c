@@ -51,6 +51,12 @@
 #include "proto/proto.h"
 #include "session.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
+
+#if OPENSSL_API_COMPAT < 0x10100000L
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#endif
 
 const char *oidc_cfg_string_list_add(apr_pool_t *pool, apr_array_header_t **list, const char *arg) {
 	if (*list == NULL)
@@ -101,18 +107,25 @@ OIDC_CFG_MEMBER_FUNCS_HTTP_TIMEOUT(http_timeout_short, OIDC_DEFAULT_HTTP_REQUEST
 const char *oidc_cmd_crypto_passphrase_set(cmd_parms *cmd, void *struct_ptr, const char *arg1, const char *arg2) {
 	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);
 	const char *rv = NULL;
-	if (arg1)
-		rv = oidc_cfg_parse_passphrase(cmd->pool, arg1, (char **)&cfg->crypto_passphrase.secret1);
-	if ((rv == NULL) && (arg2 != NULL))
-		rv = oidc_cfg_parse_passphrase(cmd->pool, arg2, (char **)&cfg->crypto_passphrase.secret2);
+	char *v = NULL;
+	if (arg1) {
+		rv = oidc_cfg_parse_passphrase(cmd->pool, arg1, &v);
+		if (rv == NULL)
+			cfg->crypto_passphrase.secret1 = v;
+	}
+	if ((rv == NULL) && (arg2 != NULL)) {
+		rv = oidc_cfg_parse_passphrase(cmd->pool, arg2, &v);
+		if (rv == NULL)
+			cfg->crypto_passphrase.secret2 = v;
+	}
 	return rv;
 }
 
-const oidc_crypto_passphrase_t *oidc_cfg_crypto_passphrase_get(oidc_cfg_t *cfg) {
+const oidc_crypto_passphrase_t *oidc_cfg_crypto_passphrase_get(const oidc_cfg_t *cfg) {
 	return &cfg->crypto_passphrase;
 }
 
-const char *oidc_cfg_crypto_passphrase_secret1_get(oidc_cfg_t *cfg) {
+const char *oidc_cfg_crypto_passphrase_secret1_get(const oidc_cfg_t *cfg) {
 	return cfg->crypto_passphrase.secret1;
 }
 
@@ -120,8 +133,87 @@ void oidc_cfg_crypto_passphrase_secret1_set(oidc_cfg_t *cfg, const char *secret)
 	cfg->crypto_passphrase.secret1 = secret;
 }
 
-const char *oidc_cfg_crypto_passphrase_secret2_get(oidc_cfg_t *cfg) {
+const char *oidc_cfg_crypto_passphrase_secret2_get(const oidc_cfg_t *cfg) {
 	return cfg->crypto_passphrase.secret2;
+}
+
+/* Derive finalized passphrases once, before requests use them for JWE operations. */
+apr_byte_t oidc_crypto_passphrase_derive_keys(oidc_crypto_passphrase_t *cp) {
+	/* an empty (non-NULL) secret is treated as "not configured", matching
+	 * oidc_util_key_symmetric_create()'s existing behavior for a client_secret */
+	if ((cp->secret1 != NULL) && (_oidc_strlen(cp->secret1) > 0) && (cp->derived_key1_set == FALSE)) {
+		if (oidc_util_key_derive_passphrase_key(cp->secret1, cp->derived_key1,
+							OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN) == FALSE)
+			return FALSE;
+		cp->derived_key1_set = TRUE;
+	}
+
+	if ((cp->secret2 != NULL) && (_oidc_strlen(cp->secret2) > 0) && (cp->derived_key2_set == FALSE)) {
+		if (oidc_util_key_derive_passphrase_key(cp->secret2, cp->derived_key2,
+							OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN) == FALSE)
+			return FALSE;
+		cp->derived_key2_set = TRUE;
+	}
+
+	return TRUE;
+}
+
+/*
+ * thin wrapper around oidc_crypto_passphrase_derive_keys() for the passphrase embedded in a
+ * server config; see that function for details
+ */
+apr_byte_t oidc_cfg_crypto_passphrase_derive_keys(oidc_cfg_t *cfg) {
+	return oidc_crypto_passphrase_derive_keys(&cfg->crypto_passphrase);
+}
+
+/*
+ * Memoize PBKDF2 output by secret across vhosts. The pool must outlive kdf_cache; a NULL cache
+ * disables memoization.
+ */
+apr_byte_t oidc_crypto_passphrase_derive_keys_cached(apr_pool_t *pool, apr_hash_t *kdf_cache,
+						     oidc_crypto_passphrase_t *cp) {
+	const unsigned char *cached = NULL;
+
+	if (kdf_cache == NULL)
+		return oidc_crypto_passphrase_derive_keys(cp);
+
+	if ((cp->secret1 != NULL) && (_oidc_strlen(cp->secret1) > 0) && (cp->derived_key1_set == FALSE)) {
+		cached = apr_hash_get(kdf_cache, cp->secret1, APR_HASH_KEY_STRING);
+		if (cached != NULL) {
+			_oidc_memcpy(cp->derived_key1, cached, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN);
+		} else {
+			if (oidc_util_key_derive_passphrase_key(cp->secret1, cp->derived_key1,
+								OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN) == FALSE)
+				return FALSE;
+			apr_hash_set(kdf_cache, apr_pstrdup(pool, cp->secret1), APR_HASH_KEY_STRING,
+				     apr_pmemdup(pool, cp->derived_key1, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN));
+		}
+		cp->derived_key1_set = TRUE;
+	}
+
+	if ((cp->secret2 != NULL) && (_oidc_strlen(cp->secret2) > 0) && (cp->derived_key2_set == FALSE)) {
+		cached = apr_hash_get(kdf_cache, cp->secret2, APR_HASH_KEY_STRING);
+		if (cached != NULL) {
+			_oidc_memcpy(cp->derived_key2, cached, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN);
+		} else {
+			if (oidc_util_key_derive_passphrase_key(cp->secret2, cp->derived_key2,
+								OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN) == FALSE)
+				return FALSE;
+			apr_hash_set(kdf_cache, apr_pstrdup(pool, cp->secret2), APR_HASH_KEY_STRING,
+				     apr_pmemdup(pool, cp->derived_key2, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN));
+		}
+		cp->derived_key2_set = TRUE;
+	}
+
+	return TRUE;
+}
+
+/*
+ * thin wrapper around oidc_crypto_passphrase_derive_keys_cached() for the passphrase embedded
+ * in a server config; see that function for details
+ */
+apr_byte_t oidc_cfg_crypto_passphrase_derive_keys_cached(apr_pool_t *pool, apr_hash_t *kdf_cache, oidc_cfg_t *cfg) {
+	return oidc_crypto_passphrase_derive_keys_cached(pool, kdf_cache, &cfg->crypto_passphrase);
 }
 
 const char *oidc_cmd_outgoing_proxy_set(cmd_parms *cmd, void *ptr, const char *arg1, const char *arg2,
@@ -140,15 +232,14 @@ const char *oidc_cmd_outgoing_proxy_set(cmd_parms *cmd, void *ptr, const char *a
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
-const oidc_http_outgoing_proxy_t *oidc_cfg_outgoing_proxy_get(oidc_cfg_t *cfg) {
+const oidc_http_outgoing_proxy_t *oidc_cfg_outgoing_proxy_get(const oidc_cfg_t *cfg) {
 	return &cfg->outgoing_proxy;
 }
 
 static const char *oidc_cfg_valid_cookie_domain(apr_pool_t *pool, const char *arg) {
-	size_t sz, limit;
+	size_t limit = _oidc_strlen(arg);
 	char d;
-	limit = _oidc_strlen(arg);
-	for (sz = 0; sz < limit; sz++) {
+	for (size_t sz = 0; sz < limit; sz++) {
 		d = arg[sz];
 		if ((d < '0' || d > '9') && (d < 'a' || d > 'z') && (d < 'A' || d > 'Z') && d != '.' && d != '-') {
 			return (apr_psprintf(pool, "invalid character '%c' in cookie domain value: %s", d, arg));
@@ -182,7 +273,7 @@ const char *oidc_cmd_session_type_set(cmd_parms *cmd, void *ptr, const char *arg
 	if (rv != NULL)
 		return OIDC_CONFIG_DIR_RV(cmd, rv);
 
-	char *s = apr_pstrdup(cmd->pool, arg);
+	const char *s = apr_pstrdup(cmd->pool, arg);
 	char *p = _oidc_strstr(s, OIDC_SESSION_TYPE_SEPARATOR);
 
 	if (p) {
@@ -197,18 +288,20 @@ const char *oidc_cmd_session_type_set(cmd_parms *cmd, void *ptr, const char *arg
 		cfg->store_id_token = 0;
 	}
 
-	if (p) {
-		if (_oidc_strcmp(p, OIDC_SESSION_TYPE_PERSISTENT) == 0) {
-			cfg->persistent_session_cookie = 1;
-		} else if (_oidc_strcmp(p, OIDC_SESSION_TYPE_STORE_ID_TOKEN) == 0) {
-			// only for client-cookie
-			cfg->store_id_token = 1;
-		} else if (_oidc_strcmp(p, OIDC_SESSION_TYPE_PERSISTENT OIDC_SESSION_TYPE_SEPARATOR
-					       OIDC_SESSION_TYPE_STORE_ID_TOKEN) == 0) {
-			// only for client-cookie
-			cfg->persistent_session_cookie = 1;
-			cfg->store_id_token = 1;
+	/* the combination was validated against options[] above, so each remaining
+	 * separator-delimited modifier can be applied on its own */
+	while (p) {
+		char *next = _oidc_strstr(p, OIDC_SESSION_TYPE_SEPARATOR);
+		if (next) {
+			*next = '\0';
+			next++;
 		}
+		if (_oidc_strcmp(p, OIDC_SESSION_TYPE_PERSISTENT) == 0)
+			cfg->persistent_session_cookie = 1;
+		else if (_oidc_strcmp(p, OIDC_SESSION_TYPE_STORE_ID_TOKEN) == 0)
+			// only for client-cookie
+			cfg->store_id_token = 1;
+		p = next;
 	}
 
 	return NULL;
@@ -223,17 +316,23 @@ OIDC_CFG_MEMBER_FUNC_TYPE_GET(persistent_session_cookie, int, OIDC_DEFAULT_PERSI
 #define OIDC_DEFAULT_STORE_ID_TOKEN 1
 OIDC_CFG_MEMBER_FUNC_TYPE_GET(store_id_token, int, OIDC_DEFAULT_STORE_ID_TOKEN)
 
-static const char *oidc_valid_endpoint_auth_method_impl(apr_pool_t *pool, const char *arg, apr_byte_t has_private_key) {
-	static const char *options[] = {OIDC_ENDPOINT_AUTH_CLIENT_SECRET_POST,
-					OIDC_ENDPOINT_AUTH_CLIENT_SECRET_BASIC,
-					OIDC_ENDPOINT_AUTH_CLIENT_SECRET_JWT,
-					OIDC_ENDPOINT_AUTH_NONE,
-					OIDC_ENDPOINT_AUTH_BEARER_ACCESS_TOKEN,
-					NULL,
-					NULL};
+static const char *oidc_valid_endpoint_auth_method_impl(apr_pool_t *pool, const char *arg, apr_byte_t has_private_key,
+							apr_byte_t allow_mtls) {
+	/* Build per call because private-key validation changes the candidate list. */
+	const char *options[9];
+	int i = 0;
+	options[i++] = OIDC_ENDPOINT_AUTH_CLIENT_SECRET_POST;
+	options[i++] = OIDC_ENDPOINT_AUTH_CLIENT_SECRET_BASIC;
+	options[i++] = OIDC_ENDPOINT_AUTH_CLIENT_SECRET_JWT;
+	options[i++] = OIDC_ENDPOINT_AUTH_NONE;
+	options[i++] = OIDC_ENDPOINT_AUTH_BEARER_ACCESS_TOKEN;
 	if (has_private_key)
-		options[5] = OIDC_ENDPOINT_AUTH_PRIVATE_KEY_JWT;
-
+		options[i++] = OIDC_ENDPOINT_AUTH_PRIVATE_KEY_JWT;
+	if (allow_mtls) {
+		options[i++] = OIDC_ENDPOINT_AUTH_TLS_CLIENT_AUTH;
+		options[i++] = OIDC_ENDPOINT_AUTH_SELF_SIGNED_TLS_CLIENT_AUTH;
+	}
+	options[i] = NULL;
 	return oidc_cfg_parse_is_valid_option(pool, arg, options);
 }
 
@@ -259,7 +358,7 @@ static void oidc_cfg_endpoint_auth_parse(apr_pool_t *pool, const char *arg1, cha
 	*method = apr_pstrdup(pool, arg);
 }
 
-static const char *oidc_cfg_valid_endpoint_auth_method_with_private_key(apr_pool_t *pool, const char *arg1) {
+static const char *oidc_cfg_valid_endpoint_auth_method_alg(apr_pool_t *pool, const char *arg1, apr_byte_t allow_mtls) {
 	const char *rv = NULL;
 	char *method = NULL;
 	char *alg = NULL;
@@ -269,30 +368,52 @@ static const char *oidc_cfg_valid_endpoint_auth_method_with_private_key(apr_pool
 		if (rv != NULL)
 			return rv;
 	}
-	return oidc_valid_endpoint_auth_method_impl(pool, method, TRUE);
+	return oidc_valid_endpoint_auth_method_impl(pool, method, TRUE, allow_mtls);
+}
+
+static const char *oidc_cfg_valid_endpoint_auth_method_with_private_key(apr_pool_t *pool, const char *arg1) {
+	return oidc_cfg_valid_endpoint_auth_method_alg(pool, arg1, TRUE);
 }
 
 static const char *oidc_cfg_valid_endpoint_auth_method_no_private_key(apr_pool_t *pool, const char *arg) {
-	return oidc_valid_endpoint_auth_method_impl(pool, arg, FALSE);
+	return oidc_valid_endpoint_auth_method_impl(pool, arg, FALSE, TRUE);
 }
 
-const char *oidc_cfg_endpoint_auth_set(apr_pool_t *pool, oidc_cfg_t *cfg, const char *arg1, char **auth, char **alg) {
-	const char *rv = oidc_cfg_get_valid_endpoint_auth_function(cfg)(pool, arg1);
+static const char *oidc_cfg_valid_endpoint_auth_method_no_mtls_with_private_key(apr_pool_t *pool, const char *arg1) {
+	return oidc_cfg_valid_endpoint_auth_method_alg(pool, arg1, FALSE);
+}
+
+static const char *oidc_cfg_valid_endpoint_auth_method_no_mtls_no_private_key(apr_pool_t *pool, const char *arg) {
+	return oidc_valid_endpoint_auth_method_impl(pool, arg, FALSE, FALSE);
+}
+
+const char *oidc_cfg_endpoint_auth_set(apr_pool_t *pool, const oidc_cfg_t *cfg, const char *arg1, char **auth,
+				       char **alg) {
+	const char *rv = oidc_cfg_get_valid_endpoint_auth_function(cfg, TRUE)(pool, arg1);
 	if (rv == NULL)
 		oidc_cfg_endpoint_auth_parse(pool, arg1, auth, alg);
 	return rv;
 }
 
 /*
- * return the right token endpoint authentication method validation function, based on whether private keys are set
+ * check if the endpoint authentication method is one of the RFC 8705 mutual-TLS methods
  */
-oidc_valid_function_t oidc_cfg_get_valid_endpoint_auth_function(oidc_cfg_t *cfg) {
+apr_byte_t oidc_cfg_endpoint_auth_is_mtls(const char *method) {
+	return (_oidc_strcmp(method, OIDC_ENDPOINT_AUTH_TLS_CLIENT_AUTH) == 0) ||
+	       (_oidc_strcmp(method, OIDC_ENDPOINT_AUTH_SELF_SIGNED_TLS_CLIENT_AUTH) == 0);
+}
+
+/* Select endpoint-auth validation based on private-key availability and whether mTLS is allowed. */
+oidc_valid_function_t oidc_cfg_get_valid_endpoint_auth_function(const oidc_cfg_t *cfg, apr_byte_t allow_mtls) {
+	if (allow_mtls == FALSE)
+		return (cfg->private_keys != NULL) ? &oidc_cfg_valid_endpoint_auth_method_no_mtls_with_private_key
+						   : &oidc_cfg_valid_endpoint_auth_method_no_mtls_no_private_key;
 	return (cfg->private_keys != NULL) ? &oidc_cfg_valid_endpoint_auth_method_with_private_key
 					   : &oidc_cfg_valid_endpoint_auth_method_no_private_key;
 }
 
 #define OIDC_SESSION_INACTIVITY_TIMEOUT_MIN 10
-#define OIDC_SESSION_INACTIVITY_TIMEOUT_MAX 3600 * 24 * 365
+#define OIDC_SESSION_INACTIVITY_TIMEOUT_MAX (3600 * 24 * 365)
 #define OIDC_DEFAULT_SESSION_INACTIVITY_TIMEOUT 300
 
 OIDC_CFG_MEMBER_FUNCS_INT(session_inactivity_timeout, OIDC_SESSION_INACTIVITY_TIMEOUT_MIN,
@@ -311,34 +432,7 @@ OIDC_CFG_MEMBER_FUNC_GET(public_keys, const apr_array_header_t *)
  */
 const char *oidc_cmd_private_keys_set(cmd_parms *cmd, void *ptr, const char *arg) {
 	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);
-	oidc_jwk_t *jwk = NULL;
-	oidc_jose_error_t err;
-	char *use = NULL;
-
-	char *kid = NULL, *name = NULL, *fname = NULL;
-	int fname_len;
-	const char *rv = oidc_cfg_parse_key_record(cmd->pool, arg, &kid, &name, &fname_len, &use, FALSE);
-	if (rv != NULL)
-		goto end;
-
-	rv = oidc_cfg_parse_filename(cmd->pool, name, &fname);
-	if (rv != NULL)
-		goto end;
-
-	if (oidc_jwk_parse_pem_private_key(cmd->pool, kid, fname, &jwk, &err) == FALSE) {
-		rv = apr_psprintf(cmd->pool, "oidc_jwk_parse_pem_private_key failed for (kid=%s) \"%s\": %s", kid,
-				  fname, oidc_jose_e2s(cmd->pool, err));
-		goto end;
-	}
-
-	if (cfg->private_keys == NULL)
-		cfg->private_keys = apr_array_make(cmd->pool, 4, sizeof(const oidc_jwk_t *));
-	if (use)
-		jwk->use = apr_pstrdup(cmd->pool, use);
-	APR_ARRAY_PUSH(cfg->private_keys, const oidc_jwk_t *) = jwk;
-
-end:
-
+	const char *rv = oidc_cfg_parse_private_key_files(cmd->pool, arg, &cfg->private_keys);
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
@@ -350,13 +444,13 @@ const char *oidc_cmd_remote_user_claim_set(cmd_parms *cmd, void *ptr, const char
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
-const oidc_remote_user_claim_t *oidc_cfg_remote_user_claim_get(oidc_cfg_t *cfg) {
+const oidc_remote_user_claim_t *oidc_cfg_remote_user_claim_get(const oidc_cfg_t *cfg) {
 	return &cfg->remote_user_claim;
 }
 
 #define OIDC_DEFAULT_CLAIM_REMOTE_USER "sub@"
 
-const char *oidc_cfg_remote_user_claim_name_get(oidc_cfg_t *cfg) {
+const char *oidc_cfg_remote_user_claim_name_get(const oidc_cfg_t *cfg) {
 	return cfg->remote_user_claim.claim_name != NULL ? cfg->remote_user_claim.claim_name
 							 : OIDC_DEFAULT_CLAIM_REMOTE_USER;
 }
@@ -365,7 +459,7 @@ const char *oidc_cfg_remote_user_claim_name_get(oidc_cfg_t *cfg) {
 
 const char *oidc_cmd_filter_claims_expr_set(cmd_parms *cmd, void *m, const char *arg) {
 	oidc_cfg_t *cfg = (oidc_cfg_t *)ap_get_module_config(cmd->server->module_config, &auth_openidc_module);
-	const char *rv = oidc_util_apr_expr_parse(cmd, arg, &cfg->filter_claims_expr, TRUE);
+	const char *rv = oidc_util_apr_expr_parse(cmd, arg, &cfg->filter_claims_expr, OIDC_APR_EXPR_RESULT_STRING);
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
@@ -443,7 +537,7 @@ const char *oidc_cmd_claim_prefix_set(cmd_parms *cmd, void *struct_ptr, const ch
 
 #define OIDC_DEFAULT_CLAIM_PREFIX "OIDC_CLAIM_"
 
-const char *oidc_cfg_claim_prefix_get(oidc_cfg_t *cfg) {
+const char *oidc_cfg_claim_prefix_get(const oidc_cfg_t *cfg) {
 	return (cfg->claim_prefix != NULL) ? cfg->claim_prefix : OIDC_DEFAULT_CLAIM_PREFIX;
 }
 
@@ -490,8 +584,9 @@ OIDC_CFG_MEMBER_FUNC_TYPE_GET(x_forwarded_headers, oidc_hdr_x_forwarded_t, OIDC_
 
 #define OIDC_CHECK_X_FORWARDED_HDR_LOG_DISABLE "OIDC_CHECK_X_FORWARDED_HDR_LOG_DISABLE"
 
-static void oidc_check_x_forwarded_hdr(request_rec *r, const apr_byte_t x_forwarded_headers, const apr_byte_t hdr_type,
-				       const char *hdr_str, const char *(hdr_func)(const request_rec *r)) {
+static void oidc_check_x_forwarded_hdr(request_rec *r, const oidc_hdr_x_forwarded_t x_forwarded_headers,
+				       const oidc_hdr_x_forwarded_t hdr_type, const char *hdr_str,
+				       const char *(hdr_func)(const request_rec *r)) {
 	apr_byte_t suppress = oidc_util_spaced_string_contains(
 	    r->pool, apr_table_get(r->subprocess_env, OIDC_CHECK_X_FORWARDED_HDR_LOG_DISABLE), hdr_str);
 	if (hdr_func(r)) {
@@ -626,6 +721,10 @@ OIDC_CFG_MEMBER_FUNC_TYPE_GET(cookie_same_site_discovery_csrf, oidc_samesite_coo
 #define OIDC_DEFAULT_SESSION_FALLBACK_TO_COOKIE 0
 OIDC_CFG_MEMBER_FUNCS_BOOL(session_cache_fallback_to_cookie, OIDC_DEFAULT_SESSION_FALLBACK_TO_COOKIE)
 
+/* masking secrets in the debug log is the default; turning it off is a deliberate, logged choice */
+#define OIDC_DEFAULT_DEBUG_MASK_SECRETS 1
+OIDC_CFG_MEMBER_FUNCS_BOOL(debug_mask_secrets, OIDC_DEFAULT_DEBUG_MASK_SECRETS)
+
 #define OIDC_DEFAULT_CLAIM_DELIMITER ","
 OIDC_CFG_MEMBER_FUNCS_STR_DEF(claim_delimiter, NULL, OIDC_DEFAULT_CLAIM_DELIMITER)
 
@@ -635,20 +734,25 @@ OIDC_CFG_MEMBER_FUNCS_STR_DEF(metrics_path, NULL, NULL)
 OIDC_CFG_MEMBER_FUNCS_STR_DEF(logout_x_frame_options, NULL, OIDC_DEFAULT_LOGOUT_X_FRAME_OPTIONS)
 
 #define OIDC_STATE_TIMEOUT_MIN 1
-#define OIDC_STATE_TIMEOUT_MAX 3600 * 24 * 30
+#define OIDC_STATE_TIMEOUT_MAX (3600 * 24 * 30)
 #define OIDC_DEFAULT_STATE_TIMEOUT 300
 
 OIDC_CFG_MEMBER_FUNCS_INT(state_timeout, OIDC_STATE_TIMEOUT_MIN, OIDC_STATE_TIMEOUT_MAX, OIDC_DEFAULT_STATE_TIMEOUT)
 
 #define OIDC_SESSION_CLIENT_COOKIE_CHUNK_SIZE_MIN 256
-#define OIDC_SESSION_CLIENT_COOKIE_CHUNK_SIZE_MAX 1024 * 64
+#define OIDC_SESSION_CLIENT_COOKIE_CHUNK_SIZE_MAX (1024 * 64)
 #define OIDC_DEFAULT_SESSION_CLIENT_COOKIE_CHUNK_SIZE 4000
 
-OIDC_CFG_MEMBER_FUNCS_INT(session_cookie_chunk_size, OIDC_SESSION_CLIENT_COOKIE_CHUNK_SIZE_MIN,
-			  OIDC_SESSION_CLIENT_COOKIE_CHUNK_SIZE_MAX, OIDC_DEFAULT_SESSION_CLIENT_COOKIE_CHUNK_SIZE)
+/* NB: 0 is accepted on top of the range and means "never chunk", which is what the
+ * runtime already implements in oidc_http_set_chunked_cookie() */
+OIDC_CFG_MEMBER_FUNCS_INT_EXT(session_cookie_chunk_size,
+			      oidc_cfg_parse_int_min_max_or_zero(cmd->pool, arg, &v,
+								 OIDC_SESSION_CLIENT_COOKIE_CHUNK_SIZE_MIN,
+								 OIDC_SESSION_CLIENT_COOKIE_CHUNK_SIZE_MAX),
+			      OIDC_DEFAULT_SESSION_CLIENT_COOKIE_CHUNK_SIZE)
 
 #define OIDC_PROVIDER_METADATA_REFRESH_INTERVAL_MIN 30
-#define OIDC_PROVIDER_METADATA_REFRESH_INTERVAL_MAX 3600 * 24 * 365
+#define OIDC_PROVIDER_METADATA_REFRESH_INTERVAL_MAX (3600 * 24 * 365)
 #define OIDC_DEFAULT_PROVIDER_METADATA_REFRESH_INTERVAL 0
 
 OIDC_CFG_MEMBER_FUNCS_INT(provider_metadata_refresh_interval, OIDC_PROVIDER_METADATA_REFRESH_INTERVAL_MIN,
@@ -669,6 +773,7 @@ OIDC_CFG_MEMBER_FUNCS_INT(provider_metadata_refresh_interval, OIDC_PROVIDER_META
 OIDC_CFG_MEMBER_FUNCS_HASHTABLE(white_listed_claims)
 OIDC_CFG_MEMBER_FUNCS_HASHTABLE(black_listed_claims)
 OIDC_CFG_MEMBER_FUNCS_HASHTABLE(redirect_urls_allowed)
+OIDC_CFG_MEMBER_FUNCS_HASHTABLE(discover_issuers_allowed)
 
 #define OIDC_CFG_MEMBER_FUNCS_ABS_OR_REL_URI(member)                                                                   \
 	const char *oidc_cmd_##member##_set(cmd_parms *cmd, void *ptr, const char *arg) {                              \
@@ -714,37 +819,44 @@ static oidc_cfg_t *oidc_cfg_server_alloc(apr_pool_t *pool, server_rec *s) {
 	oidc_cfg_t *c = apr_pcalloc(pool, sizeof(oidc_cfg_t));
 	oidc_cfg_cleanup_ctx_t *ctx = apr_pcalloc(pool, sizeof(oidc_cfg_cleanup_ctx_t));
 	ctx->cfg = c;
-	// pconf  pool used at destruction time
+	// pconf pool used at destruction time
 	ctx->pool = pool;
 	ctx->svr = s;
-	// need to register a cleanup handler to the config pool to handle graceful restarts without memory increasing
-	// memory consumption
-	apr_pool_cleanup_register(pool, ctx, oidc_cfg_server_cleanup, apr_pool_cleanup_null);
+	// register a cleanup handler on the config pool to handle graceful restarts without increasing
+	// memory consumption; this MUST be a *pre*-cleanup: libapr registers its own regular cleanups
+	// for the cache global mutex's POSIX semaphore and the shm segment on this same pool when they
+	// are created at post_config time, and regular cleanups run in reverse order of registration,
+	// so a regular registration here (which happens much earlier, at config-parse time) would run
+	// only AFTER libapr has already closed/unmapped those objects, making the mutex unlock/destroy
+	// in oidc_cache_shm_destroy() dereference an unmapped semaphore and segfault the parent process
+	// on a graceful restart; pre-cleanups are guaranteed to run before all regular cleanups
+	apr_pool_pre_cleanup_register(pool, ctx, oidc_cfg_server_cleanup);
 	return c;
 }
 
 /*
  * create a new server config record with defaults
  */
+#define OIDC_SVR_M_CREATE_PTR(type, name) c->name = NULL;
+#define OIDC_SVR_M_CREATE_INT(name) c->name = OIDC_CONFIG_POS_INT_UNSET;
+#define OIDC_SVR_M_MERGE_PTR(type, name) c->name = _oidc_cfg_merge_ptr(add->name, base->name);
+#define OIDC_SVR_M_MERGE_INT(name) c->name = _oidc_cfg_merge_pos_int(add->name, base->name);
+
 void *oidc_cfg_server_create(apr_pool_t *pool, server_rec *svr) {
 	oidc_cfg_t *c = oidc_cfg_server_alloc(pool, svr);
 	c->svr = svr;
 
 	c->merged = FALSE;
+	/* nothing to inherit from: whatever OIDCRedirectURI this config ends up with is its own */
+	c->redirect_uri_inherited = FALSE;
 
+	OIDC_SVR_CFG_SIMPLE_MEMBERS(OIDC_SVR_M_CREATE_PTR, OIDC_SVR_M_CREATE_INT)
 	c->public_keys = NULL;
 	c->private_keys = NULL;
 
 	c->provider = oidc_cfg_provider_create(pool);
 	c->oauth = oidc_cfg_oauth_create(pool);
 	oidc_cfg_cache_create_server_config(c);
-
-	c->metadata_dir = NULL;
-	c->session_type = OIDC_CONFIG_POS_INT_UNSET;
-	c->session_cache_fallback_to_cookie = OIDC_CONFIG_POS_INT_UNSET;
-	c->persistent_session_cookie = OIDC_CONFIG_POS_INT_UNSET;
-	c->store_id_token = OIDC_CONFIG_POS_INT_UNSET;
-	c->session_cookie_chunk_size = OIDC_CONFIG_POS_INT_UNSET;
 
 	c->http_timeout_long.request_timeout = OIDC_CONFIG_POS_INT_UNSET;
 	c->http_timeout_long.connect_timeout = OIDC_DEFAULT_HTTP_CONNECT_TIMEOUT_LONG;
@@ -755,22 +867,9 @@ void *oidc_cfg_server_create(apr_pool_t *pool, server_rec *svr) {
 	c->http_timeout_short.retries = OIDC_DEFAULT_HTTP_RETRIES_SHORT;
 	c->http_timeout_short.retry_interval = OIDC_DEFAULT_HTTP_RETRY_INTERVAL_SHORT;
 
-	c->state_timeout = OIDC_CONFIG_POS_INT_UNSET;
-	c->max_number_of_state_cookies = OIDC_CONFIG_POS_INT_UNSET;
-	c->delete_oldest_state_cookies = OIDC_CONFIG_POS_INT_UNSET;
-	c->session_inactivity_timeout = OIDC_CONFIG_POS_INT_UNSET;
-
-	c->cookie_domain = NULL;
-	c->claim_delimiter = NULL;
-	c->claim_prefix = NULL;
 	c->remote_user_claim.claim_name = NULL;
 	c->remote_user_claim.reg_exp = NULL;
 	c->remote_user_claim.replace = NULL;
-	c->cookie_http_only = OIDC_CONFIG_POS_INT_UNSET;
-
-	c->cookie_same_site_session = OIDC_CONFIG_POS_INT_UNSET;
-	c->cookie_same_site_state = OIDC_CONFIG_POS_INT_UNSET;
-	c->cookie_same_site_discovery_csrf = OIDC_CONFIG_POS_INT_UNSET;
 
 	c->outgoing_proxy.host_port = NULL;
 	c->outgoing_proxy.username_password = NULL;
@@ -778,38 +877,79 @@ void *oidc_cfg_server_create(apr_pool_t *pool, server_rec *svr) {
 
 	c->crypto_passphrase.secret1 = NULL;
 	c->crypto_passphrase.secret2 = NULL;
-
-	c->post_preserve_template = NULL;
-	c->post_restore_template = NULL;
-
-	c->provider_metadata_refresh_interval = OIDC_CONFIG_POS_INT_UNSET;
+	c->crypto_passphrase.derived_key1_set = FALSE;
+	c->crypto_passphrase.derived_key2_set = FALSE;
 
 	c->info_hook_data = NULL;
 	c->metrics_hook_data = NULL;
-	c->metrics_path = NULL;
-	c->trace_parent = OIDC_CONFIG_POS_INT_UNSET;
-	c->dpop_api_enabled = OIDC_CONFIG_POS_INT_UNSET;
 
 	c->black_listed_claims = NULL;
 	c->white_listed_claims = NULL;
 	c->filter_claims_expr = NULL;
 
-	c->state_input_headers = OIDC_CONFIG_POS_INT_UNSET;
 	c->redirect_urls_allowed = NULL;
-	c->ca_bundle_path = NULL;
-	c->logout_x_frame_options = NULL;
-	c->x_forwarded_headers = OIDC_CONFIG_POS_INT_UNSET;
-	c->action_on_userinfo_error = OIDC_CONFIG_POS_INT_UNSET;
+	c->discover_issuers_allowed = NULL;
 
 	return c;
+}
+
+/*
+ * merge an http_timeout struct: "add" wins as a whole if it has been configured
+ */
+static void _oidc_cfg_merge_http_timeout(oidc_http_timeout_t *c, const oidc_http_timeout_t *add,
+					 const oidc_http_timeout_t *base) {
+	const oidc_http_timeout_t *src = add->request_timeout != OIDC_CONFIG_POS_INT_UNSET ? add : base;
+	c->request_timeout = src->request_timeout;
+	c->connect_timeout = src->connect_timeout;
+	c->retries = src->retries;
+	c->retry_interval = src->retry_interval;
+}
+
+/*
+ * merge the remote_user_claim struct: "add" wins as a whole if it has been configured
+ */
+static void _oidc_cfg_merge_remote_user_claim(oidc_remote_user_claim_t *c, const oidc_remote_user_claim_t *add,
+					      const oidc_remote_user_claim_t *base) {
+	const oidc_remote_user_claim_t *src = add->claim_name != NULL ? add : base;
+	c->claim_name = src->claim_name;
+	c->reg_exp = src->reg_exp;
+	c->replace = src->replace;
+}
+
+/*
+ * merge the outgoing_proxy struct: "add" wins as a whole if it has been configured
+ */
+static void _oidc_cfg_merge_outgoing_proxy(oidc_http_outgoing_proxy_t *c, const oidc_http_outgoing_proxy_t *add,
+					   const oidc_http_outgoing_proxy_t *base) {
+	const oidc_http_outgoing_proxy_t *src = add->host_port != NULL ? add : base;
+	c->host_port = src->host_port;
+	c->username_password = src->username_password;
+	c->auth_type = src->auth_type;
+}
+
+/*
+ * merge the crypto_passphrase struct: "add" wins as a whole if it has been configured
+ */
+static void _oidc_cfg_merge_crypto_passphrase(oidc_crypto_passphrase_t *c, const oidc_crypto_passphrase_t *add,
+					      const oidc_crypto_passphrase_t *base) {
+	const oidc_crypto_passphrase_t *src = add->secret1 != NULL ? add : base;
+	c->secret1 = src->secret1;
+	c->secret2 = src->secret2;
+	/* Keep derived keys paired with the selected secrets, regardless of merge/derivation order. */
+	c->derived_key1_set = src->derived_key1_set;
+	if (src->derived_key1_set)
+		_oidc_memcpy(c->derived_key1, src->derived_key1, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN);
+	c->derived_key2_set = src->derived_key2_set;
+	if (src->derived_key2_set)
+		_oidc_memcpy(c->derived_key2, src->derived_key2, OIDC_CRYPTO_PASSPHRASE_DERIVED_KEY_LEN);
 }
 
 /*
  * merge a new server config with a base one
  */
 void *oidc_cfg_server_merge(apr_pool_t *pool, void *BASE, void *ADD) {
-	oidc_cfg_t *base = (oidc_cfg_t *)BASE;
-	oidc_cfg_t *add = (oidc_cfg_t *)ADD;
+	const oidc_cfg_t *base = (const oidc_cfg_t *)BASE;
+	const oidc_cfg_t *add = (const oidc_cfg_t *)ADD;
 
 	oidc_cfg_t *c = oidc_cfg_server_alloc(pool, add->svr);
 
@@ -817,161 +957,54 @@ void *oidc_cfg_server_merge(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->oauth = oidc_cfg_oauth_create(pool);
 
 	c->merged = TRUE;
+	/* record where the merged redirect_uri came from while "add" (this vhost's own config) and
+	 * "base" can still be told apart: the merge below collapses them into a single value */
+	c->redirect_uri_inherited = (add->redirect_uri == NULL) && (base->redirect_uri != NULL);
 
 	oidc_cfg_provider_merge(pool, c->provider, base->provider, add->provider);
 	oidc_cfg_oauth_merge(pool, c->oauth, base->oauth, add->oauth);
 	oidc_cfg_cache_merge_server_config(c, base, add);
 
-	c->public_keys = oidc_jwk_list_copy(pool, add->public_keys != NULL ? add->public_keys : base->public_keys);
-	c->private_keys = oidc_jwk_list_copy(pool, add->private_keys != NULL ? add->private_keys : base->private_keys);
+	OIDC_SVR_CFG_SIMPLE_MEMBERS(OIDC_SVR_M_MERGE_PTR, OIDC_SVR_M_MERGE_INT)
+	c->public_keys = oidc_jwk_list_copy(pool, _oidc_cfg_merge_ptr(add->public_keys, base->public_keys));
+	c->private_keys = oidc_jwk_list_copy(pool, _oidc_cfg_merge_ptr(add->private_keys, base->private_keys));
 
-	if (add->http_timeout_long.request_timeout != OIDC_CONFIG_POS_INT_UNSET) {
-		c->http_timeout_long.request_timeout = add->http_timeout_long.request_timeout;
-		c->http_timeout_long.connect_timeout = add->http_timeout_long.connect_timeout;
-		c->http_timeout_long.retries = add->http_timeout_long.retries;
-		c->http_timeout_long.retry_interval = add->http_timeout_long.retry_interval;
-	} else {
-		c->http_timeout_long.request_timeout = base->http_timeout_long.request_timeout;
-		c->http_timeout_long.connect_timeout = base->http_timeout_long.connect_timeout;
-		c->http_timeout_long.retries = base->http_timeout_long.retries;
-		c->http_timeout_long.retry_interval = base->http_timeout_long.retry_interval;
-	}
+	_oidc_cfg_merge_http_timeout(&c->http_timeout_long, &add->http_timeout_long, &base->http_timeout_long);
+	_oidc_cfg_merge_http_timeout(&c->http_timeout_short, &add->http_timeout_short, &base->http_timeout_short);
 
-	if (add->http_timeout_short.request_timeout != OIDC_CONFIG_POS_INT_UNSET) {
-		c->http_timeout_short.request_timeout = add->http_timeout_short.request_timeout;
-		c->http_timeout_short.connect_timeout = add->http_timeout_short.connect_timeout;
-		c->http_timeout_short.retries = add->http_timeout_short.retries;
-		c->http_timeout_short.retry_interval = add->http_timeout_short.retry_interval;
-	} else {
-		c->http_timeout_short.request_timeout = base->http_timeout_short.request_timeout;
-		c->http_timeout_short.connect_timeout = base->http_timeout_short.connect_timeout;
-		c->http_timeout_short.retries = base->http_timeout_short.retries;
-		c->http_timeout_short.retry_interval = base->http_timeout_short.retry_interval;
-	}
+	_oidc_cfg_merge_remote_user_claim(&c->remote_user_claim, &add->remote_user_claim, &base->remote_user_claim);
 
-	c->state_timeout = add->state_timeout != OIDC_CONFIG_POS_INT_UNSET ? add->state_timeout : base->state_timeout;
-	c->max_number_of_state_cookies = add->max_number_of_state_cookies != OIDC_CONFIG_POS_INT_UNSET
-					     ? add->max_number_of_state_cookies
-					     : base->max_number_of_state_cookies;
-	c->delete_oldest_state_cookies = add->delete_oldest_state_cookies != OIDC_CONFIG_POS_INT_UNSET
-					     ? add->delete_oldest_state_cookies
-					     : base->delete_oldest_state_cookies;
-	c->session_inactivity_timeout = add->session_inactivity_timeout != OIDC_CONFIG_POS_INT_UNSET
-					    ? add->session_inactivity_timeout
-					    : base->session_inactivity_timeout;
+	_oidc_cfg_merge_outgoing_proxy(&c->outgoing_proxy, &add->outgoing_proxy, &base->outgoing_proxy);
+	_oidc_cfg_merge_crypto_passphrase(&c->crypto_passphrase, &add->crypto_passphrase, &base->crypto_passphrase);
 
-	c->metadata_dir = add->metadata_dir != NULL ? add->metadata_dir : base->metadata_dir;
+	c->info_hook_data = _oidc_cfg_merge_ptr(add->info_hook_data, base->info_hook_data);
+	c->metrics_hook_data = _oidc_cfg_merge_ptr(add->metrics_hook_data, base->metrics_hook_data);
 
-	c->session_type = add->session_type != OIDC_CONFIG_POS_INT_UNSET ? add->session_type : base->session_type;
-	c->session_cache_fallback_to_cookie = add->session_cache_fallback_to_cookie != OIDC_CONFIG_POS_INT_UNSET
-						  ? add->session_cache_fallback_to_cookie
-						  : base->session_cache_fallback_to_cookie;
-	c->persistent_session_cookie = add->persistent_session_cookie != OIDC_CONFIG_POS_INT_UNSET
-					   ? add->persistent_session_cookie
-					   : base->persistent_session_cookie;
-	c->store_id_token =
-	    add->store_id_token != OIDC_CONFIG_POS_INT_UNSET ? add->store_id_token : base->store_id_token;
-	c->session_cookie_chunk_size = add->session_cookie_chunk_size != OIDC_CONFIG_POS_INT_UNSET
-					   ? add->session_cookie_chunk_size
-					   : base->session_cookie_chunk_size;
+	c->black_listed_claims = _oidc_cfg_merge_ptr(add->black_listed_claims, base->black_listed_claims);
+	c->white_listed_claims = _oidc_cfg_merge_ptr(add->white_listed_claims, base->white_listed_claims);
+	c->filter_claims_expr = _oidc_cfg_merge_ptr(add->filter_claims_expr, base->filter_claims_expr);
 
-	c->cookie_domain = add->cookie_domain != NULL ? add->cookie_domain : base->cookie_domain;
-	c->claim_delimiter = add->claim_delimiter != NULL ? add->claim_delimiter : base->claim_delimiter;
-	c->claim_prefix = add->claim_prefix != NULL ? add->claim_prefix : base->claim_prefix;
-
-	if (add->remote_user_claim.claim_name != NULL) {
-		c->remote_user_claim.claim_name = add->remote_user_claim.claim_name;
-		c->remote_user_claim.reg_exp = add->remote_user_claim.reg_exp;
-		c->remote_user_claim.replace = add->remote_user_claim.replace;
-	} else {
-		c->remote_user_claim.claim_name = base->remote_user_claim.claim_name;
-		c->remote_user_claim.reg_exp = base->remote_user_claim.reg_exp;
-		c->remote_user_claim.replace = base->remote_user_claim.replace;
-	}
-
-	c->cookie_http_only =
-	    add->cookie_http_only != OIDC_CONFIG_POS_INT_UNSET ? add->cookie_http_only : base->cookie_http_only;
-
-	c->cookie_same_site_session = add->cookie_same_site_session != OIDC_CONFIG_POS_INT_UNSET
-					  ? add->cookie_same_site_session
-					  : base->cookie_same_site_session;
-	c->cookie_same_site_state = add->cookie_same_site_state != OIDC_CONFIG_POS_INT_UNSET
-					? add->cookie_same_site_state
-					: base->cookie_same_site_state;
-	c->cookie_same_site_discovery_csrf = add->cookie_same_site_discovery_csrf != OIDC_CONFIG_POS_INT_UNSET
-						 ? add->cookie_same_site_discovery_csrf
-						 : base->cookie_same_site_discovery_csrf;
-
-	if (add->outgoing_proxy.host_port != NULL) {
-		c->outgoing_proxy.host_port = add->outgoing_proxy.host_port;
-		c->outgoing_proxy.username_password = add->outgoing_proxy.username_password;
-		c->outgoing_proxy.auth_type = add->outgoing_proxy.auth_type;
-	} else {
-		c->outgoing_proxy.host_port = base->outgoing_proxy.host_port;
-		c->outgoing_proxy.username_password = base->outgoing_proxy.username_password;
-		c->outgoing_proxy.auth_type = base->outgoing_proxy.auth_type;
-	}
-
-	if (add->crypto_passphrase.secret1 != NULL) {
-		c->crypto_passphrase.secret1 = add->crypto_passphrase.secret1;
-		c->crypto_passphrase.secret2 = add->crypto_passphrase.secret2;
-	} else {
-		c->crypto_passphrase.secret1 = base->crypto_passphrase.secret1;
-		c->crypto_passphrase.secret2 = base->crypto_passphrase.secret2;
-	}
-
-	c->post_preserve_template =
-	    add->post_preserve_template != NULL ? add->post_preserve_template : base->post_preserve_template;
-	c->post_restore_template =
-	    add->post_restore_template != NULL ? add->post_restore_template : base->post_restore_template;
-
-	c->provider_metadata_refresh_interval = add->provider_metadata_refresh_interval != OIDC_CONFIG_POS_INT_UNSET
-						    ? add->provider_metadata_refresh_interval
-						    : base->provider_metadata_refresh_interval;
-
-	c->info_hook_data = add->info_hook_data != NULL ? add->info_hook_data : base->info_hook_data;
-	c->metrics_hook_data = add->metrics_hook_data != NULL ? add->metrics_hook_data : base->metrics_hook_data;
-	c->metrics_path = add->metrics_path != NULL ? add->metrics_path : base->metrics_path;
-	c->trace_parent = add->trace_parent != OIDC_CONFIG_POS_INT_UNSET ? add->trace_parent : base->trace_parent;
-	c->dpop_api_enabled =
-	    add->dpop_api_enabled != OIDC_CONFIG_POS_INT_UNSET ? add->dpop_api_enabled : base->dpop_api_enabled;
-
-	c->black_listed_claims =
-	    add->black_listed_claims != NULL ? add->black_listed_claims : base->black_listed_claims;
-	c->white_listed_claims =
-	    add->white_listed_claims != NULL ? add->white_listed_claims : base->white_listed_claims;
-	c->filter_claims_expr = add->filter_claims_expr != NULL ? add->filter_claims_expr : base->filter_claims_expr;
-
-	c->state_input_headers = add->state_input_headers != OIDC_CONFIG_POS_INT_UNSET ? add->state_input_headers
-										       : base->state_input_headers;
-
-	c->redirect_urls_allowed =
-	    add->redirect_urls_allowed != NULL ? add->redirect_urls_allowed : base->redirect_urls_allowed;
-
-	c->ca_bundle_path = add->ca_bundle_path != NULL ? add->ca_bundle_path : base->ca_bundle_path;
-
-	c->logout_x_frame_options =
-	    add->logout_x_frame_options != NULL ? add->logout_x_frame_options : base->logout_x_frame_options;
-
-	c->x_forwarded_headers = add->x_forwarded_headers != OIDC_CONFIG_POS_INT_UNSET ? add->x_forwarded_headers
-										       : base->x_forwarded_headers;
-
-	c->action_on_userinfo_error = add->action_on_userinfo_error != OIDC_CONFIG_POS_INT_UNSET
-					  ? add->action_on_userinfo_error
-					  : base->action_on_userinfo_error;
+	c->redirect_urls_allowed = _oidc_cfg_merge_ptr(add->redirect_urls_allowed, base->redirect_urls_allowed);
+	c->discover_issuers_allowed =
+	    _oidc_cfg_merge_ptr(add->discover_issuers_allowed, base->discover_issuers_allowed);
 
 	return c;
 }
 
-#if OPENSSL_API_COMPAT < 0x10100000L
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-#endif
+/*
+ * Build a read-only request view with a private OAuth struct, allowing metadata endpoints to
+ * change without mutating shared server state. Other members remain shared.
+ */
+oidc_cfg_t *oidc_cfg_request_view(apr_pool_t *pool, const oidc_cfg_t *c) {
+	oidc_cfg_t *rc = apr_pmemdup(pool, c, sizeof(*c));
+	rc->oauth = oidc_cfg_oauth_shallow_copy(pool, c->oauth);
+	return rc;
+}
 
 /*
  * initialize before the post config handler runs
  */
-void oidc_pre_config_init() {
+void oidc_pre_config_init(void) {
 #if OPENSSL_API_COMPAT < 0x10100000L
 	ERR_load_crypto_strings();
 	OpenSSL_add_all_algorithms();
@@ -985,52 +1018,43 @@ oidc_provider_t *oidc_cfg_provider_get(oidc_cfg_t *cfg) {
 	return cfg->provider;
 }
 
-int oidc_cfg_merged_get(oidc_cfg_t *cfg) {
+int oidc_cfg_merged_get(const oidc_cfg_t *cfg) {
 	return cfg->merged;
+}
+
+int oidc_cfg_redirect_uri_inherited_get(const oidc_cfg_t *cfg) {
+	return cfg->redirect_uri_inherited;
 }
 
 static oidc_cache_mutex_t *_oidc_refresh_mutex = NULL;
 
-oidc_cache_mutex_t *oidc_cfg_refresh_mutex_get(oidc_cfg_t *cfg) {
+oidc_cache_mutex_t *oidc_cfg_refresh_mutex_get(const oidc_cfg_t *cfg) {
 	return _oidc_refresh_mutex;
 }
 
 int oidc_cfg_post_config(apr_pool_t *pool, oidc_cfg_t *cfg, server_rec *s) {
 	if (cfg->cache.impl == NULL)
 		cfg->cache.impl = &oidc_cache_shm;
-	if (cfg->cache.impl->post_config != NULL) {
-		if (cfg->cache.impl->post_config(pool, s) != OK)
-			return HTTP_INTERNAL_SERVER_ERROR;
-	}
+	if ((cfg->cache.impl->post_config != NULL) && (cfg->cache.impl->post_config(pool, s) != OK))
+		return HTTP_INTERNAL_SERVER_ERROR;
 	if (_oidc_refresh_mutex == NULL) {
 		// NB: use the process pool here as the mutex is a process-wide singleton
 		_oidc_refresh_mutex = oidc_cache_mutex_create(s->process->pool, TRUE);
 		if (oidc_cache_mutex_post_config(s->process->pool, s, _oidc_refresh_mutex, "refresh") != TRUE)
 			return HTTP_INTERNAL_SERVER_ERROR;
 	}
-	if (cfg->metrics_hook_data != NULL) {
-		if (oidc_metrics_post_config(pool, s) != TRUE)
-			return HTTP_INTERNAL_SERVER_ERROR;
-	}
+	if ((cfg->metrics_hook_data != NULL) && (oidc_metrics_post_config(pool, s) != TRUE))
+		return HTTP_INTERNAL_SERVER_ERROR;
 	return OK;
 }
 
-void oidc_cfg_child_init(apr_pool_t *pool, oidc_cfg_t *cfg, server_rec *s) {
-	if (cfg->cache.impl->child_init != NULL) {
-		if (cfg->cache.impl->child_init(pool, s) != APR_SUCCESS) {
-			oidc_serror(s, "cfg->cache->child_init failed");
-		}
-	}
-	if (_oidc_refresh_mutex != NULL) {
-		if (oidc_cache_mutex_child_init(pool, s, _oidc_refresh_mutex) != APR_SUCCESS) {
-			oidc_serror(s, "oidc_cache_mutex_child_init on refresh mutex failed");
-		}
-	}
-	if (cfg->metrics_hook_data != NULL) {
-		if (oidc_metrics_child_init(pool, s) != APR_SUCCESS) {
-			oidc_serror(s, "oidc_metrics_cache_child_init failed");
-		}
-	}
+void oidc_cfg_child_init(apr_pool_t *pool, const oidc_cfg_t *cfg, server_rec *s) {
+	if ((cfg->cache.impl->child_init != NULL) && (cfg->cache.impl->child_init(pool, s) != APR_SUCCESS))
+		oidc_serror(s, "cfg->cache->child_init failed");
+	if ((_oidc_refresh_mutex != NULL) && (oidc_cache_mutex_child_init(pool, s, _oidc_refresh_mutex) != APR_SUCCESS))
+		oidc_serror(s, "oidc_cache_mutex_child_init on refresh mutex failed");
+	if ((cfg->metrics_hook_data != NULL) && (oidc_metrics_child_init(pool, s) != APR_SUCCESS))
+		oidc_serror(s, "oidc_metrics_cache_child_init failed");
 }
 
 void oidc_cfg_process_cleanup(oidc_cfg_t *cfg, server_rec *s) {

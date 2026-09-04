@@ -72,8 +72,27 @@
 #define OIDC_PROTO_PROMPT "prompt"
 #define OIDC_PROTO_LOGIN_HINT "login_hint"
 #define OIDC_PROTO_ID_TOKEN_HINT "id_token_hint"
+#define OIDC_PROTO_DISPLAY "display"
+#define OIDC_PROTO_UI_LOCALES "ui_locales"
+#define OIDC_PROTO_ACR_VALUES "acr_values"
+#define OIDC_PROTO_CLAIMS_LOCALES "claims_locales"
 #define OIDC_PROTO_REQUEST_URI "request_uri"
 #define OIDC_PROTO_REQUEST_OBJECT "request"
+
+/*
+ * keys in the OIDCRequestObject JSON configuration value; parsed in proto/request.c and
+ * advertised during dynamic client registration in metadata/client.c
+ */
+#define OIDC_REQUEST_OBJECT_COPY_FROM_REQUEST "copy_from_request"
+#define OIDC_REQUEST_OBJECT_COPY_AND_REMOVE_FROM_REQUEST "copy_and_remove_from_request"
+#define OIDC_REQUEST_OBJECT_TTL "ttl"
+#define OIDC_REQUEST_OBJECT_STATIC "static"
+#define OIDC_REQUEST_OBJECT_URL "url"
+#define OIDC_REQUEST_OBJECT_TYPE "request_object_type"
+#define OIDC_REQUEST_OBJECT_CRYPTO "crypto"
+#define OIDC_REQUEST_OBJECT_CRYPTO_SIGN_ALG "sign_alg"
+#define OIDC_REQUEST_OBJECT_CRYPTO_CRYPT_ALG "crypt_alg"
+#define OIDC_REQUEST_OBJECT_CRYPTO_CRYPT_ENC "crypt_enc"
 #define OIDC_PROTO_SESSION_STATE "session_state"
 #define OIDC_PROTO_ACTIVE "active"
 #define OIDC_PROTO_LOGOUT_TOKEN "logout_token"
@@ -116,16 +135,18 @@
 #define OIDC_PROTO_DPOP "DPoP"
 #define OIDC_PROTO_DPOP_USE_NONCE "use_dpop_nonce"
 
-typedef json_t oidc_proto_state_t;
+typedef oidc_json_t oidc_proto_state_t;
 
 // profile.c
-oidc_auth_request_method_t oidc_proto_profile_auth_request_method_get(oidc_provider_t *provider);
-const char *oidc_proto_profile_token_endpoint_auth_aud(oidc_provider_t *provider);
-const char *oidc_proto_profile_revocation_endpoint_auth_aud(oidc_provider_t *provider, const char *val);
-const apr_array_header_t *oidc_proto_profile_id_token_aud_values_get(apr_pool_t *pool, oidc_provider_t *provider);
-const oidc_proto_pkce_t *oidc_proto_profile_pkce_get(oidc_provider_t *provider);
-oidc_dpop_mode_t oidc_proto_profile_dpop_mode_get(oidc_provider_t *provider);
-int oidc_proto_profile_response_require_iss_get(oidc_provider_t *provider);
+oidc_auth_request_method_t oidc_proto_profile_auth_request_method_get(const oidc_provider_t *provider);
+const char *oidc_proto_profile_token_endpoint_auth_aud(const oidc_provider_t *provider);
+const char *oidc_proto_profile_revocation_endpoint_auth_aud(const oidc_provider_t *provider, const char *val);
+const apr_array_header_t *oidc_proto_profile_id_token_aud_values_get(apr_pool_t *pool, const oidc_provider_t *provider);
+const oidc_proto_pkce_t *oidc_proto_profile_pkce_get(const oidc_provider_t *provider);
+oidc_dpop_mode_t oidc_proto_profile_dpop_mode_get(const oidc_provider_t *provider);
+oidc_cert_bound_tokens_t oidc_proto_profile_cert_bound_tokens_get(const oidc_provider_t *provider);
+int oidc_proto_profile_response_require_iss_get(const oidc_provider_t *provider);
+const char *oidc_proto_profile_request_uri_scope_get(const oidc_provider_t *provider);
 
 // auth.c
 apr_byte_t oidc_proto_token_endpoint_auth(request_rec *r, oidc_cfg_t *cfg, const char *token_endpoint_auth,
@@ -139,23 +160,24 @@ apr_byte_t oidc_proto_discovery_account_based(request_rec *r, oidc_cfg_t *cfg, c
 apr_byte_t oidc_proto_discovery_url_based(request_rec *r, oidc_cfg_t *cfg, const char *url, char **issuer);
 
 // dpop.c
-apr_byte_t oidc_proto_dpop_create(request_rec *r, oidc_cfg_t *cfg, const char *url, const char *method,
+apr_byte_t oidc_proto_dpop_create(request_rec *r, const oidc_cfg_t *cfg, const char *url, const char *method,
 				  const char *access_token, const char *nonce, char **dpop);
-apr_byte_t oidc_proto_dpop_use_nonce(request_rec *r, oidc_cfg_t *cfg, json_t *j_result, apr_hash_t *response_hdrs,
-				     const char *url, const char *method, const char *access_token, char **dpop);
+apr_byte_t oidc_proto_dpop_use_nonce(request_rec *r, const oidc_cfg_t *cfg, const oidc_json_t *j_result,
+				     apr_hash_t *response_hdrs, const char *url, const char *method,
+				     const char *access_token, char **dpop);
 
 // id_token.c
-apr_byte_t oidc_proto_idtoken_parse(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider, const char *id_token,
-				    const char *nonce, oidc_jwt_t **jwt, apr_byte_t is_code_flow);
-apr_byte_t oidc_proto_idtoken_validate_aud_and_azp(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider,
-						   oidc_jwt_payload_t *id_token_payload);
+apr_byte_t oidc_proto_idtoken_parse(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
+				    const char *id_token, const char *nonce, oidc_jwt_t **jwt, apr_byte_t is_code_flow);
+apr_byte_t oidc_proto_idtoken_validate_aud_and_azp(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
+						   const oidc_jwt_payload_t *id_token_payload);
 // non-static for test.c
-apr_byte_t oidc_proto_idtoken_validate_access_token(request_rec *r, oidc_provider_t *provider, oidc_jwt_t *jwt,
+apr_byte_t oidc_proto_idtoken_validate_access_token(request_rec *r, oidc_provider_t *provider, const oidc_jwt_t *jwt,
 						    const char *response_type, const char *access_token);
-apr_byte_t oidc_proto_idtoken_validate_code(request_rec *r, oidc_provider_t *provider, oidc_jwt_t *jwt,
+apr_byte_t oidc_proto_idtoken_validate_code(request_rec *r, oidc_provider_t *provider, const oidc_jwt_t *jwt,
 					    const char *response_type, const char *code);
-apr_byte_t oidc_proto_idtoken_validate_nonce(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider,
-					     const char *nonce, oidc_jwt_t *jwt);
+apr_byte_t oidc_proto_idtoken_validate_nonce(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
+					     const char *nonce, const oidc_jwt_t *jwt);
 
 // jwks.c
 apr_byte_t oidc_proto_jwks_uri_keys(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jwt, const oidc_jwks_uri_t *jwks_uri,
@@ -167,9 +189,9 @@ apr_byte_t oidc_proto_jwt_verify(request_rec *r, oidc_cfg_t *cfg, oidc_jwt_t *jw
 apr_byte_t oidc_proto_jwt_validate(request_rec *r, oidc_jwt_t *jwt, const char *iss, apr_byte_t exp_is_mandatory,
 				   apr_byte_t iat_is_mandatory, int iat_slack);
 char *oidc_proto_jwt_header_peek(request_rec *r, const char *jwt, char **alg, char **enc, char **kid);
-apr_byte_t oidc_proto_jwt_create_from_first_pkey(request_rec *r, oidc_cfg_t *cfg, oidc_jwk_t **jwk, oidc_jwt_t **jwt,
-						 apr_byte_t use_psa_for_rsa);
-apr_byte_t oidc_proto_jwt_sign_and_serialize(request_rec *r, oidc_jwk_t *jwk, oidc_jwt_t *jwt, char **cser);
+apr_byte_t oidc_proto_jwt_create_from_first_pkey(request_rec *r, const oidc_cfg_t *cfg, oidc_jwk_t **jwk,
+						 oidc_jwt_t **jwt, apr_byte_t use_psa_for_rsa);
+apr_byte_t oidc_proto_jwt_sign_and_serialize(request_rec *r, const oidc_jwk_t *jwk, oidc_jwt_t *jwt, char **cser);
 
 // pkce.c
 #define OIDC_PKCE_METHOD_PLAIN "plain"
@@ -183,8 +205,12 @@ extern oidc_proto_pkce_t oidc_pkce_plain;
 extern oidc_proto_pkce_t oidc_pkce_s256;
 extern oidc_proto_pkce_t oidc_pkce_none;
 
-const char *oidc_proto_state_get_pkce_state(oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_pkce_state(const oidc_proto_state_t *proto_state);
 void oidc_proto_state_set_pkce_state(oidc_proto_state_t *proto_state, const char *pkce_state);
+const char *oidc_proto_state_get_auth_request_params(const oidc_proto_state_t *proto_state);
+void oidc_proto_state_set_auth_request_params(oidc_proto_state_t *proto_state, const char *auth_request_params);
+const char *oidc_proto_state_get_path_scope(const oidc_proto_state_t *proto_state);
+void oidc_proto_state_set_path_scope(oidc_proto_state_t *proto_state, const char *path_scope);
 
 // proto.c
 apr_byte_t oidc_proto_nonce_gen(request_rec *r, char **nonce);
@@ -194,49 +220,58 @@ apr_byte_t oidc_proto_flow_is_supported(apr_pool_t *pool, const char *flow);
 int oidc_proto_return_www_authenticate(request_rec *r, const char *error, const char *error_description);
 
 // request.c
-int oidc_proto_request_auth(request_rec *r, struct oidc_provider_t *provider, const char *login_hint,
-			    const char *redirect_uri, const char *state, oidc_proto_state_t *proto_state,
-			    const char *id_token_hint, const char *code_challenge, const char *auth_request_params,
-			    const char *path_scope);
+/* proto/request_object.c: add a JAR "request"/"request_uri" parameter to the authorization request */
+void oidc_proto_request_object_param_add(request_rec *r, oidc_cfg_t *cfg, const struct oidc_provider_t *provider,
+					 const char *redirect_uri, apr_table_t *params);
+
+/* assemble the parameters for a request to the authorization endpoint */
+void oidc_proto_request_auth_params_set(request_rec *r, oidc_cfg_t *cfg, const struct oidc_provider_t *provider,
+					const char *login_hint, const char *redirect_uri, const char *state,
+					const oidc_proto_state_t *proto_state, const char *id_token_hint,
+					const char *code_challenge, const char *auth_request_params,
+					const char *path_scope, apr_table_t *params);
+/* send the assembled parameters to the Pushed Authorization Request endpoint and redirect (RFC 9126) */
+int oidc_proto_request_auth_push(request_rec *r, oidc_cfg_t *cfg, const struct oidc_provider_t *provider,
+				 apr_table_t *params);
 
 // response.c
-apr_byte_t oidc_proto_response_is_post(request_rec *r, oidc_cfg_t *cfg);
+apr_byte_t oidc_proto_response_is_post(const request_rec *r, oidc_cfg_t *cfg);
 apr_byte_t oidc_proto_response_is_redirect(request_rec *r, oidc_cfg_t *cfg);
-apr_byte_t oidc_proto_response_code_idtoken_token(request_rec *r, oidc_cfg_t *c, oidc_proto_state_t *proto_state,
+apr_byte_t oidc_proto_response_code_idtoken_token(request_rec *r, oidc_cfg_t *c, const oidc_proto_state_t *proto_state,
 						  oidc_provider_t *provider, apr_table_t *params,
 						  const char *response_mode, oidc_jwt_t **jwt);
-apr_byte_t oidc_proto_response_code_idtoken(request_rec *r, oidc_cfg_t *c, oidc_proto_state_t *proto_state,
+apr_byte_t oidc_proto_response_code_idtoken(request_rec *r, oidc_cfg_t *c, const oidc_proto_state_t *proto_state,
 					    oidc_provider_t *provider, apr_table_t *params, const char *response_mode,
 					    oidc_jwt_t **jwt);
-apr_byte_t oidc_proto_response_code_token(request_rec *r, oidc_cfg_t *c, oidc_proto_state_t *proto_state,
+apr_byte_t oidc_proto_response_code_token(request_rec *r, oidc_cfg_t *c, const oidc_proto_state_t *proto_state,
 					  oidc_provider_t *provider, apr_table_t *params, const char *response_mode,
 					  oidc_jwt_t **jwt);
-apr_byte_t oidc_proto_response_code(request_rec *r, oidc_cfg_t *c, oidc_proto_state_t *proto_state,
+apr_byte_t oidc_proto_response_code(request_rec *r, oidc_cfg_t *c, const oidc_proto_state_t *proto_state,
 				    oidc_provider_t *provider, apr_table_t *params, const char *response_mode,
 				    oidc_jwt_t **jwt);
-apr_byte_t oidc_proto_response_idtoken_token(request_rec *r, oidc_cfg_t *c, oidc_proto_state_t *proto_state,
+apr_byte_t oidc_proto_response_idtoken_token(request_rec *r, oidc_cfg_t *c, const oidc_proto_state_t *proto_state,
 					     oidc_provider_t *provider, apr_table_t *params, const char *response_mode,
 					     oidc_jwt_t **jwt);
-apr_byte_t oidc_proto_response_idtoken(request_rec *r, oidc_cfg_t *c, oidc_proto_state_t *proto_state,
+apr_byte_t oidc_proto_response_idtoken(request_rec *r, oidc_cfg_t *c, const oidc_proto_state_t *proto_state,
 				       oidc_provider_t *provider, apr_table_t *params, const char *response_mode,
 				       oidc_jwt_t **jwt);
 
 // state.c
-oidc_proto_state_t *oidc_proto_state_new();
+oidc_proto_state_t *oidc_proto_state_new(void);
 void oidc_proto_state_destroy(oidc_proto_state_t *proto_state);
-oidc_proto_state_t *oidc_proto_state_from_cookie(request_rec *r, oidc_cfg_t *c, const char *cookieValue);
-char *oidc_proto_state_to_cookie(request_rec *r, oidc_cfg_t *c, oidc_proto_state_t *proto_state);
-char *oidc_proto_state_to_string(request_rec *r, oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_issuer(oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_nonce(oidc_proto_state_t *proto_state);
-apr_time_t oidc_proto_state_get_timestamp(oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_state(oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_original_url(oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_prompt(oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_response_type(oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_response_mode(oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_original_url(oidc_proto_state_t *proto_state);
-const char *oidc_proto_state_get_original_method(oidc_proto_state_t *proto_state);
+oidc_proto_state_t *oidc_proto_state_from_cookie(request_rec *r, const oidc_cfg_t *c, const char *cookieValue);
+char *oidc_proto_state_to_cookie(request_rec *r, const oidc_cfg_t *c, const oidc_proto_state_t *proto_state);
+char *oidc_proto_state_to_string(request_rec *r, const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_issuer(const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_nonce(const oidc_proto_state_t *proto_state);
+apr_time_t oidc_proto_state_get_timestamp(const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_state(const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_original_url(const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_prompt(const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_response_type(const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_response_mode(const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_original_url(const oidc_proto_state_t *proto_state);
+const char *oidc_proto_state_get_original_method(const oidc_proto_state_t *proto_state);
 void oidc_proto_state_set_state(oidc_proto_state_t *proto_state, const char *state);
 void oidc_proto_state_set_issuer(oidc_proto_state_t *proto_state, const char *issuer);
 void oidc_proto_state_set_original_url(oidc_proto_state_t *proto_state, const char *original_url);
@@ -248,17 +283,17 @@ void oidc_proto_state_set_prompt(oidc_proto_state_t *proto_state, const char *pr
 void oidc_proto_state_set_timestamp_now(oidc_proto_state_t *proto_state);
 
 // token.c
-apr_byte_t oidc_proto_token_endpoint_request(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider,
+apr_byte_t oidc_proto_token_endpoint_request(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
 					     apr_table_t *params, char **id_token, char **access_token,
 					     char **token_type, int *expires_in, char **refresh_token, char **scope);
-apr_byte_t oidc_proto_token_refresh_request(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider,
+apr_byte_t oidc_proto_token_refresh_request(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
 					    const char *rtoken, char **id_token, char **access_token, char **token_type,
 					    int *expires_in, char **refresh_token, char **scope);
 
 // userinfo.c
-apr_byte_t oidc_proto_userinfo_request(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider,
+apr_byte_t oidc_proto_userinfo_request(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
 				       const char *id_token_sub, const char *access_token,
 				       const char *access_token_type, char **s_userinfo, char **userinfo_jwt,
-				       json_t **userinfo_claims, long *response_code);
+				       oidc_json_t **userinfo_claims, long *response_code);
 
 #endif /* _MOD_AUTH_OPENIDC_PROTO_H_ */

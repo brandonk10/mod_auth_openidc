@@ -1,0 +1,1 @@
+{"iss":"https://other.example.com","aud":"client_id","sub":"alice","jti":"seed-unknown-iss","iat":0,"events":{"http://schemas.openid.net/event/backchannel-logout":{}}}

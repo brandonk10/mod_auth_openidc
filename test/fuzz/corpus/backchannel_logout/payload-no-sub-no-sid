@@ -1,0 +1,1 @@
+{"iss":"https://idp.example.com","aud":"client_id","jti":"seed-no-sub-sid","iat":0,"events":{"http://schemas.openid.net/event/backchannel-logout":{}}}

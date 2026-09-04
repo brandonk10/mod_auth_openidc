@@ -2,11 +2,76 @@ name: Build
 
 on: [push, pull_request]
 
+# the build only ever reads the repository; withhold everything else from GITHUB_TOKEN
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+    - name: Configure
+      # -Wall -Wextra is enabled here (and, with the clang-only type checks added,
+      # in static-analysis) rather than in the shipped AM_CFLAGS, so the distro
+      # package builds keep whatever flags their toolchain dictates. -Werror makes
+      # it a gate. Two categories are excluded: -Wunused-parameter, because the
+      # Apache hook/callback and config accessor signatures are fixed by their
+      # function-pointer types (the same reason the SonarCloud S1172 findings are
+      # accepted), and -Wmissing-field-initializers, because the auth_openidc_module
+      # struct deliberately leaves the trailing `flags` member implicit - httpd only
+      # grew it during 2.4, so spelling it out would break the older httpd in the
+      # distro matrix. NB: several of these only fire in an optimized build (gcc
+      # reports -Wmaybe-uninitialized from LTO), so a syntax-only check is not enough.
+      #
+      # The three -W flags after the exclusions are ones the tree is already clean on,
+      # added purely so a regression fails the build. Two are deliberately excluded:
+      # -Wwrite-strings retypes string literals as const char[], which cascades into
+      # -Wdiscarded-qualifiers across the config and metrics tables; and
+      # -Wstrict-prototypes cannot go in the CFLAGS handed to ./configure at all,
+      # because autoconf's own AC_CHECK_LIB probe declares the symbol K&R-style as
+      # "char jq_init ();". Under -Werror that is fatal on a compiler defaulting to
+      # gnu17 (the runner's gcc 13), so every library probe silently reports "not
+      # found" - which is how it first surfaced, as --with-jq failing to find libjq.
+      # It is NOT visible on a gcc that defaults to gnu23, where () already means
+      # (void). The () -> (void) source fixes it prompted are kept regardless.
+      run: |
+        ./autogen.sh
+        ./configure --with-jq \
+          CFLAGS="-g -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
+                  -Wformat-security -Wimplicit-fallthrough -Wpointer-arith -Werror"
+    - name: Make
+      run: make
+    - name: Test
+      run: make check || (cat test/test-suite.log && exit -1)
+
+  valgrind:
+    runs-on: ubuntu-latest
+    # `make valgrind` defaults OIDC_TEST_REDIS_SERVER/OIDC_TEST_MEMCACHE_SERVER
+    # to localhost (see test/Makefile.am), so the live test_cache tcases run
+    # under valgrind too -- leak-checking the real cache/redis.c +
+    # cache/memcache.c paths the mocks bypass
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      memcached:
+        image: memcached:1.6-alpine
+        ports:
+          - 11211:11211
+    steps:
+    - uses: actions/checkout@v5
     - name: Dependencies
       run: |
         sudo apt-get update -y
@@ -19,9 +84,389 @@ jobs:
         ./configure --with-jq
     - name: Make
       run: make
-    - name: Test
-      run: make check || (cat test/test-suite.log && exit -1)
+    - name: Wait for service containers
+      run: |
+        for i in $(seq 1 30); do
+          (exec 3<>/dev/tcp/localhost/6379) 2>/dev/null \
+            && (exec 3<>/dev/tcp/localhost/11211) 2>/dev/null \
+            && { echo "redis + memcached reachable"; exit 0; }
+          echo "waiting for service containers ($i)..."; sleep 1
+        done
+        echo "service containers did not become reachable"; exit 1
     - name: Valgrind
       run: make valgrind
+
+  distcheck:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+    - name: Configure
+      run: |
+        ./autogen.sh
+        ./configure --with-jq
+    - name: Make
+      run: make
     - name: Distcheck
       run: make distcheck DESTDIR=/tmp/mod_auth_openidc
+
+  coverage:
+    runs-on: ubuntu-latest
+    # check-code-coverage defaults OIDC_TEST_REDIS_SERVER/OIDC_TEST_MEMCACHE_SERVER
+    # to localhost (see test/Makefile.am), so the live test_cache tcases run here
+    # too -- give them the servers, which also folds the real cache/redis.c +
+    # cache/memcache.c paths into the coverage report
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      memcached:
+        image: memcached:1.6-alpine
+        ports:
+          - 11211:11211
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+        sudo apt-get install -y lcov
+    - name: Configure
+      run: |
+        ./autogen.sh
+        ./configure --with-jq --enable-code-coverage
+    - name: Wait for service containers
+      run: |
+        for i in $(seq 1 30); do
+          (exec 3<>/dev/tcp/localhost/6379) 2>/dev/null \
+            && (exec 3<>/dev/tcp/localhost/11211) 2>/dev/null \
+            && { echo "redis + memcached reachable"; exit 0; }
+          echo "waiting for service containers ($i)..."; sleep 1
+        done
+        echo "service containers did not become reachable"; exit 1
+    - name: Coverage
+      run: |
+        make check-code-coverage \
+          CODE_COVERAGE_OUTPUT_FILE=coverage.info \
+          CODE_COVERAGE_OUTPUT_DIRECTORY=coverage-report \
+          2>&1 | tee coverage.log || { cat test/test-suite.log; exit 1; }
+    # minimum-coverage gates: last measured 95.6% lines / 54.9% branches (2026-08-08); the
+    # floors sit below that to absorb run-to-run wobble from the live redis/memcache tcases.
+    # Bump them in the same PR that raises coverage meaningfully. NB: the line gate also
+    # indirectly fails the job on test failures, which the AX_CODE_COVERAGE "-make -k check"
+    # recipe otherwise swallows.
+    # "--ignore-errors inconsistent" mirrors CODE_COVERAGE_LCOV_SHOPTS in test/Makefile.am:
+    # with branch coverage on, a handful of lines come back hit with no branch data (an
+    # artifact of the -flto fat objects) and lcov treats that as fatal rather than a warning.
+    - name: Enforce minimum line coverage
+      run: >
+        lcov --summary test/coverage.info --fail-under-lines 94
+        --rc branch_coverage=1 --ignore-errors inconsistent
+    # lcov has no --fail-under-branches counterpart, so read the rate out of the summary
+    - name: Enforce minimum branch coverage
+      run: |
+        MIN=54
+        rate=$(lcov --summary test/coverage.info --rc branch_coverage=1 \
+                 --ignore-errors inconsistent 2>&1 \
+                 | sed -n 's/^ *branches\.*: \([0-9.]*\)%.*/\1/p')
+        [ -n "$rate" ] || { echo "could not determine the branch coverage rate"; exit 1; }
+        echo "branch coverage: ${rate}% (floor ${MIN}%)"
+        if awk -v r="$rate" -v m="$MIN" 'BEGIN { exit (r < m) ? 0 : 1 }'; then
+          echo "branch coverage ${rate}% is below the ${MIN}% floor"
+          exit 1
+        fi
+    - name: Summary
+      if: always()
+      run: |
+        {
+          echo '## Code coverage'
+          echo '```'
+          sed -n '/coverage rate/,/branches/p' coverage.log | grep . \
+            || tail -n 20 coverage.log
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload report
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: coverage-report
+        path: |
+          test/coverage-report
+          test/coverage.info
+        if-no-files-found: warn
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+        sudo apt-get install -y clang
+    - name: Configure
+      run: |
+        ./autogen.sh
+        ./configure --with-jq
+    - name: Make
+      run: make
+    - name: Build fuzz targets (clang + ASan/UBSan)
+      run: test/fuzz/build.sh
+    - name: Replay seed corpora under sanitizers
+      run: |
+        cd test/fuzz
+        for t in base64 url jwt json cookie response_header form_params metadata state_cookie jwks discovery_response pem_key backchannel_logout authz_response current_url bearer_token redirect_uri post_preserve strings; do
+          echo "== replay fuzz_$t =="
+          ./build/fuzz_$t corpus/$t/*
+        done
+        # the curated open-redirect payloads, one libFuzzer input per file
+        tmp=$(mktemp -d); i=0
+        while IFS= read -r line; do printf '%s' "$line" > "$tmp/p$i"; i=$((i + 1)); done \
+          < ../open-redirect-payload-list.txt
+        ./build/fuzz_url "$tmp"/*
+    - name: Upload crashes
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: fuzz-crashes
+        path: |
+          test/fuzz/crash-*
+          test/fuzz/oom-*
+          test/fuzz/timeout-*
+        if-no-files-found: ignore
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+    - name: Configure
+      # gcc (not clang) avoids the apxs -ffat-lto-objects flag clang rejects;
+      # -U_FORTIFY_SOURCE drops the fortify macros that conflict with ASan;
+      # -fno-sanitize-recover makes UBSan abort so a finding fails the build.
+      # alignment/nonnull-attribute/pointer-overflow are excluded as benign on
+      # the supported arches: the shm cache entry is aligned(64) as a cache-line
+      # hint but apr_shm does not 64-byte-align the segment, the curl response
+      # accumulator does memcpy(dst, NULL, 0) on the first chunk, and the cache
+      # walks entries by byte offset.
+      run: |
+        ./autogen.sh
+        ./configure --with-jq \
+          CFLAGS="-g -O1 -fsanitize=address,undefined -fno-sanitize=alignment,nonnull-attribute,pointer-overflow -fno-omit-frame-pointer -fno-sanitize-recover=undefined -U_FORTIFY_SOURCE" \
+          LDFLAGS="-fsanitize=address,undefined"
+    - name: Make
+      run: make
+    - name: Test (ASan + UBSan)
+      # leak detection is left to the valgrind job (APR pools make ASan leak
+      # output noisy); this job targets memory corruption + undefined behaviour
+      env:
+        ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1
+        UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      run: make check || (cat test/test-suite.log && exit 1)
+
+  cache-backends:
+    # Two things the other jobs miss: (1) a gcc-vs-clang build matrix, and
+    # (2) the redis/memcache backends run against *live* servers rather than
+    # the in-process mocks the unit tests use by default. The redis and
+    # memcache dev headers arrive via libhiredis-dev and apache2-dev ->
+    # libaprutil1-dev (apr_memcache.h), so HAVE_LIBHIREDIS and HAVE_MEMCACHE
+    # are both on; the test_cache "redis-live"/"memcache-live" tcases register
+    # only when OIDC_TEST_*_SERVER is set, so they stay off in the other jobs.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      memcached:
+        image: memcached:1.6-alpine
+        ports:
+          - 11211:11211
+    env:
+      OIDC_TEST_REDIS_SERVER: localhost:6379
+      OIDC_TEST_MEMCACHE_SERVER: localhost:11211
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+        sudo apt-get install -y clang
+    - name: Configure
+      run: |
+        ./autogen.sh
+        ./configure --with-jq CC=${{ matrix.cc }}
+        # the apxs-derived CFLAGS carry gcc-only LTO flags (-flto=auto /
+        # -ffat-lto-objects); strip them on the clang leg so an older runner
+        # clang cannot choke on them (LTO is not needed for a test build)
+        if [ "${{ matrix.cc }}" = "clang" ]; then
+          sed -i 's/-flto=auto//g; s/-ffat-lto-objects//g' src/Makefile test/Makefile
+        fi
+    - name: Make
+      run: make
+    - name: Wait for service containers
+      run: |
+        for i in $(seq 1 30); do
+          (exec 3<>/dev/tcp/localhost/6379) 2>/dev/null \
+            && (exec 3<>/dev/tcp/localhost/11211) 2>/dev/null \
+            && { echo "redis + memcached reachable"; exit 0; }
+          echo "waiting for service containers ($i)..."; sleep 1
+        done
+        echo "service containers did not become reachable"; exit 1
+    - name: Test (live redis + memcached)
+      run: make check || (cat test/test-suite.log && exit 1)
+
+  static-analysis:
+    # the strictness job: everything that must not regress but should not be able
+    # to block the primary build+test signal when a compiler upgrade adds a new
+    # diagnostic. clang is stricter than the gcc build on type correctness -
+    # implicit integer narrowing and incompatible function-pointer casts, which
+    # tend to hide in the macro-generated config getters/setters where the gcc
+    # build (erroring only on implicit-function-declaration) stays silent.
+    #
+    # -Wall -Wextra is enabled here rather than in the shipped AM_CFLAGS, with
+    # -Werror so a new warning fails the build. Two categories are excluded:
+    # -Wunused-parameter, because the Apache hook/callback and config accessor
+    # signatures are fixed by their function-pointer types (the same reason the
+    # SonarCloud S1172 findings are accepted), and -Wmissing-field-initializers,
+    # because the auth_openidc_module struct deliberately leaves the trailing
+    # `flags` member implicit - httpd only grew it during 2.4, so spelling it out
+    # would break the build on the older httpd in the distro matrix.
+    #
+    # -Wno-unknown-warning-option is load-bearing: -Wcast-function-type-mismatch
+    # only exists from clang 19, and under a blanket -Werror an unrecognized -W
+    # option is itself promoted to an error, which kills ./configure at its
+    # "can the compiler create executables" test rather than at the build. The
+    # runner currently ships clang 18, so that check is inert there (it already
+    # was before -Werror: an unknown -Werror=<name> is likewise only a warning).
+    # Pin a newer clang here if it needs to be enforced rather than merely
+    # available to local runs.
+    #
+    # -Wno-null-pointer-subtraction likewise: APR's ring macros (APR_RING_*, via
+    # APR_BRIGADE_INSERT_TAIL) do offsetof-style arithmetic on a null pointer.
+    # clang blames the file the macro expands in, so it surfaces as errors in
+    # our sources even though the construct is entirely APR's. Only the older
+    # apr_ring.h on the runner (APR 1.7.2) trips it; APR 1.7.6 does not, which
+    # is why a local clang build stays clean.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+        sudo apt-get install -y clang
+    - name: Configure
+      run: |
+        ./autogen.sh
+        ./configure --with-jq CC=clang \
+          CFLAGS="-g -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
+                  -Wno-unknown-warning-option -Wno-null-pointer-subtraction \
+                  -Wimplicit-int-conversion -Wcast-function-type-mismatch \
+                  -Wformat-security -Wimplicit-fallthrough -Wpointer-arith -Werror"
+        # the apxs-derived CFLAGS carry gcc-only LTO flags (-flto=auto /
+        # -ffat-lto-objects); strip them on the clang leg so an older runner
+        # clang cannot choke on them (LTO is irrelevant for an analysis build)
+        sed -i 's/-flto=auto//g; s/-ffat-lto-objects//g' src/Makefile test/Makefile
+    - name: Make (clang, type checks promoted to errors)
+      run: make
+      # build the suite under the same flags: -Wimplicit-int-conversion pulls in
+      # -Wshorten-64-to-32, which gcc has no equivalent for, so this leg is the only
+      # place an implicitly narrowed size_t in the tests is caught. Running the tests
+      # rather than just compiling them costs little and keeps this leg comparable to
+      # the gcc build job.
+    - name: Test
+      run: make check || (cat test/test-suite.log && exit -1)
+
+  gcc-analyzer:
+    # gcc's path-sensitive analyzer: leaks, double frees, use-after-free, null
+    # dereferences and out-of-bounds accesses along a specific execution path -
+    # a different class of finding from the warning flags in the build job, and
+    # complementary to clang-analyzer-* in the clang-tidy job (the two disagree
+    # often enough that both are worth running).
+    #
+    # A separate job because -fanalyzer is gcc-only and slows compilation
+    # noticeably. -Werror=analyzer-* promotes only the concrete-defect checks:
+    # -Wanalyzer-too-complex is a budget-exhausted notice about the analysis
+    # itself, not a finding, and would otherwise fail the build on unrelated code
+    # growth. NB: -fanalyzer needs a real compile - it does not run under
+    # -fsyntax-only.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+    - name: Configure
+      run: |
+        ./autogen.sh
+        ./configure --with-jq \
+          CFLAGS="-g -O2 -fanalyzer \
+            -Werror=analyzer-null-dereference -Werror=analyzer-null-argument \
+            -Werror=analyzer-double-free -Werror=analyzer-use-after-free \
+            -Werror=analyzer-malloc-leak -Werror=analyzer-file-leak \
+            -Werror=analyzer-out-of-bounds -Werror=analyzer-write-to-const \
+            -Werror=analyzer-write-to-string-literal \
+            -Werror=analyzer-use-of-uninitialized-value"
+        # -fanalyzer and LTO do not combine; the apxs-derived CFLAGS carry
+        # -flto=auto / -ffat-lto-objects, so strip them for this build
+        sed -i 's/-flto=auto//g; s/-ffat-lto-objects//g' src/Makefile test/Makefile
+    - name: Make (gcc -fanalyzer)
+      run: make
+
+  clang-tidy:
+    # narrow, warning-free lint baseline: the check set and the
+    # conventions-based exclusions live in .clang-tidy, which sets
+    # WarningsAsErrors so any new finding fails the build close to the
+    # change instead of surfacing post-hoc in SonarCloud
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y apache2-dev libcjose-dev libssl-dev check pkg-config
+        sudo apt-get install -y libjansson-dev libcurl4-openssl-dev libhiredis-dev libpcre2-dev libjq-dev check
+        sudo apt-get install -y clang-tidy bear
+    - name: Configure
+      run: |
+        ./autogen.sh
+        ./configure --with-jq
+    - name: Compilation database
+      run: |
+        bear -- make -C src
+        # the apxs-derived CFLAGS carry gcc-only LTO flags (-flto=auto /
+        # -ffat-lto-objects); strip them from the compilation database so
+        # the clang-tidy driver does not trip over them
+        sed -i 's/-flto=auto//g; s/-ffat-lto-objects//g' compile_commands.json
+    - name: clang-tidy
+      run: run-clang-tidy -quiet -p . "src/.*\.c$"

@@ -44,7 +44,51 @@
 #include "cfg/cfg_int.h"
 #include "cfg/parse.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
 
+/*
+ * "unset" sentinel for oauth_token_introspect_interval: the standard OIDC_CONFIG_POS_INT_UNSET (-1)
+ * cannot be used since -1 is a valid configured value for this directive
+ */
+#define OIDC_INTROSPECT_INTERVAL_UNSET -2
+
+/* Generate declaration, initialization, and merge logic for simple directory members. */
+#define OIDC_DIR_CFG_SIMPLE_MEMBERS(PTR, INT)                                                                          \
+	PTR(char *, discover_url)                                                                                      \
+	PTR(char *, cookie_path)                                                                                       \
+	PTR(char *, cookie)                                                                                            \
+	PTR(char *, authn_header)                                                                                      \
+	PTR(char *, unauthz_arg)                                                                                       \
+	PTR(apr_array_header_t *, pass_cookies)                                                                        \
+	PTR(apr_array_header_t *, strip_cookies)                                                                       \
+	PTR(oidc_apr_expr_t *, path_auth_request_expr)                                                                 \
+	PTR(oidc_apr_expr_t *, path_scope_expr)                                                                        \
+	PTR(oidc_apr_expr_t *, unauth_expression)                                                                      \
+	PTR(oidc_apr_expr_t *, userinfo_claims_expr)                                                                   \
+	PTR(char *, state_cookie_prefix)                                                                               \
+	PTR(apr_array_header_t *, pass_userinfo_as)                                                                    \
+	INT(unauth_action)                                                                                             \
+	INT(unautz_action)                                                                                             \
+	INT(pass_info_in)                                                                                              \
+	INT(pass_info_encoding)                                                                                        \
+	INT(oauth_accept_token_in)                                                                                     \
+	INT(preserve_post)                                                                                             \
+	INT(pass_access_token)                                                                                         \
+	INT(pass_refresh_token)                                                                                        \
+	INT(refresh_access_token_before_expiry)                                                                        \
+	INT(action_on_error_refresh)                                                                                   \
+	INT(pass_idtoken_as)
+
+#define OIDC_DIR_M_DECL_PTR(type, name) type name;
+#define OIDC_DIR_M_DECL_INT(name) int name;
+#define OIDC_DIR_M_CREATE_PTR(type, name) c->name = NULL;
+#define OIDC_DIR_M_CREATE_INT(name) c->name = OIDC_CONFIG_POS_INT_UNSET;
+#define OIDC_DIR_M_MERGE_PTR(type, name) c->name = _oidc_cfg_merge_ptr(add->name, base->name);
+#define OIDC_DIR_M_MERGE_INT(name) c->name = _oidc_cfg_merge_pos_int(add->name, base->name);
+
+	OIDC_DIR_CFG_SIMPLE_MEMBERS(OIDC_DIR_M_DECL_PTR, OIDC_DIR_M_DECL_INT)
+	/* special: created as an (empty) hash, merged on entry count */
+	/* special: -1 is a valid value so this uses its own OIDC_INTROSPECT_INTERVAL_UNSET sentinel */
 #define OIDC_PASS_ID_TOKEN_AS_CLAIMS_STR "claims"
 #define OIDC_PASS_IDTOKEN_AS_PAYLOAD_STR "payload"
 #define OIDC_PASS_IDTOKEN_AS_SERIALIZED_STR "serialized"
@@ -56,7 +100,9 @@
 const char *oidc_cmd_dir_pass_idtoken_as_set(cmd_parms *cmd, void *m, const char *arg) {
 	oidc_dir_cfg_t *dir_cfg = (oidc_dir_cfg_t *)m;
 
-	oidc_pass_idtoken_as_t type;
+	/* only read when the parse below succeeds and has written it; seeded so the optimizer does not
+	 * have to prove that across the call (-Wmaybe-uninitialized) */
+	oidc_pass_idtoken_as_t type = OIDC_PASS_IDTOKEN_AS_CLAIMS;
 	const char *rv = NULL;
 
 	static const oidc_cfg_option_t options[] = {
@@ -89,22 +135,24 @@ const char *oidc_cmd_dir_pass_idtoken_as_set(cmd_parms *cmd, void *m, const char
  */
 static const char *oidc_cfg_dir_parse_pass_userinfo_as(apr_pool_t *pool, const char *v,
 						       oidc_pass_user_info_as_t **result) {
-	char *name = NULL;
 	const char *rv = NULL;
-	oidc_pass_userinfo_enum_t type;
+	/* only read when the parse below succeeds and has written it; seeded so the optimizer does not
+	 * have to prove that across the call (-Wmaybe-uninitialized) */
+	oidc_pass_userinfo_enum_t type = OIDC_PASS_USERINFO_AS_CLAIMS;
 	static const oidc_cfg_option_t options[] = {
 	    {OIDC_PASS_USERINFO_AS_CLAIMS, OIDC_PASS_USERINFO_AS_CLAIMS_STR},
 	    {OIDC_PASS_USERINFO_AS_JSON_OBJECT, OIDC_PASS_USERINFO_AS_JSON_OBJECT_STR},
 	    {OIDC_PASS_USERINFO_AS_JWT, OIDC_PASS_USERINFO_AS_JWT_STR},
 	    {OIDC_PASS_USERINFO_AS_SIGNED_JWT, OIDC_PASS_USERINFO_AS_SIGNED_JWT_STR}};
 
-	name = _oidc_strstr(v, ":");
-	if (name) {
-		*name = '\0';
-		name++;
-	}
+	/* split "<type>:<name>" without writing into `v`: oidc_cfg_dir_post_config passes the default
+	 * as a string literal, so truncating it in place would write to read-only memory. Copying out
+	 * just the type also avoids duplicating the whole string when there is no separator at all. */
+	const char *sep = _oidc_strstr(v, ":");
+	const char *value = (sep != NULL) ? apr_pstrndup(pool, v, (apr_size_t)(sep - v)) : v;
+	const char *name = (sep != NULL) ? sep + 1 : NULL;
 
-	rv = oidc_cfg_parse_option(pool, options, OIDC_CFG_OPTIONS_SIZE(options), v, (int *)&type);
+	rv = oidc_cfg_parse_option(pool, options, OIDC_CFG_OPTIONS_SIZE(options), value, (int *)&type);
 	if (rv != NULL)
 		return rv;
 
@@ -150,8 +198,8 @@ static const oidc_cfg_option_t oidc_oauth_accept_token_in_options[] = {
  */
 const char *oidc_cfg_dir_accept_oauth_token_in2str(apr_pool_t *pool, oidc_oauth_accept_token_in_t v) {
 	static oidc_cfg_option_t enabled[OIDC_CFG_OPTIONS_SIZE(oidc_oauth_accept_token_in_options)];
-	int i = 0, j = 0;
-	for (j = 0; j < OIDC_CFG_OPTIONS_SIZE(oidc_oauth_accept_token_in_options); j++) {
+	int i = 0;
+	for (int j = 0; j < OIDC_CFG_OPTIONS_SIZE(oidc_oauth_accept_token_in_options); j++) {
 		if (v & oidc_oauth_accept_token_in_options[j].val) {
 			enabled[i] = oidc_oauth_accept_token_in_options[j];
 			i++;
@@ -169,7 +217,8 @@ const char *oidc_cfg_dir_accept_oauth_token_in2str(apr_pool_t *pool, oidc_oauth_
 const char *oidc_cmd_dir_accept_oauth_token_in_set(cmd_parms *cmd, void *m, const char *arg) {
 	oidc_dir_cfg_t *dir_cfg = (oidc_dir_cfg_t *)m;
 	int v = 0;
-	const char *rv = NULL, *s = NULL;
+	const char *rv = NULL;
+	const char *s = NULL;
 	char *p = NULL;
 
 	s = apr_pstrdup(cmd->pool, arg);
@@ -212,12 +261,18 @@ const char *oidc_cmd_dir_pass_cookies_set(cmd_parms *cmd, void *m, const char *a
 	return oidc_cfg_string_list_add(cmd->pool, &dir_cfg->pass_cookies, arg);
 }
 
+/*
+ * Body generators for the per-directory (oidc_dir_cfg_t) accessors declared in
+ * cfg/dir.h: for member `foo` they emit oidc_cmd_dir_foo_set() and
+ * oidc_cfg_dir_foo_get(); those names are token-pasted here and so appear in
+ * no source line.
+ */
 #define OIDC_CFG_DIR_MEMBER_FUNC_GET(member, type, def_val, unset_val)                                                 \
 	type oidc_cfg_dir_##member##_get(request_rec *r) {                                                             \
 		oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);               \
 		if (dir_cfg->member == unset_val)                                                                      \
-			return def_val;                                                                                \
-		return dir_cfg->member;                                                                                \
+			return (type)def_val;                                                                          \
+		return (type)dir_cfg->member;                                                                          \
 	}
 
 #define OIDC_CFG_DIR_MEMBER_FUNC_INT_GET(member, type, def_val)                                                        \
@@ -291,9 +346,9 @@ static const oidc_cfg_option_t unauth_action_options[] = {{OIDC_UNAUTH_AUTHENTIC
 							  {OIDC_UNAUTH_RETURN407, OIDC_UNAUTH_RETURN407_STR}};
 
 static const char *oidc_cfg_dir_unauth_action2str(oidc_unauth_action_t action) {
-	int i = 0;
-	for (i = 0; i < OIDC_CFG_OPTIONS_SIZE(unauth_action_options); i++) {
-		if (action == unauth_action_options[i].val)
+	for (int i = 0; i < OIDC_CFG_OPTIONS_SIZE(unauth_action_options); i++) {
+		/* oidc_cfg_option_t holds the value as an int; the cast keeps the comparison signed */
+		if ((int)action == unauth_action_options[i].val)
 			return unauth_action_options[i].str;
 	}
 	return NULL;
@@ -308,7 +363,7 @@ const char *oidc_cmd_dir_unauth_action_set(cmd_parms *cmd, void *m, const char *
 	    oidc_cfg_parse_option(cmd->pool, unauth_action_options, OIDC_CFG_OPTIONS_SIZE(unauth_action_options), arg1,
 				  &dir_cfg->unauth_action);
 	if (rv == NULL)
-		rv = oidc_util_apr_expr_parse(cmd, arg2, &dir_cfg->unauth_expression, FALSE);
+		rv = oidc_util_apr_expr_parse(cmd, arg2, &dir_cfg->unauth_expression, OIDC_APR_EXPR_RESULT_BOOLEAN);
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
@@ -342,7 +397,8 @@ const char *oidc_cmd_dir_unautz_action_set(cmd_parms *cmd, void *m, const char *
 
 const char *oidc_cmd_dir_userinfo_claims_expr_set(cmd_parms *cmd, void *m, const char *arg) {
 	oidc_dir_cfg_t *dir_cfg = (oidc_dir_cfg_t *)m;
-	const char *rv = oidc_util_apr_expr_parse(cmd, arg, &dir_cfg->userinfo_claims_expr, TRUE);
+	const char *rv =
+	    oidc_util_apr_expr_parse(cmd, arg, &dir_cfg->userinfo_claims_expr, OIDC_APR_EXPR_RESULT_STRING);
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
@@ -351,19 +407,19 @@ const char *oidc_cmd_dir_userinfo_claims_expr_set(cmd_parms *cmd, void *m, const
 const char *oidc_cmd_dir_path_auth_request_params_set(cmd_parms *cmd, void *m, const char *arg) {
 	oidc_dir_cfg_t *dir_cfg = (oidc_dir_cfg_t *)m;
 	const char *rv = NULL;
-	rv = oidc_util_apr_expr_parse(cmd, arg, &dir_cfg->path_auth_request_expr, TRUE);
+	rv = oidc_util_apr_expr_parse(cmd, arg, &dir_cfg->path_auth_request_expr, OIDC_APR_EXPR_RESULT_STRING);
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
 const char *oidc_cmd_dir_path_scope_set(cmd_parms *cmd, void *m, const char *arg) {
 	oidc_dir_cfg_t *dir_cfg = (oidc_dir_cfg_t *)m;
 	const char *rv = NULL;
-	rv = oidc_util_apr_expr_parse(cmd, arg, &dir_cfg->path_scope_expr, TRUE);
+	rv = oidc_util_apr_expr_parse(cmd, arg, &dir_cfg->path_scope_expr, OIDC_APR_EXPR_RESULT_STRING);
 	return OIDC_CONFIG_DIR_RV(cmd, rv);
 }
 
 #define OIDC_REFRESH_ACCESS_TOKEN_BEFORE_EXPIRY_MIN 0
-#define OIDC_REFRESH_ACCESS_TOKEN_BEFORE_EXPIRY_MAX 3600 * 24 * 365
+#define OIDC_REFRESH_ACCESS_TOKEN_BEFORE_EXPIRY_MAX (3600 * 24 * 365)
 
 /*
  * set the time in seconds that the access token needs to be valid for
@@ -471,7 +527,7 @@ const char *oidc_cfg_dir_accept_token_in_option_get(request_rec *r, const char *
 }
 
 #define OIDC_OAUTH_ACCESS_TOKEN_INTROSPECTION_INTERVAL_MIN -1
-#define OIDC_OAUTH_ACCESS_TOKEN_INTROSPECTION_INTERVAL_MAX 3600 * 24 * 365
+#define OIDC_OAUTH_ACCESS_TOKEN_INTROSPECTION_INTERVAL_MAX (3600 * 24 * 365)
 
 /* default value for the token introspection interval (0 = disabled, no expiry of claims) */
 #define OIDC_DEFAULT_TOKEN_INTROSPECTION_INTERVAL 0
@@ -485,9 +541,8 @@ const char *oidc_cmd_dir_token_introspection_interval_set(cmd_parms *cmd, void *
 }
 
 int oidc_cfg_dir_token_introspection_interval_get(request_rec *r) {
-	oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
-	// we use -2 here as an exception because -1 is a valid value
-	if (dir_cfg->oauth_token_introspect_interval <= -2)
+	const oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
+	if (dir_cfg->oauth_token_introspect_interval <= OIDC_INTROSPECT_INTERVAL_UNSET)
 		return OIDC_DEFAULT_TOKEN_INTROSPECTION_INTERVAL;
 	return dir_cfg->oauth_token_introspect_interval;
 }
@@ -513,7 +568,7 @@ oidc_unauth_action_t oidc_cfg_dir_unauth_action_get(request_rec *r) {
 		goto end;
 	}
 
-	s = oidc_util_apr_expr_exec(r, dir_cfg->unauth_expression, FALSE);
+	s = oidc_util_apr_expr_exec(r, dir_cfg->unauth_expression, OIDC_APR_EXPR_RESULT_BOOLEAN);
 
 	action = (s != NULL) ? dir_cfg->unauth_action : OIDC_DEFAULT_UNAUTH_ACTION;
 
@@ -526,7 +581,7 @@ end:
 }
 
 apr_byte_t oidc_cfg_dir_unauth_expr_is_set(request_rec *r) {
-	oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
+	const oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
 	return (dir_cfg->unauth_expression != NULL) ? TRUE : FALSE;
 }
 
@@ -535,13 +590,13 @@ apr_byte_t oidc_cfg_dir_unauth_expr_is_set(request_rec *r) {
 OIDC_CFG_DIR_MEMBER_FUNC_INT_GET(unautz_action, oidc_unautz_action_t, OIDC_DEFAULT_UNAUTZ_ACTION)
 
 const char *oidc_cfg_dir_unauthz_arg_get(request_rec *r) {
-	oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
+	const oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
 	return dir_cfg->unauthz_arg;
 }
 
 const char *oidc_cfg_dir_path_auth_request_params_get(request_rec *r) {
-	oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
-	return oidc_util_apr_expr_exec(r, dir_cfg->path_auth_request_expr, TRUE);
+	const oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
+	return oidc_util_apr_expr_exec(r, dir_cfg->path_auth_request_expr, OIDC_APR_EXPR_RESULT_STRING);
 }
 
 /* default pass user info as */
@@ -549,18 +604,24 @@ const char *oidc_cfg_dir_path_auth_request_params_get(request_rec *r) {
 
 static apr_array_header_t *pass_userinfo_as_default = NULL;
 
-const apr_array_header_t *oidc_cfg_dir_pass_userinfo_as_get(request_rec *r) {
-	oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
+/*
+ * initialize the default pass-userinfo-as array once, from the (single-threaded) post-config phase;
+ * lazy initialization from the request path is not safe under threaded MPMs because the static and
+ * the process pool it allocates from are shared across worker threads without locking.
+ */
+int oidc_cfg_dir_post_config(server_rec *s) {
 	oidc_pass_user_info_as_t *p = NULL;
-	if (dir_cfg->pass_userinfo_as == NULL) {
-		if (pass_userinfo_as_default == NULL) {
-			pass_userinfo_as_default =
-			    apr_array_make(r->server->process->pool, 3, sizeof(const oidc_pass_user_info_as_t *));
-			oidc_cfg_dir_parse_pass_userinfo_as(r->server->process->pool, OIDC_DEFAULT_PASS_USERINFO_AS,
-							    &p);
-			APR_ARRAY_PUSH(pass_userinfo_as_default, const oidc_pass_user_info_as_t *) = p;
-		}
-	}
+	if (pass_userinfo_as_default != NULL)
+		return OK;
+	pass_userinfo_as_default = apr_array_make(s->process->pool, 3, sizeof(const oidc_pass_user_info_as_t *));
+	if (oidc_cfg_dir_parse_pass_userinfo_as(s->process->pool, OIDC_DEFAULT_PASS_USERINFO_AS, &p) != NULL)
+		return HTTP_INTERNAL_SERVER_ERROR;
+	APR_ARRAY_PUSH(pass_userinfo_as_default, const oidc_pass_user_info_as_t *) = p;
+	return OK;
+}
+
+const apr_array_header_t *oidc_cfg_dir_pass_userinfo_as_get(request_rec *r) {
+	const oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
 	return dir_cfg->pass_userinfo_as ? dir_cfg->pass_userinfo_as : pass_userinfo_as_default;
 }
 
@@ -570,14 +631,14 @@ OIDC_CFG_DIR_MEMBER_FUNC_INT_GET(pass_idtoken_as, oidc_pass_idtoken_as_t, OIDC_D
 
 #ifdef USE_LIBJQ
 const char *oidc_cfg_dir_userinfo_claims_expr_get(request_rec *r) {
-	oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
-	return oidc_util_apr_expr_exec(r, dir_cfg->userinfo_claims_expr, TRUE);
+	const oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
+	return oidc_util_apr_expr_exec(r, dir_cfg->userinfo_claims_expr, OIDC_APR_EXPR_RESULT_STRING);
 }
 #endif
 
 const char *oidc_cfg_dir_path_scope_get(request_rec *r) {
-	oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
-	return oidc_util_apr_expr_exec(r, dir_cfg->path_scope_expr, TRUE);
+	const oidc_dir_cfg_t *dir_cfg = ap_get_module_config(r->per_dir_config, &auth_openidc_module);
+	return oidc_util_apr_expr_exec(r, dir_cfg->path_scope_expr, OIDC_APR_EXPR_RESULT_STRING);
 }
 
 /*
@@ -585,33 +646,25 @@ const char *oidc_cfg_dir_path_scope_get(request_rec *r) {
  */
 void *oidc_cfg_dir_config_create(apr_pool_t *pool, char *path) {
 	oidc_dir_cfg_t *c = apr_pcalloc(pool, sizeof(oidc_dir_cfg_t));
-	c->discover_url = NULL;
-	c->cookie = NULL;
-	c->cookie_path = NULL;
-	c->authn_header = NULL;
-	c->unauth_action = OIDC_CONFIG_POS_INT_UNSET;
-	c->unauth_expression = NULL;
-	c->unautz_action = OIDC_CONFIG_POS_INT_UNSET;
-	c->unauthz_arg = NULL;
-	c->pass_cookies = NULL;
-	c->strip_cookies = NULL;
-	c->pass_info_in = OIDC_CONFIG_POS_INT_UNSET;
-	c->pass_info_encoding = OIDC_CONFIG_POS_INT_UNSET;
-	c->oauth_accept_token_in = OIDC_CONFIG_POS_INT_UNSET;
+	OIDC_DIR_CFG_SIMPLE_MEMBERS(OIDC_DIR_M_CREATE_PTR, OIDC_DIR_M_CREATE_INT)
 	c->oauth_accept_token_options = apr_hash_make(pool);
-	c->oauth_token_introspect_interval = -2;
-	c->preserve_post = OIDC_CONFIG_POS_INT_UNSET;
-	c->pass_access_token = OIDC_CONFIG_POS_INT_UNSET;
-	c->pass_refresh_token = OIDC_CONFIG_POS_INT_UNSET;
-	c->path_auth_request_expr = NULL;
-	c->path_scope_expr = NULL;
-	c->userinfo_claims_expr = NULL;
-	c->refresh_access_token_before_expiry = OIDC_CONFIG_POS_INT_UNSET;
-	c->action_on_error_refresh = OIDC_CONFIG_POS_INT_UNSET;
-	c->state_cookie_prefix = NULL;
-	c->pass_userinfo_as = NULL;
-	c->pass_idtoken_as = OIDC_CONFIG_POS_INT_UNSET;
-	return (c);
+	c->oauth_token_introspect_interval = OIDC_INTROSPECT_INTERVAL_UNSET;
+	return c;
+}
+
+/*
+ * pick the "add" hash if it has any entries, otherwise fall back to "base"
+ */
+static apr_hash_t *_oidc_cfg_dir_merge_hash(apr_hash_t *add, apr_hash_t *base) {
+	return apr_hash_count(add) > 0 ? add : base;
+}
+
+/*
+ * pick the "add" introspect interval if it was explicitly configured
+ * (i.e. not the OIDC_INTROSPECT_INTERVAL_UNSET default), otherwise fall back to "base"
+ */
+static int _oidc_cfg_dir_merge_introspect_interval(int add, int base) {
+	return add > OIDC_INTROSPECT_INTERVAL_UNSET ? add : base;
 }
 
 /*
@@ -619,60 +672,12 @@ void *oidc_cfg_dir_config_create(apr_pool_t *pool, char *path) {
  */
 void *oidc_cfg_dir_config_merge(apr_pool_t *pool, void *BASE, void *ADD) {
 	oidc_dir_cfg_t *c = apr_pcalloc(pool, sizeof(oidc_dir_cfg_t));
-	oidc_dir_cfg_t *base = BASE;
-	oidc_dir_cfg_t *add = ADD;
-        c->redirect_uri = add->redirect_uri != NULL ? add->redirect_uri : base->redirect_uri;
-        c->default_sso_url = add->default_sso_url != NULL ? add->default_sso_url : base->default_sso_url;
-        c->default_slo_url = add->default_slo_url != NULL ? add->default_slo_url : base->default_slo_url;
-	c->discover_url = add->discover_url != NULL ? add->discover_url : base->discover_url;
-	c->cookie = add->cookie != NULL ? add->cookie : base->cookie;
-	c->cookie_path = add->cookie_path != NULL ? add->cookie_path : base->cookie_path;
-	c->authn_header = add->authn_header != NULL ? add->authn_header : base->authn_header;
-	c->unauth_action = add->unauth_action != OIDC_CONFIG_POS_INT_UNSET ? add->unauth_action : base->unauth_action;
-	c->unauth_expression = add->unauth_expression != NULL ? add->unauth_expression : base->unauth_expression;
-	c->unautz_action = add->unautz_action != OIDC_CONFIG_POS_INT_UNSET ? add->unautz_action : base->unautz_action;
-	c->unauthz_arg = add->unauthz_arg != NULL ? add->unauthz_arg : base->unauthz_arg;
-
-	c->pass_cookies = add->pass_cookies != NULL ? add->pass_cookies : base->pass_cookies;
-	c->strip_cookies = add->strip_cookies != NULL ? add->strip_cookies : base->strip_cookies;
-
-	c->pass_info_in = add->pass_info_in != OIDC_CONFIG_POS_INT_UNSET ? add->pass_info_in : base->pass_info_in;
-	c->pass_info_encoding =
-	    add->pass_info_encoding != OIDC_CONFIG_POS_INT_UNSET ? add->pass_info_encoding : base->pass_info_encoding;
-	c->oauth_accept_token_in = add->oauth_accept_token_in != OIDC_CONFIG_POS_INT_UNSET
-				       ? add->oauth_accept_token_in
-				       : base->oauth_accept_token_in;
-	c->oauth_accept_token_options = apr_hash_count(add->oauth_accept_token_options) > 0
-					    ? add->oauth_accept_token_options
-					    : base->oauth_accept_token_options;
-	c->oauth_token_introspect_interval = add->oauth_token_introspect_interval >= -1
-						 ? add->oauth_token_introspect_interval
-						 : base->oauth_token_introspect_interval;
-	c->preserve_post = add->preserve_post != OIDC_CONFIG_POS_INT_UNSET ? add->preserve_post : base->preserve_post;
-	c->pass_access_token =
-	    add->pass_access_token != OIDC_CONFIG_POS_INT_UNSET ? add->pass_access_token : base->pass_access_token;
-	c->pass_refresh_token =
-	    add->pass_refresh_token != OIDC_CONFIG_POS_INT_UNSET ? add->pass_refresh_token : base->pass_refresh_token;
-	c->path_auth_request_expr =
-	    add->path_auth_request_expr != NULL ? add->path_auth_request_expr : base->path_auth_request_expr;
-	c->path_scope_expr = add->path_scope_expr != NULL ? add->path_scope_expr : base->path_scope_expr;
-	c->userinfo_claims_expr =
-	    add->userinfo_claims_expr != NULL ? add->userinfo_claims_expr : base->userinfo_claims_expr;
-
-	c->pass_userinfo_as = add->pass_userinfo_as != NULL ? add->pass_userinfo_as : base->pass_userinfo_as;
-	c->pass_idtoken_as =
-	    add->pass_idtoken_as != OIDC_CONFIG_POS_INT_UNSET ? add->pass_idtoken_as : base->pass_idtoken_as;
-
-	c->refresh_access_token_before_expiry = add->refresh_access_token_before_expiry != OIDC_CONFIG_POS_INT_UNSET
-						    ? add->refresh_access_token_before_expiry
-						    : base->refresh_access_token_before_expiry;
-
-	c->action_on_error_refresh = add->action_on_error_refresh != OIDC_CONFIG_POS_INT_UNSET
-					 ? add->action_on_error_refresh
-					 : base->action_on_error_refresh;
-
-	c->state_cookie_prefix =
-	    add->state_cookie_prefix != NULL ? add->state_cookie_prefix : base->state_cookie_prefix;
-
-	return (c);
+	const oidc_dir_cfg_t *base = BASE;
+	const oidc_dir_cfg_t *add = ADD;
+	OIDC_DIR_CFG_SIMPLE_MEMBERS(OIDC_DIR_M_MERGE_PTR, OIDC_DIR_M_MERGE_INT)
+	c->oauth_accept_token_options =
+	    _oidc_cfg_dir_merge_hash(add->oauth_accept_token_options, base->oauth_accept_token_options);
+	c->oauth_token_introspect_interval = _oidc_cfg_dir_merge_introspect_interval(
+	    add->oauth_token_introspect_interval, base->oauth_token_introspect_interval);
+	return c;
 }

@@ -45,27 +45,27 @@
 #include "metrics.h"
 #include "mod_auth_openidc.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
 
-static int oidc_session_management_iframe_op(request_rec *r, oidc_cfg_t *c, oidc_session_t *session,
-					     const char *check_session_iframe) {
+static int oidc_session_management_iframe_op(request_rec *r, const char *check_session_iframe) {
 	oidc_debug(r, "enter");
 	oidc_http_hdr_out_location_set(r, check_session_iframe);
 	return HTTP_MOVED_TEMPORARILY;
 }
 
-static int oidc_session_management_iframe_rp(request_rec *r, oidc_cfg_t *c, oidc_session_t *session,
+static int oidc_session_management_iframe_rp(request_rec *r, const oidc_cfg_t *c, const oidc_session_t *session,
 					     const char *client_id, const char *check_session_iframe) {
 
 	oidc_debug(r, "enter");
 
-	const char *java_script =
+	static const char java_script_tmpl[] =
 	    "    <script type=\"text/javascript\">\n"
 	    "      var targetOrigin  = '%s';\n"
 	    "      var clientId  = '%s';\n"
 	    "      var sessionId  = '%s';\n"
 	    "      var loginUrl  = '%s';\n"
 	    "      var message = clientId + ' ' + sessionId;\n"
-	    "	   var timerID;\n"
+	    "\t   var timerID;\n"
 	    "\n"
 	    "      function checkSession() {\n"
 	    "        console.debug('checkSession: posting ' + message + ' to ' + targetOrigin);\n"
@@ -87,11 +87,11 @@ static int oidc_session_management_iframe_rp(request_rec *r, oidc_cfg_t *c, oidc
 	    "        if (e.data != 'unchanged') {\n"
 	    "          clearInterval(timerID);\n"
 	    "          if (e.data == 'changed' && sessionId == '' ) {\n"
-	    "			 // 'changed' + no session: enforce a login (if we have a login url...)\n"
+	    "\t\t\t // 'changed' + no session: enforce a login (if we have a login url...)\n"
 	    "            if (loginUrl != '') {\n"
 	    "              window.top.location.replace(loginUrl);\n"
 	    "            }\n"
-	    "		   } else {\n"
+	    "\t\t   } else {\n"
 	    "              // either 'changed' + active session, or 'error': enforce a logout\n"
 	    "              window.top.location.replace('%s?logout=' + encodeURIComponent(window.top.location.href));\n"
 	    "          }\n"
@@ -103,11 +103,15 @@ static int oidc_session_management_iframe_rp(request_rec *r, oidc_cfg_t *c, oidc
 	    "    </script>\n";
 
 	/* determine the origin for the check_session_iframe endpoint */
-	char *origin = apr_pstrdup(r->pool, check_session_iframe);
+	const char *origin = apr_pstrdup(r->pool, check_session_iframe);
 	apr_uri_t uri;
-	apr_uri_parse(r->pool, check_session_iframe, &uri);
-	char *p = _oidc_strstr(origin, uri.path);
-	*p = '\0';
+	if (apr_uri_parse(r->pool, check_session_iframe, &uri) != APR_SUCCESS) {
+		oidc_error(r, "could not parse the check_session_iframe URL: %s", check_session_iframe);
+		return HTTP_INTERNAL_SERVER_ERROR;
+	}
+	char *p = (uri.path != NULL) ? _oidc_strstr(origin, uri.path) : NULL;
+	if (p != NULL)
+		*p = '\0';
 
 	/* the element identifier for the OP iframe */
 	const char *op_iframe_id = "openidc-op";
@@ -117,7 +121,6 @@ static int oidc_session_management_iframe_rp(request_rec *r, oidc_cfg_t *c, oidc
 	if (session_state == NULL) {
 		oidc_warn(
 		    r, "no session_state found in the session; the OP does probably not support session management!?");
-		// return OK;
 	}
 
 	char *s_poll_interval = NULL;
@@ -126,17 +129,23 @@ static int oidc_session_management_iframe_rp(request_rec *r, oidc_cfg_t *c, oidc
 	if ((poll_interval <= 0) || (poll_interval > 3600 * 24))
 		poll_interval = 3000;
 
-	char *login_uri = NULL, *error_str = NULL, *error_description = NULL;
+	char *login_uri = NULL;
+	char *error_str = NULL;
+	char *error_description = NULL;
 	oidc_util_url_parameter_get(r, "login_uri", &login_uri);
-	if ((login_uri != NULL) &&
-	    (oidc_validate_redirect_url(r, c, login_uri, FALSE, &error_str, &error_description) == FALSE)) {
+	if ((login_uri != NULL) && (oidc_validate_redirect_url(r, c, login_uri, OIDC_REDIRECT_URL_SAME_HOST, &error_str,
+							       &error_description) == FALSE)) {
 		return HTTP_BAD_REQUEST;
 	}
 
 	const char *redirect_uri = oidc_util_url_redirect_uri(r, c);
 
-	java_script = apr_psprintf(r->pool, java_script, origin, client_id, session_state ? session_state : "",
-				   login_uri ? login_uri : "", op_iframe_id, poll_interval, redirect_uri, redirect_uri);
+	const char *java_script =
+	    apr_psprintf(r->pool, java_script_tmpl, oidc_util_html_javascript_escape(r->pool, origin),
+			 oidc_util_html_javascript_escape(r->pool, client_id),
+			 session_state ? oidc_util_html_javascript_escape(r->pool, session_state) : "",
+			 login_uri ? oidc_util_html_javascript_escape(r->pool, login_uri) : "", op_iframe_id,
+			 poll_interval, oidc_util_html_javascript_escape(r->pool, redirect_uri));
 
 	return oidc_util_html_content_prep(r, OIDC_REQUEST_STATE_KEY_HTML, NULL, java_script, "setTimer()", NULL);
 }
@@ -165,15 +174,14 @@ int oidc_session_management(request_rec *r, oidc_cfg_t *c, oidc_session_t *sessi
 					   TRUE);
 	}
 
-	if (oidc_get_provider_from_session(r, c, session, &provider) == FALSE) {
-		if ((oidc_provider_static_config(r, c, &provider) == FALSE) || (provider == NULL))
-			return HTTP_NOT_FOUND;
-	}
+	if ((oidc_get_provider_from_session(r, c, session, &provider) == FALSE) &&
+	    ((oidc_provider_static_config(r, c, &provider) == FALSE) || (provider == NULL)))
+		return HTTP_NOT_FOUND;
 
 	/* see if this is a request for the OP iframe */
 	if (_oidc_strcmp("iframe_op", cmd) == 0) {
 		if (oidc_cfg_provider_check_session_iframe_get(provider) != NULL) {
-			return oidc_session_management_iframe_op(r, c, session,
+			return oidc_session_management_iframe_op(r,
 								 oidc_cfg_provider_check_session_iframe_get(provider));
 		}
 		return HTTP_NOT_FOUND;
@@ -197,15 +205,18 @@ int oidc_session_management(request_rec *r, oidc_cfg_t *c, oidc_session_t *sessi
 	if (_oidc_strcmp("check", cmd) == 0) {
 		id_token_hint = oidc_session_get_idtoken(r, session);
 		/*
-		 * TODO: this doesn't work with per-path provided auth_request_params and scopes
-		 *       as oidc_dir_cfg_path_auth_request_params and oidc_dir_cfg_path_scope will pick
-		 *       those for the redirect_uri itself; do we need to store those as part of the
-		 *       session now?
+		 * Reuse settings persisted for the original protected path. Older sessions lack them, so fall
+		 * back to the current redirect URI's per-path settings.
 		 */
+		const char *auth_request_params = oidc_session_get_path_auth_request_params(r, session);
+		if (auth_request_params == NULL)
+			auth_request_params = oidc_cfg_dir_path_auth_request_params_get(r);
+		const char *path_scope = oidc_session_get_path_scope(r, session);
+		if (path_scope == NULL)
+			path_scope = oidc_cfg_dir_path_scope_get(r);
 		return oidc_request_authenticate_user(
 		    r, c, provider, apr_psprintf(r->pool, "%s?session=iframe_rp", oidc_util_url_redirect_uri(r, c)),
-		    NULL, id_token_hint, "none", oidc_cfg_dir_path_auth_request_params_get(r),
-		    oidc_cfg_dir_path_scope_get(r));
+		    NULL, id_token_hint, "none", auth_request_params, path_scope);
 	}
 
 	/* handle failure in fallthrough */

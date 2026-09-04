@@ -1,6 +1,9 @@
 AM_CFLAGS = $(CODE_COVERAGE_CFLAGS) -DNAMEVER="@NAMEVER@" @APACHE_CFLAGS@ @OPENSSL_CFLAGS@ @CURL_CFLAGS@ @JANSSON_CFLAGS@ @CJOSE_CFLAGS@ @PCRE_CFLAGS@
 AM_CPPFLAGS = $(CODE_COVERAGE_CPPFLAGS)  @APACHE_CPPFLAGS@
-AM_LDFLAGS = --coverage @APACHE_LDFLAGS@
+AM_LDFLAGS = @APACHE_LDFLAGS@
+if CODE_COVERAGE_ENABLED
+AM_LDFLAGS += --coverage
+endif
 LIBADD = $(CODE_COVERAGE_LIBS) @APACHE_LIBS@ @OPENSSL_LIBS@ @CURL_LIBS@ @JANSSON_LIBS@ @CJOSE_LIBS@ @PCRE_LIBS@
 
 if HAVE_LIBHIREDIS
@@ -33,6 +36,7 @@ libauth_openidc_la_SOURCES = \
 	mod_auth_openidc.c \
 	state.c \
 	cfg/cfg.c \
+	cfg/check.c \
 	cfg/cache.c \
 	cfg/provider.c \
 	cfg/oauth.c \
@@ -66,6 +70,7 @@ libauth_openidc_la_SOURCES = \
 	proto/profile.c \
 	proto/proto.c \
 	proto/request.c \
+	proto/request_object.c \
 	proto/response.c \
 	proto/state.c \
 	proto/token.c \
@@ -76,10 +81,10 @@ libauth_openidc_la_SOURCES = \
 	util/file.c \
 	util/html.c \
 	util/jq.c \
-	util/json.c \
 	util/jwt.c \
 	util/key.c \
 	util/pcre_subst.c \
+	util/request_state.c \
 	util/random.c \
 	util/url.c \
 	util/util.c \
@@ -88,7 +93,17 @@ libauth_openidc_la_SOURCES = \
 	http.c \
 	session.c \
 	metadata.c \
-	jose.c
+	metadata/util.c \
+	metadata/jwks.c \
+	metadata/provider.c \
+	metadata/oauth.c \
+	metadata/conf.c \
+	metadata/client.c \
+	json.c \
+	jose.c \
+	jose/jwk.c \
+	jose/jws.c \
+	jose/jwe.c
 
 if HAVE_LIBHIREDIS
 libauth_openidc_la_SOURCES += \
@@ -103,29 +118,43 @@ endif
 noinst_HEADERS = \
 	cfg/cfg.h \
 	cfg/cfg_int.h \
+	cfg/directives.h \
 	cfg/cache.h \
 	cfg/provider.h \
 	cfg/oauth.h \
 	cfg/dir.h \
 	cfg/parse.h \
+	cfg/check.h \
 	mod_auth_openidc.h \
 	state.h \
 	handle/handle.h \
 	proto/proto.h \
 	cache/cache.h \
+	cache/shm.h \
 	util/util.h \
+	util/util_cfg.h \
+	util/request_state.h \
 	util/pcre_subst.h \
 	oauth.h \
 	metadata.h \
+	metadata/internal.h \
 	session.h \
+	json.h \
 	jose.h \
+	jose/internal.h \
 	http.h \
+	http_int.h \
 	metrics.h \
 	const.h
 
 if HAVE_LIBHIREDIS
 noinst_HEADERS += \
 	cache/redis.h
+endif
+
+if HAVE_MEMCACHE
+noinst_HEADERS += \
+	cache/memcache.h
 endif
 
 noinst_DATA = mod_auth_openidc.la

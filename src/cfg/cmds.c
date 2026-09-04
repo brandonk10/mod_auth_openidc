@@ -76,12 +76,12 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_ITERATE,
 		OIDCPrivateKeyFiles,
 		private_keys,
-		"The	AP_INIT_TAKE1,qualified names of the files that contain the RSA/EC private keys that can be used to decrypt content sent to us by the OP."),
+		"The fully qualified names of the files that contain the RSA/EC private keys that can be used to decrypt content sent to us by the OP."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE1,
 		OIDCCookieDomain,
 		cookie_domain,
-		"Specify domain element for OIDC session cookie."),
+		"Specify the domain element for the OIDC session and state cookies."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE1,
 		OIDCCookieHTTPOnly,
@@ -96,7 +96,7 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE123,
 		OIDCOutgoingProxy,
 		outgoing_proxy,
-		"Specify an outgoing proxy for your network (<host>[:<port>]."),
+		"Specify an outgoing proxy for your network (<host>[:<port>])."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE12,
 		OIDCCryptoPassphrase,
@@ -151,7 +151,12 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCSessionType,
 		session_type,
-		"OpenID Connect session storage type (Apache 2.0/2.2 only). Must be one of \"server-cache\" or \"client-cookie\" with an optional suffix \":persistent\"."),
+		"OpenID Connect session storage type."),
+	OIDC_CFG_CMD(
+		AP_INIT_TAKE1,
+		OIDCDebugMaskSecrets,
+		debug_mask_secrets,
+		"Mask secrets and tokens written to the debug log. Defaults to On; turning it Off writes credentials to the log in the clear and is intended for short-lived troubleshooting only."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE1,
 		OIDCSessionCacheFallbackToCookie,
@@ -161,13 +166,13 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCSessionCookieChunkSize,
 		session_cookie_chunk_size,
-		"Chunk size for client-cookie session storage type in bytes. Defaults to 4k. Set 0 to suppress chunking."),
+		"Chunk size for client-cookie session storage type in bytes. Defaults to 4000. Set 0 to suppress chunking."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE2,
 		OIDCPreservePostTemplates,
 		post_preserve_templates,
-		"Name of POST preserve and restore templates:"
-		"1) preserve: needs to contain two \"%s\" characters, the first for the JSON POST data, the second for the URL to redirect to."
+		"Name of POST preserve and restore templates: "
+		"1) preserve: needs to contain two \"%s\" characters, the first for the JSON POST data, the second for the URL to redirect to. "
 		"2) restore: needs to contain one \"%s\", which contains the (original) URL to POST the restored data to"
 		),
 	OIDC_CFG_CMD(
@@ -184,7 +189,7 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_ITERATE,
 		OIDCMetricsData,
 		metrics_hook_data,
-		"The data that will be returned from the metrics hook."),
+		"The classes of metrics that will be collected; publish them with " OIDCMetricsPublish "."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE1,
 		OIDCMetricsPublish,
@@ -209,12 +214,17 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCStateInputHeaders,
 		state_input_headers,
-		"Specify header name which is used as the input for calculating the fingerprint of the state during authentication; must be one of \"none\", \"user-agent\", \"x-forwarded-for\" or \"both\" (default)."),
+		"Which request headers are used as input for calculating the fingerprint of the state during authentication."),
 	OIDC_CFG_CMD(
 		AP_INIT_ITERATE,
 		OIDCRedirectURLsAllowed,
 		redirect_urls_allowed,
 		"Specify one or more regular expressions that define URLs allowed for post logout and other redirects."),
+	OIDC_CFG_CMD(
+		AP_INIT_ITERATE,
+		OIDCDiscoverIssuersAllowed,
+		discover_issuers_allowed,
+		"Specify one or more regular expressions that define issuers allowed to be used for dynamic OpenID Connect Discovery/registration; when unset, any issuer is allowed."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE1,
 		OIDCCABundlePath,
@@ -229,7 +239,7 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_ITERATE,
 		OIDCXForwardedHeaders,
 		x_forwarded_headers,
-		"Sets the value of the interpreted X-Forwarded-* headers."),
+		"Selects which X-Forwarded-* headers sent by a proxy are honoured."),
 #ifdef USE_LIBJQ
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE1,
@@ -256,7 +266,7 @@ const command_rec oidc_cfg_cmds[] = {
 		oidc_cmd_cache_type_set,
 		NULL,
 		RSRC_CONF,
-		"cache backend must be one of ['shm'|" _OIDC_CMDS_CACHE_TYPE_MEMCACHE _OIDC_CMDS_CACHE_TYPE_REDIS "'file']."),
+		"The cache backend."),
 	OIDC_CFG_CMD(
 		AP_INIT_TAKE1,
 		OIDCCacheEncrypt,
@@ -283,63 +293,10 @@ const command_rec oidc_cfg_cmds[] = {
 		cache_file_clean_interval,
 		"Cache file clean interval in seconds."),
 #ifdef USE_MEMCACHE
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCMemCacheServers,
-		cache_memcache_servers,
-		"Memcache servers used for caching (space separated list of <hostname>[:<port>] tuples)"),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCMemCacheConnectionsMin,
-		cache_memcache_min,
-		"Minimum number of connections to each Memcache server per process"),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCMemCacheConnectionsSMax,
-		cache_memcache_smax,
-		"Soft maximum number of connections to each Memcache server per process"),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCMemCacheConnectionsHMax,
-		cache_memcache_hmax,
-		"Hard maximum number of connections to each Memcache server per process"),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCMemCacheConnectionsTTL,
-		cache_memcache_ttl,
-		"Maximum time in seconds a connection to a Memcache server can be idle before being closed"),
+	OIDC_CACHE_CMDS_MEMCACHE(OIDC_CFG_CMD)
 #endif
 #ifdef USE_LIBHIREDIS
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCRedisCacheServer,
-		cache_redis_server,
-		"Redis server used for caching (<hostname>[:<port>])"),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCRedisCacheUsername,
-		cache_redis_username,
-		"Username for authentication to the Redis server."),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCRedisCachePassword,
-		cache_redis_password,
-		"Password for authentication to the Redis server."),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCRedisCacheDatabase,
-		cache_redis_database,
-		"Database to select on the Redis server."),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE12,
-		OIDCRedisCacheConnectTimeout,
-		cache_redis_connect_timeout,
-		"Timeout for connecting to the Redis server."),
-	OIDC_CFG_CMD(
-		AP_INIT_TAKE1,
-		OIDCRedisCacheTimeout,
-		cache_redis_timeout,
-		"Timeout waiting for a response of the Redis server."),
+	OIDC_CACHE_CMDS_REDIS(OIDC_CFG_CMD)
 #endif
 
 	// provider
@@ -380,10 +337,10 @@ const command_rec oidc_cfg_cmds[] = {
 		registration_endpoint_json,
 		"Define a JSON object with parameters that will be merged into the client registration request to the OpenID OP Registration Endpoint (e.g.: { \"request_uris\" : [ \"https://example.com/uri\"] })."),
 	OIDC_CFG_CMD_PROVIDER(
-		AP_INIT_TAKE1,
+		AP_INIT_RAW_ARGS,
 		OIDCProviderUserInfoEndpoint,
 		userinfo_endpoint_url,
-		"Define the OpenID OP UserInfo Endpoint URL (e.g.: https://localhost:9031/idp/userinfo.openid)"),
+		"Define the OpenID OP UserInfo Endpoint URL (e.g.: https://localhost:9031/idp/userinfo.openid); leave empty to explicitly disable calling the UserInfo Endpoint, even when one is advertised in the discovered provider metadata."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_RAW_ARGS,
 		OIDCProviderRevocationEndpoint,
@@ -428,17 +385,17 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCResponseType,
 		response_type,
-		"The response type (or OpenID Connect Flow) used; must be one of \"code\", \"id_token\", \"id_token token\", \"code id_token\", \"code token\" or \"code id_token token\" (serves as default value for discovered OPs too)"),
+		"The response type (or OpenID Connect Flow) used (serves as default value for discovered OPs too)."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCResponseMode,
 		response_mode,
-		"The response mode used; must be one of \"fragment\", \"query\" or \"form_post\" (serves as default value for discovered OPs too)"),
+		"The response mode used (serves as default value for discovered OPs too)."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCClientJwksUri,
 		client_jwks_uri,
-		"Define the Client JWKS URL (e.g.: https://localhost/protected/?jwks=rsa)"),
+		"Define the Client JWKS URL (e.g.: https://localhost/protected/?jwks=rsa)."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCIDTokenSignedResponseAlg,
@@ -448,12 +405,12 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCIDTokenEncryptedResponseAlg,
 		id_token_encrypted_response_alg,
-		"The algorithm that the OP should use to encrypt the Content Encryption Key that is used to encrypt the id_token (used only in dynamic client registration); must be one of [RSA1_5|A128KW|A256KW|RSA-OAEP]"),
+		"The algorithm that the OP should use to encrypt the Content Encryption Key that is used to encrypt the id_token (used only in dynamic client registration)."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCIDTokenEncryptedResponseEnc,
 		id_token_encrypted_response_enc,
-		"The algorithm that the OP should use to encrypt to the id_token with the Content Encryption Key (used only in dynamic client registration); must be one of [A128CBC-HS256|A256CBC-HS512|A256GCM]"),
+		"The algorithm that the OP should use to encrypt the id_token with the Content Encryption Key (used only in dynamic client registration)."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_ITERATE,
 		OIDCIDTokenAudValues,
@@ -463,22 +420,22 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCUserInfoSignedResponseAlg,
 		userinfo_signed_response_alg,
-		"The algorithm that the OP should use to sign the UserInfo response (used only in dynamic client registration); must be one of [RS256|RS384|RS512|PS256|PS384|PS512|HS256|HS384|HS512]"),
+		"The algorithm that the OP must use to sign the UserInfo response; required to verify a signed UserInfo JWT."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCUserInfoEncryptedResponseAlg,
 		userinfo_encrypted_response_alg,
-		"The algorithm that the OP should use to encrypt the Content Encryption Key that is used to encrypt the UserInfo response (used only in dynamic client registration); must be one of [RSA1_5|A128KW|A256KW|RSA-OAEP]"),
+		"The algorithm that the OP must use to encrypt the Content Encryption Key that encrypts the UserInfo response; setting it enables decryption of that response."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCUserInfoEncryptedResponseEnc,
 		userinfo_encrypted_response_enc,
-		"The algorithm that the OP should use to encrypt to encrypt the UserInfo response with the Content Encryption Key (used only in dynamic client registration); must be one of [A128CBC-HS256|A256CBC-HS512|A256GCM]"),
+		"The algorithm that the OP must use to encrypt the UserInfo response with the Content Encryption Key."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCUserInfoTokenMethod,
 		userinfo_token_method,
-		"The method that is used to present the access token to the userinfo endpoint; must be one of [authz_header|post_param]"),
+		"The method that is used to present the access token to the userinfo endpoint."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCSSLValidateServer,
@@ -523,22 +480,27 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCAuthRequestParams,
 		auth_request_params,
-		"Extra parameters that need to be sent in the Authorization Request (must be query-encoded like \"display=popup&prompt=consent\"."),
+		"Extra parameters that need to be sent in the Authorization Request (must be query-encoded like \"display=popup&prompt=consent\")."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCLogoutRequestParams,
 		logout_request_params,
-		"Extra parameters that need to be sent in the Logout Request (must be query-encoded like \"client_id=myclient&prompt=none\"."),
+		"Extra parameters that need to be sent in the Logout Request (must be query-encoded like \"client_id=myclient&prompt=none\")."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCPKCEMethod,
 		pkce,
-		"The RFC 7636 PCKE mode used; must be one of \"plain\" or \"S256\""),
+		"The RFC 7636 PKCE mode used."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE12,
 		OIDCDPoPMode,
 		dpop_mode,
-		"The RFC 9449 DPoP mode used; must be one of \"off\", \"optional\" or \"required\""),
+		"The RFC 9449 DPoP mode used."),
+	OIDC_CFG_CMD_PROVIDER(
+		AP_INIT_TAKE1,
+		OIDCCertBoundAccessTokens,
+		cert_bound_tokens,
+		"Whether to obtain RFC 8705 certificate-bound access tokens with the configured TLS client certificate when it is not used for client authentication (\"off\", \"auto\" or \"on\")."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCClientID,
@@ -578,7 +540,7 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCProviderAuthRequestMethod,
 		auth_request_method,
-		"HTTP method used to send the authentication request to the provider (GET or POST)."),
+		"HTTP method used to send the authentication request to the provider (GET, POST or PAR)."),
 	OIDC_CFG_CMD_PROVIDER(
 		AP_INIT_TAKE1,
 		OIDCProfile,
@@ -616,7 +578,7 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCOAuthIntrospectionEndpointParams,
 		introspection_endpoint_params,
-		"Extra parameters that need to be sent in the token introspection request (must be query-encoded like \"grant_type=urn%3Apingidentity.com%3Aoauth2%3Agrant_type%3Avalidate_bearer\"."),
+		"Extra parameters that need to be sent in the token introspection request (must be query-encoded like \"grant_type=urn%3Apingidentity.com%3Aoauth2%3Agrant_type%3Avalidate_bearer\")."),
 	OIDC_CFG_CMD_OAUTH(
 		AP_INIT_TAKE1,
 		OIDCOAuthIntrospectionEndpointAuth,
@@ -646,7 +608,7 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCOAuthIntrospectionTokenParamName,
 		introspection_token_param_name,
-		"Name of the parameter whose value carries the access token value in an validation request to the token introspection endpoint."),
+		"Name of the parameter whose value carries the access token value in a validation request to the token introspection endpoint."),
 	OIDC_CFG_CMD_OAUTH(
 		AP_INIT_TAKE123,
 		OIDCOAuthTokenExpiryClaim,
@@ -673,10 +635,25 @@ const command_rec oidc_cfg_cmds[] = {
 		verify_shared_keys,
 		"Shared secret(s) that is/are used to verify signed JWT access tokens locally."),
 	OIDC_CFG_CMD_OAUTH(
+		AP_INIT_ITERATE,
+		OIDCOAuthDecryptSharedKeys,
+		decrypt_shared_keys,
+		"Shared secret(s) that is/are used to decrypt encrypted JWT access tokens locally; when not defined the client secret configured for the OpenID Connect provider is used."),
+	OIDC_CFG_CMD_OAUTH(
 		AP_INIT_TAKE1,
 		OIDCOAuthVerifyJwksUri,
 		verify_jwks_uri,
-		"The JWKs URL on which the Authorization publishes the keys used to sign its JWT access tokens."),
+		"The JWKs URL on which the Authorization Server publishes the keys used to sign its JWT access tokens."),
+	OIDC_CFG_CMD_OAUTH(
+		AP_INIT_ITERATE,
+		OIDCOAuthVerifyAudience,
+		verify_aud_values,
+		"Accepted \"aud\" claim value(s) in locally validated JWT access tokens; when not set the \"aud\" claim is not verified."),
+	OIDC_CFG_CMD_OAUTH(
+		AP_INIT_TAKE1,
+		OIDCOAuthVerifyIssuer,
+		verify_issuer,
+		"The issuer that locally validated JWT access tokens must have been issued by; when not set the \"iss\" claim is not verified."),
 
 	// dir
 
@@ -730,7 +707,7 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCCookiePath,
 		cookie_path,
-		"Define the cookie path for the session cookie."),
+		"Define the cookie path for the session and state cookies."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_TAKE1,
 		OIDCStateCookiePrefix,
@@ -745,22 +722,22 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE12,
 		OIDCUnAuthAction,
 		unauth_action,
-		"Set the action taken when an unauthenticated request occurs: must be one of auth | pass | 401 | 407 |410."),
+		"Set the action taken when an unauthenticated request occurs."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_TAKE12,
 		OIDCUnAutzAction,
 		unautz_action,
-		"Set the action taken when an unauthorized request occurs: must be one of: 401 [<text>] | 403 [<text>] | 302 [<url>] | auth."),
+		"Set the action taken when an unauthorized request occurs."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_TAKE12,
 		OIDCPassClaimsAs,
 		pass_claims_as,
-		"Specify how claims are passed to the application(s); must be one of: none | headers | environment | both."),
+		"Specify how claims are passed to the application(s)."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_ITERATE,
 		OIDCOAuthAcceptTokenAs,
 		accept_oauth_token_in,
-		"The method in which an OAuth token can be presented; must be one or more of: header | post | query | cookie."),
+		"The method in which an OAuth token can be presented."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_TAKE1,
 		OIDCOAuthTokenIntrospectionInterval,
@@ -775,27 +752,27 @@ const command_rec oidc_cfg_cmds[] = {
 		AP_INIT_TAKE1,
 		OIDCPassAccessToken,
 		pass_access_token,
-		"Pass the access token in a header and/or environment variable (On or Off)"),
+		"Pass the access token in a header and/or environment variable."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_TAKE1,
 		OIDCPassRefreshToken,
 		pass_refresh_token,
-		"Pass the refresh token in a header and/or environment variable (On or Off)"),
+		"Pass the refresh token in a header and/or environment variable."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_ITERATE,
 		OIDCPassIDTokenAs,
 		pass_idtoken_as,
-		"Set the format in which the id_token is passed in (a) header(s); must be one or more of: claims | payload | serialized"),
+		"Set the format in which the id_token is passed in (a) header(s)."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_TAKE12,
 		OIDCRefreshAccessTokenBeforeExpiry,
 		refresh_access_token_before_expiry,
-		"Ensure the access token is valid for at least <secs> seconds by refreshing it if required; must be: <secs> [logout_on_error | authenticate_on_error]."),
+		"Ensure the access token is valid for at least <secs> seconds by refreshing it if required."),
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_ITERATE,
 		OIDCPassUserInfoAs,
 		pass_userinfo_as,
-		"The format in which the userinfo is passed in (a) header(s); must be one or more of: claims | json | jwt | signed_jwt"),
+		"The format in which the userinfo is passed in (a) header(s)."),
 #ifdef USE_LIBJQ
 	OIDC_CFG_CMD_DIR(
 		AP_INIT_TAKE1,

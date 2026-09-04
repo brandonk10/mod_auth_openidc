@@ -40,134 +40,106 @@
  * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
-#include "mod_auth_openidc.h"
+#include "cfg/cfg.h"
+#include "util/request_state.h"
 #include "util/util.h"
 
 #include "http.h"
 
 /*
+ * return the HTML escape sequence for a character, or NULL if the character passes through unchanged
+ */
+static const char *oidc_util_html_escape_char(char c) {
+	switch (c) {
+	case '&':
+		return "&amp;";
+	case '\'':
+		return "&apos;";
+	case '"':
+		return "&quot;";
+	case '>':
+		return "&gt;";
+	case '<':
+		return "&lt;";
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * two-pass escape of a string with the provided per-character escape function: measure first,
+ * then write with the bounds-checked idiom; shared by the HTML and JavaScript escapers below
+ */
+static char *oidc_util_html_escape_with(apr_pool_t *pool, const char *s, const char *(*escape_char)(char)) {
+	const char *cp = NULL;
+	size_t outputlen = 0;
+	size_t i = 0;
+
+	/* first pass: compute the length of the escaped output */
+	for (cp = s; *cp; cp++) {
+		const char *esc = escape_char(*cp);
+		outputlen += esc ? _oidc_strlen(esc) : 1;
+	}
+
+	/* second pass: write the escaped output, preserving the bounds-checked write idiom */
+	char *output = apr_pcalloc(pool, outputlen + 1);
+	for (cp = s; *cp; cp++) {
+		const char *esc = escape_char(*cp);
+		if (esc == NULL) {
+			if (i + 1 <= outputlen)
+				output[i] = *cp;
+			i += 1;
+			continue;
+		}
+		size_t n = _oidc_strlen(esc);
+		if (i + n <= outputlen)
+			(void)_oidc_strcpy(&output[i], esc);
+		i += n;
+	}
+	output[i] = '\0';
+	return output;
+}
+
+/*
  * HTML escape a string
  */
 char *oidc_util_html_escape(apr_pool_t *pool, const char *s) {
-	// TODO: this has performance/memory issues for large chunks of HTML
-	const char chars[6] = {'&', '\'', '\"', '>', '<', '\0'};
-	const char *const replace[] = {
-	    "&amp;", "&apos;", "&quot;", "&gt;", "&lt;",
-	};
-	unsigned int i = 0;
-	unsigned int j = 0;
-	unsigned int k = 0;
-	unsigned int n = 0;
-	unsigned int m = 0;
-	const char *ptr = chars;
-	unsigned int len = _oidc_strlen(ptr);
-	char *r = apr_pcalloc(pool, _oidc_strlen(s) * 6 + 1);
-	for (i = 0; i < _oidc_strlen(s); i++) {
-		for (n = 0; n < len; n++) {
-			if (s[i] == chars[n]) {
-				m = (unsigned int)_oidc_strlen(replace[n]);
-				for (k = 0; k < m; k++)
-					r[j + k] = replace[n][k];
-				j += m;
-				break;
-			}
-		}
-		if (n == len) {
-			r[j] = s[i];
-			j++;
-		}
+	return oidc_util_html_escape_with(pool, s != NULL ? s : "", oidc_util_html_escape_char);
+}
+
+/*
+ * return the JavaScript escape sequence for a character, or NULL if the character passes through unchanged
+ */
+static const char *oidc_util_html_javascript_escape_char(char c) {
+	switch (c) {
+	case '\'':
+		return "\\'";
+	case '"':
+		return "\\\"";
+	case '\\':
+		return "\\\\";
+	case '/':
+		return "\\/";
+	case 0x0D:
+		return "\\r";
+	case 0x0A:
+		return "\\n";
+	case '<':
+		return "\\x3c";
+	case '>':
+		return "\\x3e";
+	default:
+		return NULL;
 	}
-	r[j] = '\0';
-	return apr_pstrdup(pool, r);
 }
 
 /*
  * JavaScript escape a string
  */
 char *oidc_util_html_javascript_escape(apr_pool_t *pool, const char *s) {
-	const char *cp = NULL;
-	char *output = NULL;
-	int outputlen = 0;
-	int i = 0;
-
-	if (s == NULL) {
+	if (s == NULL)
 		return NULL;
-	}
-
-	outputlen = 0;
-	for (cp = s; *cp; cp++) {
-		switch (*cp) {
-		case '\'':
-		case '"':
-		case '\\':
-		case '/':
-		case 0x0D:
-		case 0x0A:
-			outputlen += 2;
-			break;
-		case '<':
-		case '>':
-			outputlen += 4;
-			break;
-		default:
-			outputlen += 1;
-			break;
-		}
-	}
-
-	i = 0;
-	output = apr_pcalloc(pool, outputlen + 1);
-	for (cp = s; *cp; cp++) {
-		switch (*cp) {
-		case '\'':
-			if (i <= outputlen - 2)
-				(void)_oidc_strcpy(&output[i], "\\'");
-			i += 2;
-			break;
-		case '"':
-			if (i <= outputlen - 2)
-				(void)_oidc_strcpy(&output[i], "\\\"");
-			i += 2;
-			break;
-		case '\\':
-			if (i <= outputlen - 2)
-				(void)_oidc_strcpy(&output[i], "\\\\");
-			i += 2;
-			break;
-		case '/':
-			if (i <= outputlen - 2)
-				(void)_oidc_strcpy(&output[i], "\\/");
-			i += 2;
-			break;
-		case 0x0D:
-			if (i <= outputlen - 2)
-				(void)_oidc_strcpy(&output[i], "\\r");
-			i += 2;
-			break;
-		case 0x0A:
-			if (i <= outputlen - 2)
-				(void)_oidc_strcpy(&output[i], "\\n");
-			i += 2;
-			break;
-		case '<':
-			if (i <= outputlen - 4)
-				(void)_oidc_strcpy(&output[i], "\\x3c");
-			i += 4;
-			break;
-		case '>':
-			if (i <= outputlen - 4)
-				(void)_oidc_strcpy(&output[i], "\\x3e");
-			i += 4;
-			break;
-		default:
-			if (i <= outputlen - 1)
-				output[i] = *cp;
-			i += 1;
-			break;
-		}
-	}
-	output[i] = '\0';
-	return output;
+	return oidc_util_html_escape_with(pool, s, oidc_util_html_javascript_escape_char);
 }
 
 /*
@@ -176,21 +148,24 @@ char *oidc_util_html_javascript_escape(apr_pool_t *pool, const char *s) {
 int oidc_util_html_send(request_rec *r, const char *title, const char *html_head, const char *on_load,
 			const char *html_body, int status_code) {
 
-	char *html = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">\n"
-		     "<html>\n"
-		     "  <head>\n"
-		     "    <meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">\n"
-		     "    <title>%s</title>\n"
-		     "    %s\n"
-		     "  </head>\n"
-		     "  <body%s>\n"
-		     "%s\n"
-		     "  </body>\n"
-		     "</html>\n";
+	static const char html_tmpl[] =
+	    "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">\n"
+	    "<html>\n"
+	    "  <head>\n"
+	    "    <meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">\n"
+	    "    <title>%s</title>\n"
+	    "    %s\n"
+	    "  </head>\n"
+	    "  <body%s>\n"
+	    "%s\n"
+	    "  </body>\n"
+	    "</html>\n";
 
-	html = apr_psprintf(r->pool, html, title ? oidc_util_html_escape(r->pool, title) : "",
-			    html_head ? html_head : "", on_load ? apr_psprintf(r->pool, " onload=\"%s\"", on_load) : "",
-			    html_body ? html_body : "<p></p>");
+	/* Escape trusted onload JavaScript so a stray quote cannot break out of the attribute. */
+	const char *html = apr_psprintf(
+	    r->pool, html_tmpl, title ? oidc_util_html_escape(r->pool, title) : "", html_head ? html_head : "",
+	    on_load ? apr_psprintf(r->pool, " onload=\"%s\"", oidc_util_html_escape(r->pool, on_load)) : "",
+	    html_body ? html_body : "<p></p>");
 
 	return oidc_util_http_send(r, html, _oidc_strlen(html), OIDC_HTTP_CONTENT_TYPE_TEXT_HTML, status_code);
 }
@@ -251,29 +226,65 @@ static char *oidc_util_template_escape(request_rec *r, const char *arg, int esca
 }
 
 /*
+ * verify that a template contains only safe printf-style specifiers (%s and
+ * %%) and exactly the expected number of %s placeholders; reject anything
+ * else to avoid passing surprising specifiers (%n, %x, ...) to apr_psprintf
+ */
+static apr_byte_t oidc_util_template_format_valid(const char *tpl, int expected_s_count) {
+	int s_count = 0;
+	const char *p = tpl;
+	while (*p) {
+		if (*p != '%') {
+			p++;
+			continue;
+		}
+		p++;
+		if (*p == '%') {
+			p++;
+			continue;
+		}
+		if (*p == 's') {
+			s_count++;
+			p++;
+			continue;
+		}
+		return FALSE;
+	}
+	return (s_count == expected_s_count) ? TRUE : FALSE;
+}
+
+/*
  * fill and send a HTML template
  */
 int oidc_util_html_send_in_template(request_rec *r, const char *filename, char **static_template_content,
-				    const char *arg1, int arg1_esc, const char *arg2, int arg2_esc) {
-	char *html = NULL;
+				    const char *arg1, oidc_post_preserve_escape_t arg1_esc, const char *arg2,
+				    oidc_post_preserve_escape_t arg2_esc) {
+	const char *html = NULL;
 	int rc = OK;
-	if (*static_template_content == NULL) {
-		// NB: templates go into the server process pool
-		if (oidc_util_file_read(r, filename, r->server->process->pool, static_template_content) == FALSE) {
-			oidc_error(r, "could not read template: %s", filename);
-			*static_template_content = NULL;
-		}
+	// NB: templates go into the server process pool
+	if ((*static_template_content == NULL) &&
+	    (oidc_util_file_read(r, filename, r->server->process->pool, static_template_content) == FALSE)) {
+		oidc_error(r, "could not read template: %s", filename);
+		*static_template_content = NULL;
 	}
 	if (*static_template_content) {
+		if (oidc_util_template_format_valid(*static_template_content, (arg2 == NULL) ? 1 : 2) == FALSE) {
+			oidc_error(r,
+				   "template %s contains format specifiers other than two \"%%s\" placeholders; "
+				   "refusing to render",
+				   filename);
+			return HTTP_INTERNAL_SERVER_ERROR;
+		}
 		html = apr_psprintf(r->pool, *static_template_content, oidc_util_template_escape(r, arg1, arg1_esc),
-				    oidc_util_template_escape(r, arg2, arg2_esc));
+				    (arg2 != NULL) ? oidc_util_template_escape(r, arg2, arg2_esc) : "");
 		rc = oidc_util_http_content_prep(r, html, _oidc_strlen(html), OIDC_HTTP_CONTENT_TYPE_TEXT_HTML);
 	}
 	return rc;
 }
 
 /*
- * send a user-facing error to the browser
+ * Expose error details to ErrorDocument through OIDC_ERROR and OIDC_ERROR_DESC. The values may
+ * contain request input and must be HTML-escaped before rendering.
  */
 int oidc_util_html_send_error(request_rec *r, const char *error, const char *description, int status_code) {
 

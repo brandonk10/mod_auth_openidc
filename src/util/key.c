@@ -42,31 +42,59 @@
 
 #include "util/util.h"
 
+#include <openssl/evp.h>
+
+/* iteration count for PBKDF2-HMAC-SHA256, per current OWASP guidance; this only runs once per
+ * (re)start, in the single-threaded post_config phase -- see oidc_cfg_crypto_passphrase_post_config */
+#define OIDC_UTIL_KEY_DERIVE_ITERATIONS 210000
+/* fixed, non-secret, application-specific salt: it exists for domain separation (so a
+ * precomputed table built against some other use of PBKDF2-HMAC-SHA256 does not apply here),
+ * not to protect against an attacker who has the source code */
+#define OIDC_UTIL_KEY_DERIVE_SALT "mod_auth_openidc-crypto-passphrase-v1"
+
+/*
+ * stretch an operator-supplied OIDCCryptoPassphrase value into "out_len" bytes of key material
+ * using PBKDF2-HMAC-SHA256, so that a low-entropy passphrase cannot be brute-forced offline at
+ * the speed of a single SHA-256 evaluation
+ */
+apr_byte_t oidc_util_key_derive_passphrase_key(const char *passphrase, unsigned char *out, apr_size_t out_len) {
+	if ((passphrase == NULL) || (_oidc_strlen(passphrase) == 0))
+		return FALSE;
+	return (PKCS5_PBKDF2_HMAC(passphrase, (int)_oidc_strlen(passphrase),
+				  (const unsigned char *)OIDC_UTIL_KEY_DERIVE_SALT,
+				  (int)(sizeof(OIDC_UTIL_KEY_DERIVE_SALT) - 1), OIDC_UTIL_KEY_DERIVE_ITERATIONS,
+				  EVP_sha256(), (int)out_len, out) == 1)
+		   ? TRUE
+		   : FALSE;
+}
+
 /*
  * create a symmetric key from a client_secret
  */
 apr_byte_t oidc_util_key_symmetric_create(request_rec *r, const char *client_secret, unsigned int r_key_len,
 					  const char *hash_algo, apr_byte_t set_kid, oidc_jwk_t **jwk) {
 	oidc_jose_error_t err = {{'\0'}, 0, {'\0'}, {'\0'}};
-	unsigned char *key = NULL;
+	const unsigned char *key = NULL;
 	unsigned int key_len;
 
 	if ((client_secret != NULL) && (_oidc_strlen(client_secret) > 0)) {
 
 		if (hash_algo == NULL) {
-			key = (unsigned char *)client_secret;
-			key_len = _oidc_strlen(client_secret);
+			key = (const unsigned char *)client_secret;
+			key_len = (unsigned int)_oidc_strlen(client_secret);
 		} else {
 			/* hash the client_secret first, this is OpenID Connect specific */
+			unsigned char *hashed = NULL;
 			if (oidc_jose_hash_bytes(r->pool, hash_algo, (const unsigned char *)client_secret,
-						 _oidc_strlen(client_secret), &key, &key_len, &err) == FALSE)
+						 (unsigned int)_oidc_strlen(client_secret), &hashed, &key_len,
+						 &err) == FALSE)
 				return FALSE;
+			key = hashed;
 		}
 
 		if ((key != NULL) && (key_len > 0)) {
 			if ((r_key_len != 0) && (key_len >= r_key_len))
 				key_len = r_key_len;
-			oidc_debug(r, "key_len=%d", key_len);
 			*jwk = oidc_jwk_create_symmetric_key(r->pool, NULL, key, key_len, set_kid, &err);
 		}
 
@@ -82,12 +110,11 @@ apr_byte_t oidc_util_key_symmetric_create(request_rec *r, const char *client_sec
 /*
  * merge an array of JWKs and a JWK into a single hashtable
  */
-apr_hash_t *oidc_util_key_symmetric_merge(apr_pool_t *pool, const apr_array_header_t *keys, oidc_jwk_t *jwk) {
+apr_hash_t *oidc_util_key_symmetric_merge(apr_pool_t *pool, const apr_array_header_t *keys, const oidc_jwk_t *jwk) {
 	apr_hash_t *result = apr_hash_make(pool);
 	const oidc_jwk_t *elem = NULL;
-	int i = 0;
 	if (keys != NULL) {
-		for (i = 0; i < keys->nelts; i++) {
+		for (int i = 0; i < keys->nelts; i++) {
 			elem = APR_ARRAY_IDX(keys, i, const oidc_jwk_t *);
 			if (elem->kid != NULL)
 				apr_hash_set(result, elem->kid, APR_HASH_KEY_STRING, elem);
@@ -105,9 +132,8 @@ apr_hash_t *oidc_util_key_symmetric_merge(apr_pool_t *pool, const apr_array_head
 apr_hash_t *oidc_util_key_sets_merge(apr_pool_t *pool, apr_hash_t *k1, const apr_array_header_t *k2) {
 	apr_hash_t *rv = k1 ? apr_hash_copy(pool, k1) : apr_hash_make(pool);
 	const oidc_jwk_t *jwk = NULL;
-	int i = 0;
 	if (k2 != NULL) {
-		for (i = 0; i < k2->nelts; i++) {
+		for (int i = 0; i < k2->nelts; i++) {
 			jwk = APR_ARRAY_IDX(k2, i, const oidc_jwk_t *);
 			if (jwk->kid != NULL)
 				apr_hash_set(rv, jwk->kid, APR_HASH_KEY_STRING, jwk);
@@ -135,13 +161,12 @@ apr_hash_t *oidc_util_key_sets_hash_merge(apr_pool_t *pool, apr_hash_t *k1, apr_
  */
 oidc_jwk_t *oidc_util_key_list_first(const apr_array_header_t *key_list, int kty, const char *use) {
 	oidc_jwk_t *rv = NULL;
-	int i = 0;
 	oidc_jwk_t *jwk = NULL;
-	for (i = 0; (key_list) && (i < key_list->nelts); i++) {
+	for (int i = 0; key_list && (i < key_list->nelts); i++) {
 		jwk = APR_ARRAY_IDX(key_list, i, oidc_jwk_t *);
 		if ((kty != -1) && (jwk->kty != kty))
 			continue;
-		if (((use == NULL) || (jwk->use == NULL) || (_oidc_strncmp(jwk->use, use, _oidc_strlen(use)) == 0))) {
+		if ((use == NULL) || (jwk->use == NULL) || (_oidc_strncmp(jwk->use, use, _oidc_strlen(use)) == 0)) {
 			rv = jwk;
 			break;
 		}

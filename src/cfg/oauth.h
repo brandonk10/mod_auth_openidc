@@ -45,24 +45,6 @@
 
 #include "cfg/cfg.h"
 
-#define OIDCOAuthServerMetadataURL "OIDCOAuthServerMetadataURL"
-#define OIDCOAuthClientID "OIDCOAuthClientID"
-#define OIDCOAuthClientSecret "OIDCOAuthClientSecret"
-#define OIDCOAuthIntrospectionClientAuthBearerToken "OIDCOAuthIntrospectionClientAuthBearerToken"
-#define OIDCOAuthIntrospectionEndpoint "OIDCOAuthIntrospectionEndpoint"
-#define OIDCOAuthIntrospectionEndpointMethod "OIDCOAuthIntrospectionEndpointMethod"
-#define OIDCOAuthIntrospectionEndpointParams "OIDCOAuthIntrospectionEndpointParams"
-#define OIDCOAuthIntrospectionEndpointAuth "OIDCOAuthIntrospectionEndpointAuth"
-#define OIDCOAuthIntrospectionEndpointCert "OIDCOAuthIntrospectionEndpointCert"
-#define OIDCOAuthIntrospectionEndpointKey "OIDCOAuthIntrospectionEndpointKey"
-#define OIDCOAuthIntrospectionEndpointKeyPassword "OIDCOAuthIntrospectionEndpointKeyPassword"
-#define OIDCOAuthIntrospectionTokenParamName "OIDCOAuthIntrospectionTokenParamName"
-#define OIDCOAuthTokenExpiryClaim "OIDCOAuthTokenExpiryClaim"
-#define OIDCOAuthSSLValidateServer "OIDCOAuthSSLValidateServer"
-#define OIDCOAuthVerifyCertFiles "OIDCOAuthVerifyCertFiles"
-#define OIDCOAuthVerifySharedKeys "OIDCOAuthVerifySharedKeys"
-#define OIDCOAuthVerifyJwksUri "OIDCOAuthVerifyJwksUri"
-
 typedef enum {
 	OIDC_TOKEN_EXPIRY_CLAIM_FORMAT_RELATIVE = 1,
 	OIDC_TOKEN_EXPIRY_CLAIM_FORMAT_ABSOLUTE = 2
@@ -78,18 +60,23 @@ typedef enum {
 	OIDC_INTROSPECTION_METHOD_POST = 2
 } oidc_oauth_introspection_endpoint_method_t;
 
-#define OIDC_CFG_OAUTH_MEMBER_FUNC_GET_DECL(member, type)                                                              \
-	type OIDC_CFG_MEMBER_FUNC_NAME(member, cfg_oauth, get)(oidc_cfg_t * cfg);
+/* Generate OAuth directive-handler, setter, and getter declarations; bodies live in oauth.c. */
 
+/* <type> oidc_cfg_oauth_<member>_get(const oidc_cfg_t *) */
+#define OIDC_CFG_OAUTH_MEMBER_FUNC_GET_DECL(member, type) type oidc_cfg_oauth_##member##_get(const oidc_cfg_t *cfg);
+
+/* const char *oidc_cmd_oauth_<member>_set(cmd_parms *, void *, ...) */
 #define OIDC_CMD_OAUTH_MEMBER_FUNC_DECL(member, ...)                                                                   \
-	const char *OIDC_CFG_MEMBER_FUNC_NAME(member, cmd_oauth, set)(cmd_parms *, void *, ##__VA_ARGS__);
+	const char *oidc_cmd_oauth_##member##_set(cmd_parms *, void *, ##__VA_ARGS__);
 
+/* directive handler + typed getter */
 #define OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(member, type, ...)                                                            \
 	OIDC_CMD_OAUTH_MEMBER_FUNC_DECL(member, const char *, ##__VA_ARGS__);                                          \
 	OIDC_CFG_OAUTH_MEMBER_FUNC_GET_DECL(member, type)
 
+/* const char *oidc_cfg_oauth_<member>_set(apr_pool_t *, oidc_cfg_t *, const char *) */
 #define OIDC_CFG_OAUTH_MEMBER_FUNC_SET_DECL(member)                                                                    \
-	const char *OIDC_CFG_MEMBER_FUNC_NAME(member, cfg_oauth, set)(apr_pool_t *, oidc_cfg_t *, const char *);
+	const char *oidc_cfg_oauth_##member##_set(apr_pool_t *, oidc_cfg_t *, const char *);
 
 OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(ssl_validate_server, int)
 OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(metadata_url, const char *)
@@ -106,7 +93,10 @@ OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(client_id, const char *)
 OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(client_secret, const char *)
 OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(verify_jwks_uri, const char *)
 OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(verify_shared_keys, apr_hash_t *)
+OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(decrypt_shared_keys, apr_hash_t *)
 OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(verify_public_keys, const apr_array_header_t *)
+OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(verify_aud_values, const apr_array_header_t *)
+OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(verify_issuer, const char *)
 OIDC_CFG_OAUTH_MEMBER_FUNCS_DECL(introspection_client_auth_bearer_token, const char *)
 
 // remote user claim, 3 args, 1 getter
@@ -130,6 +120,7 @@ OIDC_CFG_OAUTH_MEMBER_FUNC_GET_DECL(introspection_endpoint_auth_alg, const char 
 typedef struct oidc_oauth_t oidc_oauth_t;
 
 oidc_oauth_t *oidc_cfg_oauth_create(apr_pool_t *pool);
+oidc_oauth_t *oidc_cfg_oauth_shallow_copy(apr_pool_t *pool, const oidc_oauth_t *src);
 void oidc_cfg_oauth_merge(apr_pool_t *pool, oidc_oauth_t *dst, const oidc_oauth_t *base, const oidc_oauth_t *add);
 void oidc_cfg_oauth_destroy(oidc_oauth_t *o);
 

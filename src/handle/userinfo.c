@@ -40,17 +40,20 @@
  * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
  */
 
+#include "cfg/dir.h"
 #include "cfg/provider.h"
 #include "handle/handle.h"
 #include "mod_auth_openidc.h"
 #include "proto/proto.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
 
 /*
  * store claims resolved from the userinfo endpoint in the session
  */
-void oidc_userinfo_store_claims(request_rec *r, oidc_cfg_t *c, oidc_session_t *session, oidc_provider_t *provider,
-				json_t *userinfo_claims, const char *userinfo_jwt) {
+void oidc_userinfo_store_claims(request_rec *r, const oidc_cfg_t *c, oidc_session_t *session,
+				const oidc_provider_t *provider, oidc_json_t *userinfo_claims,
+				const char *userinfo_jwt) {
 
 	oidc_debug(r, "enter");
 
@@ -85,22 +88,24 @@ void oidc_userinfo_store_claims(request_rec *r, oidc_cfg_t *c, oidc_session_t *s
 /*
  * retrieve claims from the userinfo endpoint and return the stringified response
  */
-const char *oidc_userinfo_retrieve_claims(request_rec *r, oidc_cfg_t *c, oidc_provider_t *provider,
+const char *oidc_userinfo_retrieve_claims(request_rec *r, oidc_cfg_t *c, const oidc_provider_t *provider,
 					  const char *access_token, const char *access_token_type,
-					  oidc_session_t *session, char *id_token_sub, json_t **userinfo_claims,
+					  oidc_session_t *session, char *id_token_sub, oidc_json_t **userinfo_claims,
 					  char **userinfo_jwt) {
 
 	char *result = NULL;
 	char *refreshed_access_token = NULL;
 	char *refreshed_access_token_type = NULL;
-	json_t *id_token_claims = NULL;
+	const oidc_json_t *id_token_claims = NULL;
 	long response_code = 0;
 
 	oidc_debug(r, "enter");
 
-	/* see if a userinfo endpoint is set, otherwise there's nothing to do for us */
-	if (oidc_cfg_provider_userinfo_endpoint_url_get(provider) == NULL) {
-		oidc_debug(r, "not retrieving userinfo claims because userinfo_endpoint is not set");
+	/* see if a userinfo endpoint is set (and not explicitly disabled with an empty value), otherwise there's
+	 * nothing to do for us */
+	if ((oidc_cfg_provider_userinfo_endpoint_url_get(provider) == NULL) ||
+	    (_oidc_strcmp(oidc_cfg_provider_userinfo_endpoint_url_get(provider), "") == 0)) {
+		oidc_debug(r, "not retrieving userinfo claims because userinfo_endpoint is not set or disabled");
 		goto end;
 	}
 
@@ -120,9 +125,10 @@ const char *oidc_userinfo_retrieve_claims(request_rec *r, oidc_cfg_t *c, oidc_pr
 		}
 	}
 
-	// TODO: return code should indicate whether the token expired or some other error occurred
-	// TODO: long-term: session storage should be JSON (with explicit types and less conversion, using standard
-	// routines)
+	/*
+	 * NB: userinfo results are ultimately stored in the session in their stringified form; a future
+	 * improvement would be to keep session storage as typed JSON to avoid the string<->JSON conversions
+	 */
 
 	/* try to get claims from the userinfo endpoint using the provided access token */
 	if (oidc_proto_userinfo_request(r, c, provider, id_token_sub, access_token, access_token_type, &result,
@@ -137,10 +143,21 @@ const char *oidc_userinfo_retrieve_claims(request_rec *r, oidc_cfg_t *c, oidc_pr
 		goto end;
 	}
 
-	// a connectivity error rather than a HTTP error; may want to check for anything != 401
+	// a connectivity error rather than a HTTP error: refreshing the access token won't help
 	if (response_code == 0) {
 		oidc_error(r, "resolving user info claims failed with a connectivity error, no attempt will be made to "
 			      "refresh the access token and try again");
+		result = NULL;
+		goto end;
+	}
+
+	/* only an "invalid_token" response (401) indicates the access token may have expired and is worth
+	 * refreshing; any other HTTP error (e.g. 403, 5xx) will not be resolved by presenting a fresh token */
+	if (response_code != HTTP_UNAUTHORIZED) {
+		oidc_error(r,
+			   "resolving user info claims failed with HTTP status %ld; since this is not a 401 the access "
+			   "token will not be refreshed",
+			   response_code);
 		result = NULL;
 		goto end;
 	}
@@ -182,62 +199,62 @@ apr_byte_t oidc_userinfo_refresh_claims(request_rec *r, oidc_cfg_t *cfg, oidc_se
 	apr_byte_t rc = TRUE;
 	oidc_provider_t *provider = NULL;
 	const char *claims = NULL;
-	const char *access_token = NULL;
-	const char *access_token_type = NULL;
 	char *userinfo_jwt = NULL;
-	json_t *userinfo_claims = NULL;
+	oidc_json_t *userinfo_claims = NULL;
+	apr_time_t last_refresh = 0;
 
-	/* see int we can do anything here, i.e. a refresh interval is configured */
+	/* see if we can do anything here, i.e. a refresh interval is configured */
 	int interval = oidc_session_get_userinfo_refresh_interval(r, session);
 
 	oidc_debug(r, "interval=%d", interval);
 
-	if (interval > -1) {
+	if (interval <= -1)
+		goto end;
 
-		/* get the current provider info */
-		if (oidc_get_provider_from_session(r, cfg, session, &provider) == FALSE) {
-			*needs_save = TRUE;
-			return FALSE;
-		}
-
-		if (oidc_cfg_provider_userinfo_endpoint_url_get(provider) != NULL) {
-
-			/* get the last refresh timestamp from the session info */
-			apr_time_t last_refresh = oidc_session_get_userinfo_last_refresh(r, session);
-
-			oidc_debug(r,
-				   "refresh needed in: %" APR_TIME_T_FMT " seconds (last_refresh=%" APR_TIME_T_FMT
-				   ", interval=%d, now=%" APR_TIME_T_FMT ")",
-				   apr_time_sec(last_refresh + apr_time_from_sec(interval) - apr_time_now()),
-				   apr_time_sec(last_refresh), interval, apr_time_sec(apr_time_now()));
-
-			/* see if we need to refresh again */
-			if (last_refresh + apr_time_from_sec(interval) < apr_time_now()) {
-
-				/* get the current access token */
-				access_token = oidc_session_get_access_token(r, session);
-				access_token_type = oidc_session_get_access_token_type(r, session);
-
-				/* retrieve the current claims */
-				claims =
-				    oidc_userinfo_retrieve_claims(r, cfg, provider, access_token, access_token_type,
-								  session, NULL, &userinfo_claims, &userinfo_jwt);
-
-				/* store claims resolved from userinfo endpoint */
-				oidc_userinfo_store_claims(r, cfg, session, provider, userinfo_claims, userinfo_jwt);
-
-				json_decref(userinfo_claims);
-
-				if (claims == NULL) {
-					*needs_save = FALSE;
-					rc = FALSE;
-				} else {
-					/* indicated something changed */
-					*needs_save = TRUE;
-				}
-			}
-		}
+	/* get the current provider info */
+	if (oidc_get_provider_from_session(r, cfg, session, &provider) == FALSE) {
+		*needs_save = TRUE;
+		rc = FALSE;
+		goto end;
 	}
+
+	/* nothing to do without a userinfo endpoint (or when it is explicitly disabled with an empty value) */
+	if ((oidc_cfg_provider_userinfo_endpoint_url_get(provider) == NULL) ||
+	    (_oidc_strcmp(oidc_cfg_provider_userinfo_endpoint_url_get(provider), "") == 0))
+		goto end;
+
+	/* get the last refresh timestamp from the session info */
+	last_refresh = oidc_session_get_userinfo_last_refresh(r, session);
+
+	oidc_debug(r,
+		   "refresh needed in: %" APR_TIME_T_FMT " seconds (last_refresh=%" APR_TIME_T_FMT
+		   ", interval=%d, now=%" APR_TIME_T_FMT ")",
+		   apr_time_sec(last_refresh + apr_time_from_sec(interval) - apr_time_now()),
+		   apr_time_sec(last_refresh), interval, apr_time_sec(apr_time_now()));
+
+	/* see if we need to refresh again */
+	if (last_refresh + apr_time_from_sec(interval) >= apr_time_now())
+		goto end;
+
+	/* retrieve the current claims using the current access token */
+	claims = oidc_userinfo_retrieve_claims(r, cfg, provider, oidc_session_get_access_token(r, session),
+					       oidc_session_get_access_token_type(r, session), session, NULL,
+					       &userinfo_claims, &userinfo_jwt);
+
+	/* store claims resolved from userinfo endpoint */
+	oidc_userinfo_store_claims(r, cfg, session, provider, userinfo_claims, userinfo_jwt);
+
+	oidc_json_decref(userinfo_claims);
+
+	if (claims == NULL) {
+		*needs_save = FALSE;
+		rc = FALSE;
+	} else {
+		/* indicated something changed */
+		*needs_save = TRUE;
+	}
+
+end:
 
 	oidc_debug(r, "return: %d", rc);
 
@@ -251,7 +268,7 @@ apr_byte_t oidc_userinfo_refresh_claims(request_rec *r, oidc_cfg_t *cfg, oidc_se
 /*
  * obtain the signed JWT cache TTL from the environment variables
  */
-static int oidc_userinfo_signed_jwt_cache_ttl(request_rec *r) {
+static int oidc_userinfo_signed_jwt_cache_ttl(const request_rec *r) {
 	const char *s_ttl = apr_table_get(r->subprocess_env, OIDC_USERINFO_SIGNED_JWT_CACHE_TTL_ENVVAR);
 	return _oidc_str_to_int(s_ttl, OIDC_USERINFO_SIGNED_JWT_CACHE_TTL_DEFAULT);
 }
@@ -259,8 +276,8 @@ static int oidc_userinfo_signed_jwt_cache_ttl(request_rec *r) {
 /*
  * create a signed JWT with s_claims payload and return the serialized form in cser
  */
-static apr_byte_t oidc_userinfo_create_signed_jwt(request_rec *r, oidc_cfg_t *cfg, oidc_session_t *session,
-						  json_t *claims, char **cser) {
+static apr_byte_t oidc_userinfo_create_signed_jwt(request_rec *r, oidc_cfg_t *cfg, const oidc_session_t *session,
+						  oidc_json_t *claims, char **cser) {
 	apr_byte_t rv = FALSE;
 	oidc_jwt_t *jwt = NULL;
 	oidc_jwk_t *jwk = NULL;
@@ -274,16 +291,17 @@ static apr_byte_t oidc_userinfo_create_signed_jwt(request_rec *r, oidc_cfg_t *cf
 	if (oidc_proto_jwt_create_from_first_pkey(r, cfg, &jwk, &jwt, FALSE) == FALSE)
 		goto end;
 
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_AUD,
-			    json_string(oidc_util_url_cur(r, oidc_cfg_x_forwarded_headers_get(cfg))));
-	json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_ISS,
-			    json_string(oidc_cfg_provider_issuer_get(oidc_cfg_provider_get(cfg))));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_AUD,
+				 oidc_json_string(oidc_util_url_cur(r, oidc_cfg_x_forwarded_headers_get(cfg))));
+	oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_ISS,
+				 oidc_json_string(oidc_cfg_provider_issuer_get(oidc_cfg_provider_get(cfg))));
 
-	if (oidc_util_json_merge(r, claims, jwt->payload.value.json) == FALSE)
+	if (oidc_json_merge(r, claims, jwt->payload.value.json) == FALSE)
 		goto end;
-	char *s_claims = oidc_util_json_encode(r->pool, jwt->payload.value.json, JSON_PRESERVE_ORDER | JSON_COMPACT);
-	if (oidc_jose_hash_and_base64url_encode(r->pool, OIDC_JOSE_ALG_SHA256, s_claims, _oidc_strlen(s_claims) + 1,
-						&key, &err) == FALSE) {
+	const char *s_claims =
+	    oidc_json_encode(r->pool, jwt->payload.value.json, OIDC_JSON_PRESERVE_ORDER | OIDC_JSON_COMPACT);
+	if (oidc_jose_hash_and_base64url_encode(r->pool, OIDC_JOSE_ALG_SHA256, s_claims,
+						(int)_oidc_strlen(s_claims) + 1, &key, &err) == FALSE) {
 		oidc_error(r, "oidc_jose_hash_and_base64url_encode failed: %s", oidc_jose_e2s(r->pool, err));
 		goto end;
 	}
@@ -298,19 +316,21 @@ static apr_byte_t oidc_userinfo_create_signed_jwt(request_rec *r, oidc_cfg_t *cf
 		goto end;
 	}
 
-	if (json_object_get(jwt->payload.value.json, OIDC_CLAIM_JTI) == NULL) {
-		json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_JTI, json_string(oidc_proto_jti_gen(r)));
+	if (oidc_json_object_get(jwt->payload.value.json, OIDC_CLAIM_JTI) == NULL) {
+		oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_JTI,
+					 oidc_json_string(oidc_proto_jti_gen(r)));
 	}
-	if (json_object_get(jwt->payload.value.json, OIDC_CLAIM_IAT) == NULL) {
-		json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_IAT,
-				    json_integer(apr_time_sec(apr_time_now())));
+	if (oidc_json_object_get(jwt->payload.value.json, OIDC_CLAIM_IAT) == NULL) {
+		oidc_json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_IAT,
+					 oidc_json_integer(apr_time_sec(apr_time_now())));
 	}
-	if (json_object_get(jwt->payload.value.json, OIDC_CLAIM_EXP) == NULL) {
+	if (oidc_json_object_get(jwt->payload.value.json, OIDC_CLAIM_EXP) == NULL) {
 		access_token_expires = oidc_session_get_access_token_expires(r, session);
-		json_object_set_new(jwt->payload.value.json, OIDC_CLAIM_EXP,
-				    json_integer(access_token_expires > 0 ? apr_time_sec(access_token_expires)
-									  : apr_time_sec(apr_time_now()) +
-										OIDC_USERINFO_SIGNED_JWT_EXP_DEFAULT));
+		oidc_json_object_set_new(
+		    jwt->payload.value.json, OIDC_CLAIM_EXP,
+		    oidc_json_integer(access_token_expires > 0
+					  ? apr_time_sec(access_token_expires)
+					  : apr_time_sec(apr_time_now()) + OIDC_USERINFO_SIGNED_JWT_EXP_DEFAULT));
 	}
 
 	if (oidc_proto_jwt_sign_and_serialize(r, jwk, jwt, cser) == FALSE)
@@ -323,7 +343,7 @@ static apr_byte_t oidc_userinfo_create_signed_jwt(request_rec *r, oidc_cfg_t *cf
 
 	if (ttl == 0) {
 		// need to get the cache ttl from the exp claim
-		oidc_util_json_object_get_int(jwt->payload.value.json, OIDC_CLAIM_EXP, &exp, 0);
+		oidc_json_object_get_int(jwt->payload.value.json, OIDC_CLAIM_EXP, &exp, 0);
 		// actually the exp claim always exists by now
 		expiry = (exp > 0) ? apr_time_from_sec(exp)
 				   : apr_time_now() + apr_time_from_sec(OIDC_USERINFO_SIGNED_JWT_EXP_DEFAULT);
@@ -344,87 +364,117 @@ end:
 }
 
 /*
- * pass the userinfo claims to headers and/or environment variables, encoded as configured
+ * set an appinfo value, falling back to default_name (with the default
+ * header prefix) when no explicit name was configured
  */
-void oidc_userinfo_pass_as(request_rec *r, oidc_cfg_t *cfg, oidc_session_t *session, oidc_appinfo_pass_in_t pass_in,
-			   oidc_appinfo_encoding_t encoding) {
-	const apr_array_header_t *pass_userinfo_as = NULL;
-	oidc_pass_user_info_as_t *p = NULL;
-	int i = 0;
-	char *cser = NULL;
-	json_t *claims = NULL, *filtered_claims = NULL;
+static void oidc_userinfo_appinfo_set(request_rec *r, const char *name, const char *default_name, const char *value,
+				      oidc_appinfo_pass_in_t pass_in, oidc_appinfo_encoding_t encoding) {
+	oidc_util_appinfo_set(r, name ? name : default_name, value, name ? "" : OIDC_DEFAULT_HEADER_PREFIX, pass_in,
+			      encoding);
+}
 
-	pass_userinfo_as = oidc_cfg_dir_pass_userinfo_as_get(r);
+/*
+ * pass the userinfo JWT stored in the session to the app, rejecting the
+ * client-cookie session type which does not support storing such JWTs
+ */
+static void oidc_userinfo_pass_as_jwt(request_rec *r, const oidc_cfg_t *cfg, const oidc_session_t *session,
+				      const char *name, oidc_appinfo_pass_in_t pass_in,
+				      oidc_appinfo_encoding_t encoding) {
+
+	if (oidc_cfg_session_type_get(cfg) == OIDC_SESSION_TYPE_CLIENT_COOKIE) {
+		oidc_error(r, "session type \"client-cookie\" does not allow storing/passing a "
+			      "userinfo JWT; use \"" OIDCSessionType " server-cache\" for that");
+		return;
+	}
+
+	const char *s_userinfo_jwt = oidc_session_get_userinfo_jwt(r, session);
+	if (s_userinfo_jwt == NULL) {
+		oidc_debug(r, "configured to pass userinfo in a JWT, but no such JWT was found in the session "
+			      "(probably no such JWT was returned from the userinfo endpoint)");
+		return;
+	}
+
+	oidc_userinfo_appinfo_set(r, name, OIDC_APP_INFO_USERINFO_JWT, s_userinfo_jwt, pass_in, encoding);
+}
+
+/*
+ * dispatch a single configured "pass userinfo as" entry to the matching
+ * encoding-specific handler
+ */
+static void oidc_userinfo_pass_entry(request_rec *r, oidc_cfg_t *cfg, const oidc_session_t *session,
+				     oidc_json_t *claims, const oidc_pass_user_info_as_t *p,
+				     oidc_appinfo_pass_in_t pass_in, oidc_appinfo_encoding_t encoding) {
+
+	char *cser = NULL;
+
+	switch (p->type) {
+	case OIDC_PASS_USERINFO_AS_CLAIMS:
+		/* set the userinfo claims in the app headers */
+		oidc_set_app_claims(r, cfg, claims);
+		break;
+	case OIDC_PASS_USERINFO_AS_JSON_OBJECT:
+		/* pass the userinfo JSON object to the app in a header or environment variable */
+		oidc_userinfo_appinfo_set(
+		    r, p->name, OIDC_APP_INFO_USERINFO_JSON,
+		    oidc_json_encode(r->pool, claims, OIDC_JSON_PRESERVE_ORDER | OIDC_JSON_COMPACT), pass_in, encoding);
+		break;
+	case OIDC_PASS_USERINFO_AS_JWT:
+		oidc_userinfo_pass_as_jwt(r, cfg, session, p->name, pass_in, encoding);
+		break;
+	case OIDC_PASS_USERINFO_AS_SIGNED_JWT:
+		if (oidc_userinfo_create_signed_jwt(r, cfg, session, claims, &cser) == TRUE)
+			oidc_userinfo_appinfo_set(r, p->name, OIDC_APP_INFO_SIGNED_JWT, cser, pass_in, encoding);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
+ * resolve the claims to pass to the app, optionally applying a JQ filter
+ * to the userinfo claims stored in the session; *filtered receives the
+ * newly allocated oidc_json_t that the caller must release, or NULL when no
+ * filter was applied
+ */
+static oidc_json_t *oidc_userinfo_resolve_claims(request_rec *r, const oidc_session_t *session,
+						 oidc_json_t **filtered) {
+
+	*filtered = NULL;
 
 #ifdef USE_LIBJQ
-	const char *s_claims = NULL;
 	const char *s_filter = oidc_cfg_dir_userinfo_claims_expr_get(r);
-	if (s_filter) {
-		s_claims = oidc_util_jq_filter(r, oidc_session_get_userinfo_claims(r, session), s_filter);
-		if (oidc_util_json_decode_object(r, s_claims, &filtered_claims) == FALSE) {
+	if (s_filter != NULL) {
+		const char *s_claims = oidc_util_jq_filter(r, oidc_session_get_userinfo_claims(r, session), s_filter);
+		if (oidc_json_decode_object(r, s_claims, filtered) == FALSE) {
 			oidc_error(r, "JQ filtering of claims for [%s] resulted in invalid JSON object, filter='%s'",
 				   "userinfo", s_filter);
-			return;
+			return NULL;
 		}
+		return *filtered;
 	}
 #endif
 
-	claims = filtered_claims ? filtered_claims : oidc_session_get_userinfo_claims(r, session);
+	return oidc_session_get_userinfo_claims(r, session);
+}
 
-	for (i = 0; (pass_userinfo_as != NULL) && (i < pass_userinfo_as->nelts); i++) {
+/*
+ * pass the userinfo claims to headers and/or environment variables, encoded as configured
+ */
+void oidc_userinfo_pass_as(request_rec *r, oidc_cfg_t *cfg, const oidc_session_t *session,
+			   oidc_appinfo_pass_in_t pass_in, oidc_appinfo_encoding_t encoding) {
 
-		p = APR_ARRAY_IDX(pass_userinfo_as, i, oidc_pass_user_info_as_t *);
+	const apr_array_header_t *pass_userinfo_as = oidc_cfg_dir_pass_userinfo_as_get(r);
+	oidc_json_t *filtered_claims = NULL;
+	oidc_json_t *claims = oidc_userinfo_resolve_claims(r, session, &filtered_claims);
 
-		switch (p->type) {
+	if (claims == NULL)
+		return;
 
-		case OIDC_PASS_USERINFO_AS_CLAIMS:
-			/* set the userinfo claims in the app headers */
-			oidc_set_app_claims(r, cfg, claims);
-			break;
-
-		case OIDC_PASS_USERINFO_AS_JSON_OBJECT:
-			/* pass the userinfo JSON object to the app in a header or environment variable */
-			oidc_util_appinfo_set(
-			    r, p->name ? p->name : OIDC_APP_INFO_USERINFO_JSON,
-			    oidc_util_json_encode(r->pool, claims, JSON_PRESERVE_ORDER | JSON_COMPACT),
-			    p->name ? "" : OIDC_DEFAULT_HEADER_PREFIX, pass_in, encoding);
-			break;
-
-		case OIDC_PASS_USERINFO_AS_JWT:
-			if (oidc_cfg_session_type_get(cfg) != OIDC_SESSION_TYPE_CLIENT_COOKIE) {
-				/* get the compact serialized JWT from the session */
-				const char *s_userinfo_jwt = oidc_session_get_userinfo_jwt(r, session);
-				if (s_userinfo_jwt != NULL) {
-					/* pass the compact serialized JWT to the app in a header or environment
-					 * variable */
-					oidc_util_appinfo_set(r, p->name ? p->name : OIDC_APP_INFO_USERINFO_JWT,
-							      s_userinfo_jwt, p->name ? "" : OIDC_DEFAULT_HEADER_PREFIX,
-							      pass_in, encoding);
-				} else {
-					oidc_debug(
-					    r,
-					    "configured to pass userinfo in a JWT, but no such JWT was found in the "
-					    "session (probably no such JWT was returned from the userinfo endpoint)");
-				}
-			} else {
-				oidc_error(r, "session type \"client-cookie\" does not allow storing/passing a "
-					      "userinfo JWT; use \"" OIDCSessionType " server-cache\" for that");
-			}
-			break;
-
-		case OIDC_PASS_USERINFO_AS_SIGNED_JWT:
-
-			if (oidc_userinfo_create_signed_jwt(r, cfg, session, claims, &cser) == TRUE) {
-				oidc_util_appinfo_set(r, p->name ? p->name : OIDC_APP_INFO_SIGNED_JWT, cser,
-						      p->name ? "" : OIDC_DEFAULT_HEADER_PREFIX, pass_in, encoding);
-			}
-			break;
-
-		default:
-			break;
-		}
-	}
+	for (int i = 0; (pass_userinfo_as != NULL) && (i < pass_userinfo_as->nelts); i++)
+		oidc_userinfo_pass_entry(r, cfg, session, claims,
+					 APR_ARRAY_IDX(pass_userinfo_as, i, oidc_pass_user_info_as_t *), pass_in,
+					 encoding);
 
 	if (filtered_claims)
-		json_decref(filtered_claims);
+		oidc_json_decref(filtered_claims);
 }

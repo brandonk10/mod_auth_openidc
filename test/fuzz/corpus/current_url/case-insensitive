@@ -1,0 +1,4 @@
+/
+host: WWW.EXAMPLE.COM
+x-forwarded-proto: HTTPS
+forwarded: HOST=Front.Example.Com;PROTO=https

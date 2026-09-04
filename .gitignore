@@ -27,3 +27,21 @@
 /Makefile.in
 /missing
 /test-driver
+/.claude/
+/CLAUDE.md
+/*.gcov
+
+# code coverage (make check-code-coverage / --enable-code-coverage)
+*.gcda
+*.gcno
+coverage.info
+coverage.log
+coverage-report/
+
+# clangd / clang-tidy tooling (e.g. `bear -- make` generates the compile DB)
+compile_commands.json
+.cache/
+
+# ctags index (e.g. `ctags -R src/`)
+/tags
+/TAGS

@@ -41,12 +41,34 @@
  *
  **************************************************************************/
 
+#include "cache/cache.h"
+#include "cache/shm.h"
 #include "cfg/cache.h"
 #include "cfg/cfg_int.h"
 #include "cfg/provider.h"
 #include "check_util.h"
+#include "mod_auth_openidc.h"
 #include "util.h"
 #include "util/util.h"
+#include "util/util_cfg.h"
+#include <apr_thread_proc.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#if APR_HAS_FORK
+#include <sys/wait.h>
+#endif
+#include <unistd.h>
+
+#ifdef USE_LIBHIREDIS
+#include "cache/redis.h"
+#endif
+
+#ifdef USE_MEMCACHE
+#include "cache/memcache.h"
+#endif
 
 START_TEST(test_cache_mutex_and_status2str) {
 	request_rec *r = oidc_test_request_get();
@@ -212,6 +234,7 @@ START_TEST(test_cache_second_passphrase_retry) {
 	/* set initial secret and ensure encryption is enabled */
 	cfg->crypto_passphrase.secret1 = "oldsecret012345678901234567890"; // 30+ chars
 	cfg->crypto_passphrase.secret2 = NULL;
+	oidc_test_crypto_passphrase_rederive(cfg);
 	cfg->cache.encrypt = 1;
 
 	/* disable internal compression for this test */
@@ -223,6 +246,7 @@ START_TEST(test_cache_second_passphrase_retry) {
 	/* rotate secrets: new secret becomes secret1, old one moved to secret2 */
 	cfg->crypto_passphrase.secret1 = "newsecret01234567890123456789012"; // different
 	cfg->crypto_passphrase.secret2 = "oldsecret012345678901234567890";
+	oidc_test_crypto_passphrase_rederive(cfg);
 
 	/* attempt to retrieve: oidc_cache_get should first try with secret1 (no match) then with secret2 and succeed */
 	value = NULL;
@@ -233,8 +257,103 @@ START_TEST(test_cache_second_passphrase_retry) {
 	/* cleanup: restore cfg values */
 	cfg->crypto_passphrase.secret1 = (char *)old_s1;
 	cfg->crypto_passphrase.secret2 = (char *)old_s2;
+	oidc_test_crypto_passphrase_rederive(cfg);
 	cfg->cache.encrypt = old_encrypt;
 	apr_table_unset(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS");
+}
+END_TEST
+
+/* fill the shm cache beyond its capacity (500 slots in the test fixture) so the sampled-LRU
+ * eviction path runs, then verify recent entries are still served and deletion works */
+START_TEST(test_cache_shm_eviction_and_delete) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	char *value = NULL;
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(3600);
+	const int nslots = oidc_cfg_cache_shm_size_max_get(cfg);
+	int i = 0;
+
+	/* insert more entries than there are slots: every set must succeed through eviction */
+	for (i = 0; i < nslots + 20; i++)
+		ck_assert_int_eq(
+		    oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "evict-%d", i), "v", expiry),
+		    TRUE);
+
+	/* the most recently inserted entry must be present */
+	value = NULL;
+	ck_assert_int_eq(
+	    oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "evict-%d", nslots + 19), &value),
+	    TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "v");
+
+	/* overwriting an existing key must not consume a new slot or duplicate the entry */
+	ck_assert_int_eq(
+	    oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "evict-%d", nslots + 19), "v2", expiry),
+	    TRUE);
+	value = NULL;
+	ck_assert_int_eq(
+	    oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "evict-%d", nslots + 19), &value),
+	    TRUE);
+	ck_assert_str_eq(value, "v2");
+
+	/* deleting an entry (NULL value) must result in a miss afterwards */
+	ck_assert_int_eq(
+	    oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "evict-%d", nslots + 19), NULL, expiry),
+	    TRUE);
+	value = NULL;
+	ck_assert_int_eq(
+	    oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "evict-%d", nslots + 19), &value),
+	    TRUE);
+	ck_assert_ptr_null(value);
+
+	/* deleting a non-existing key is a no-op that must not clear an unrelated entry */
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "evict-does-not-exist", NULL, expiry), TRUE);
+}
+END_TEST
+
+/* Churn beyond capacity and verify that reused or mislinked slots never cross values between keys. */
+START_TEST(test_cache_shm_churn_never_crosses_keys) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	const int nslots = oidc_cfg_cache_shm_size_max_get(cfg);
+	const int total = nslots * 5;
+	const apr_time_t future = apr_time_now() + apr_time_from_sec(3600);
+	const apr_time_t past = apr_time_now() - apr_time_from_sec(1);
+	int present = 0;
+	int i = 0;
+
+	for (i = 0; i < total; i++) {
+		const char *key = apr_psprintf(r->pool, "churn-%d", i);
+		/* every fifth entry is already expired on arrival, every seventh is deleted again */
+		ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, key,
+						apr_psprintf(r->pool, "value-for-%d", i),
+						((i % 5) == 0) ? past : future),
+				 TRUE);
+		if ((i % 7) == 0)
+			ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, key, NULL, future), TRUE);
+	}
+
+	for (i = 0; i < total; i++) {
+		char *value = NULL;
+		const char *key = apr_psprintf(r->pool, "churn-%d", i);
+		ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+		if (value == NULL)
+			continue;
+		present++;
+		/* an expired or deleted entry must never come back, and a live one must be its own */
+		ck_assert_msg((i % 5) != 0, "expired entry churn-%d was served: %s", i, value);
+		ck_assert_msg((i % 7) != 0, "deleted entry churn-%d was served: %s", i, value);
+		ck_assert_str_eq(value, apr_psprintf(r->pool, "value-for-%d", i));
+	}
+
+	/* the cache is bounded, so it cannot be holding more than its slot count */
+	ck_assert_msg(present <= nslots, "%d entries present in a cache of %d slots", present, nslots);
+	/* ... and after that much churn it should not have collapsed to (nearly) nothing either */
+	ck_assert_msg(present > 0, "no entry at all survived the churn");
+	const char *error = NULL;
+	ck_assert_msg(oidc_cache_shm_validate(r, &error) == TRUE, "invalid shm structure: %s",
+		      error != NULL ? error : "unknown");
 }
 END_TEST
 
@@ -269,6 +388,210 @@ START_TEST(test_cache_shm_get_key_bounds_negative) {
 }
 END_TEST
 
+START_TEST(test_cache_shm_hash_size_and_value_boundaries) {
+	const apr_uint64_t key[2] = {0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL};
+	unsigned char input[15];
+	for (apr_size_t i = 0; i < sizeof(input); i++)
+		input[i] = (unsigned char)i;
+	ck_assert_uint_eq(oidc_cache_shm_siphash(input, 0, key), 0x726fdb47dd0e0e31ULL);
+	ck_assert_uint_eq(oidc_cache_shm_siphash(input, sizeof(input), key), 0xa129ca6149be45e5ULL);
+
+	apr_size_t segment_size = 0;
+	ck_assert_int_eq(oidc_cache_shm_segment_size(10000, 16928, 16384, &segment_size), TRUE);
+	ck_assert_uint_gt(segment_size, (apr_size_t)10000 * 16928);
+	ck_assert_int_eq(oidc_cache_shm_segment_size(10000, 16928, 16384, NULL), FALSE);
+	ck_assert_int_eq(oidc_cache_shm_segment_size(0, 16928, 1, &segment_size), FALSE);
+	ck_assert_int_eq(oidc_cache_shm_segment_size(INT_MAX, INT_MAX, 1U << 30, &segment_size), FALSE);
+
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	const int old_encrypt = cfg->cache.encrypt;
+	cfg->cache.encrypt = 0;
+	const apr_ssize_t limit = oidc_cache_shm_value_size_max(oidc_cfg_cache_shm_entry_size_max_get(cfg));
+	char *value = apr_palloc(r->pool, (apr_size_t)limit + 1);
+	_oidc_memset(value, 'x', (apr_size_t)limit);
+	value[limit] = '\0';
+	value[limit - 1] = '\0';
+	ck_assert_int_eq(
+	    oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "boundary-ok", value, apr_time_now() + apr_time_from_sec(60)),
+	    TRUE);
+	value[limit - 1] = 'x';
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "boundary-too-large", value,
+					apr_time_now() + apr_time_from_sec(60)),
+			 FALSE);
+	cfg->cache.encrypt = old_encrypt;
+}
+END_TEST
+
+START_TEST(test_cache_shm_delete_missing_from_full_cache_is_noop) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	const int old_encrypt = cfg->cache.encrypt;
+	const int nslots = oidc_cfg_cache_shm_size_max_get(cfg);
+	const apr_time_t expiry = apr_time_now() + apr_time_from_sec(3600);
+	cfg->cache.encrypt = 0;
+
+	for (int i = 0; i < nslots; i++)
+		ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "full-%d", i),
+						apr_psprintf(r->pool, "value-%d", i), expiry),
+				 TRUE);
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "full-missing", NULL, 0), TRUE);
+	for (int i = 0; i < nslots; i++) {
+		char *value = NULL;
+		ck_assert_int_eq(
+		    oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "full-%d", i), &value), TRUE);
+		ck_assert_ptr_nonnull(value);
+		ck_assert_str_eq(value, apr_psprintf(r->pool, "value-%d", i));
+	}
+	const char *error = NULL;
+	ck_assert_msg(oidc_cache_shm_validate(r, &error) == TRUE, "invalid shm structure: %s",
+		      error != NULL ? error : "unknown");
+	cfg->cache.encrypt = old_encrypt;
+}
+END_TEST
+
+START_TEST(test_cache_shm_pressure_reclaims_expired_before_live) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	const int old_encrypt = cfg->cache.encrypt;
+	const int nslots = oidc_cfg_cache_shm_size_max_get(cfg);
+	const apr_time_t past = apr_time_now() - apr_time_from_sec(1);
+	const apr_time_t future = apr_time_now() + apr_time_from_sec(3600);
+	cfg->cache.encrypt = 0;
+
+	for (int i = 0; i < nslots; i++)
+		ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "expired-%d", i),
+						"expired", past),
+				 TRUE);
+	for (int i = 0; i < nslots; i++)
+		ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION,
+						apr_psprintf(r->pool, "replacement-%d", i),
+						apr_psprintf(r->pool, "live-%d", i), future),
+				 TRUE);
+	for (int i = 0; i < nslots; i++) {
+		char *value = NULL;
+		ck_assert_int_eq(
+		    oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, apr_psprintf(r->pool, "replacement-%d", i), &value),
+		    TRUE);
+		ck_assert_ptr_nonnull(value);
+		ck_assert_str_eq(value, apr_psprintf(r->pool, "live-%d", i));
+	}
+	const char *error = NULL;
+	ck_assert_msg(oidc_cache_shm_validate(r, &error) == TRUE, "invalid shm structure: %s",
+		      error != NULL ? error : "unknown");
+	cfg->cache.encrypt = old_encrypt;
+}
+END_TEST
+
+typedef struct oidc_cache_shm_thread_ctx_t {
+	request_rec *base;
+	int id;
+	int failures;
+} oidc_cache_shm_thread_ctx_t;
+
+static void *APR_THREAD_FUNC oidc_cache_shm_thread(apr_thread_t *thread, void *data) {
+	oidc_cache_shm_thread_ctx_t *ctx = data;
+	apr_pool_t *pool = NULL;
+	if (apr_pool_create(&pool, NULL) != APR_SUCCESS) {
+		ctx->failures++;
+		return NULL;
+	}
+	request_rec r = *ctx->base;
+	r.pool = pool;
+	const apr_time_t expiry = apr_time_now() + apr_time_from_sec(3600);
+	for (int i = 0; i < 1000; i++) {
+		const char *key = apr_psprintf(pool, "thread-%d-%d", ctx->id, i);
+		const char *expected = apr_psprintf(pool, "value-%d-%d", ctx->id, i);
+		char *value = NULL;
+		if (oidc_cache_set(&r, OIDC_CACHE_SECTION_SESSION, key, expected, expiry) != TRUE) {
+			ctx->failures++;
+			break;
+		}
+		if (oidc_cache_get(&r, OIDC_CACHE_SECTION_SESSION, key, &value) != TRUE) {
+			ctx->failures++;
+			break;
+		}
+		if ((value != NULL) && (_oidc_strcmp(value, expected) != 0)) {
+			ctx->failures++;
+			break;
+		}
+		apr_pool_clear(pool);
+	}
+	apr_pool_destroy(pool);
+	return NULL;
+}
+
+START_TEST(test_cache_shm_concurrent_shard_churn) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	const int old_encrypt = cfg->cache.encrypt;
+	cfg->cache.encrypt = 0;
+
+	apr_thread_t *threads[8];
+	oidc_cache_shm_thread_ctx_t contexts[8];
+	for (int i = 0; i < 8; i++) {
+		contexts[i].base = r;
+		contexts[i].id = i;
+		contexts[i].failures = 0;
+		ck_assert_int_eq(apr_thread_create(&threads[i], NULL, oidc_cache_shm_thread, &contexts[i], r->pool),
+				 APR_SUCCESS);
+	}
+	for (int i = 0; i < 8; i++) {
+		apr_status_t status = APR_SUCCESS;
+		ck_assert_int_eq(apr_thread_join(&status, threads[i]), APR_SUCCESS);
+		ck_assert_int_eq(status, APR_SUCCESS);
+		ck_assert_int_eq(contexts[i].failures, 0);
+	}
+	const char *error = NULL;
+	ck_assert_msg(oidc_cache_shm_validate(r, &error) == TRUE, "invalid shm structure: %s",
+		      error != NULL ? error : "unknown");
+	cfg->cache.encrypt = old_encrypt;
+}
+END_TEST
+
+#if APR_HAS_FORK
+START_TEST(test_cache_shm_multiprocess_churn) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	const int old_encrypt = cfg->cache.encrypt;
+	cfg->cache.encrypt = 0;
+	pid_t children[4];
+
+	for (int child = 0; child < 4; child++) {
+		children[child] = fork();
+		ck_assert_msg(children[child] >= 0, "fork failed");
+		if (children[child] != 0)
+			continue;
+		if (cfg->cache.impl->child_init(r->pool, r->server) != APR_SUCCESS)
+			_exit(2);
+		const apr_time_t expiry = apr_time_now() + apr_time_from_sec(3600);
+		for (int i = 0; i < 1000; i++) {
+			const char *key = apr_psprintf(r->pool, "process-%d-%d", child, i);
+			const char *expected = apr_psprintf(r->pool, "value-%d-%d", child, i);
+			char *value = NULL;
+			if (oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, key, expected, expiry) != TRUE)
+				_exit(3);
+			if (oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, key, &value) != TRUE)
+				_exit(4);
+			if ((value != NULL) && (_oidc_strcmp(value, expected) != 0))
+				_exit(5);
+		}
+		_exit(0);
+	}
+	for (int child = 0; child < 4; child++) {
+		int status = 0;
+		ck_assert_int_eq(waitpid(children[child], &status, 0), children[child]);
+		ck_assert_msg(WIFEXITED(status) && (WEXITSTATUS(status) == 0), "child %d failed with status %d", child,
+			      status);
+	}
+	const char *error = NULL;
+	ck_assert_msg(oidc_cache_shm_validate(r, &error) == TRUE, "invalid shm structure: %s",
+		      error != NULL ? error : "unknown");
+	cfg->cache.encrypt = old_encrypt;
+}
+END_TEST
+#endif
+
 START_TEST(test_cache_secret1_empty_secret2_fallback) {
 	request_rec *r = oidc_test_request_get();
 	char *value = NULL;
@@ -283,6 +606,7 @@ START_TEST(test_cache_secret1_empty_secret2_fallback) {
 	/* set initial secret and ensure encryption is enabled */
 	cfg->crypto_passphrase.secret1 = "origsecret012345678901234567890";
 	cfg->crypto_passphrase.secret2 = NULL;
+	oidc_test_crypto_passphrase_rederive(cfg);
 	cfg->cache.encrypt = 1;
 
 	/* disable compression for deterministic behavior */
@@ -294,6 +618,7 @@ START_TEST(test_cache_secret1_empty_secret2_fallback) {
 	/* now simulate secret1 being empty string and secret2 having the original secret */
 	cfg->crypto_passphrase.secret1 = ""; /* empty (non-NULL) */
 	cfg->crypto_passphrase.secret2 = "origsecret012345678901234567890";
+	oidc_test_crypto_passphrase_rederive(cfg);
 
 	/* retrieval should succeed via fallback to secret2 */
 	value = NULL;
@@ -304,6 +629,7 @@ START_TEST(test_cache_secret1_empty_secret2_fallback) {
 	/* cleanup */
 	cfg->crypto_passphrase.secret1 = (char *)old_s1;
 	cfg->crypto_passphrase.secret2 = (char *)old_s2;
+	oidc_test_crypto_passphrase_rederive(cfg);
 	cfg->cache.encrypt = old_encrypt;
 	apr_table_unset(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS");
 }
@@ -332,6 +658,77 @@ START_TEST(test_cache_backend_true_null_miss) {
 }
 END_TEST
 
+/* Cover unencrypted cache hits and hashing of long keys. */
+START_TEST(test_cache_unencrypted_hit_and_long_key) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	int old_encrypt = cfg->cache.encrypt;
+	char *value = NULL;
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+
+	cfg->cache.encrypt = 0;
+
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "plain-k", "plain-v", expiry), TRUE);
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "plain-k", &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "plain-v");
+
+	/* a key too long to be used as it is gets hashed whether or not encryption is on */
+	size_t long_len = OIDC_CACHE_KEY_SIZE_MAX + 50;
+	char *long_key = apr_pcalloc(r->pool, long_len + 1);
+	memset(long_key, 'k', long_len);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_NONCE, long_key, "long-plain-v", expiry), TRUE);
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_NONCE, long_key, &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "long-plain-v");
+
+	cfg->cache.encrypt = old_encrypt;
+}
+END_TEST
+
+/* A previous-passphrase retry error must not be downgraded to a cache miss. */
+static int _e2e_flaky_get_calls = 0;
+
+static apr_byte_t e2e_flaky_get(request_rec *r, const char *section, const char *key, char **value) {
+	_e2e_flaky_get_calls++;
+	if (_e2e_flaky_get_calls == 1) {
+		*value = NULL;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static oidc_cache_t e2e_flaky_cache = {"flaky", 1, NULL, NULL, e2e_flaky_get, NULL, NULL};
+
+START_TEST(test_cache_second_passphrase_retry_backend_error) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	const char *old_s1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
+	const char *old_s2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
+	oidc_cache_t *old_impl = (oidc_cache_t *)cfg->cache.impl;
+	int old_encrypt = cfg->cache.encrypt;
+	char *value = NULL;
+
+	cfg->crypto_passphrase.secret1 = "newsecret01234567890123456789012";
+	cfg->crypto_passphrase.secret2 = "oldsecret012345678901234567890";
+	oidc_test_crypto_passphrase_rederive(cfg);
+	cfg->cache.encrypt = 1;
+	cfg->cache.impl = &e2e_flaky_cache;
+	_e2e_flaky_get_calls = 0;
+
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "rotating", &value), FALSE);
+	ck_assert_int_eq(_e2e_flaky_get_calls, 2);
+	ck_assert_ptr_null(value);
+
+	cfg->cache.impl = old_impl;
+	cfg->cache.encrypt = old_encrypt;
+	cfg->crypto_passphrase.secret1 = (char *)old_s1;
+	cfg->crypto_passphrase.secret2 = (char *)old_s2;
+	oidc_test_crypto_passphrase_rederive(cfg);
+}
+END_TEST
+
 START_TEST(test_cache_compression_enabled_set_get) {
 	request_rec *r = oidc_test_request_get();
 	char *value = NULL;
@@ -342,12 +739,9 @@ START_TEST(test_cache_compression_enabled_set_get) {
 
 	/* verify encryption+compression works by trying to create a JWT with the current cfg secret */
 	oidc_cfg_t *cfg = oidc_test_cfg_get();
-	oidc_crypto_passphrase_t passphrase;
-	passphrase.secret1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
-	passphrase.secret2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	char *encoded = NULL;
 	apr_byte_t forced_no_compress = FALSE;
-	if (!oidc_util_jwt_create(r, &passphrase, "probe", &encoded)) {
+	if (!oidc_util_jwt_create(r, oidc_cfg_crypto_passphrase_get(cfg), "probe", &encoded)) {
 		/* compression or encryption not available; fall back to non-compressed path for this test */
 		apr_table_set(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS", "true");
 		forced_no_compress = TRUE;
@@ -381,17 +775,16 @@ START_TEST(test_cache_compression_enabled_second_passphrase) {
 	/* set initial secret and ensure encryption is enabled */
 	cfg->crypto_passphrase.secret1 = "cmp_oldsecret012345678901234567";
 	cfg->crypto_passphrase.secret2 = NULL;
+	oidc_test_crypto_passphrase_rederive(cfg);
 	cfg->cache.encrypt = 1;
 
 	/* verify encryption+compression works for this cfg; fall back to no-compress if not */
-	oidc_crypto_passphrase_t passphrase;
-	passphrase.secret1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
-	passphrase.secret2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	char *encoded = NULL;
 	apr_byte_t forced_no_compress = FALSE;
-	if (!oidc_util_jwt_create(r, &passphrase, "probe", &encoded)) {
+	if (!oidc_util_jwt_create(r, oidc_cfg_crypto_passphrase_get(cfg), "probe", &encoded)) {
 		cfg->crypto_passphrase.secret1 = (char *)old_s1;
 		cfg->crypto_passphrase.secret2 = (char *)old_s2;
+		oidc_test_crypto_passphrase_rederive(cfg);
 		cfg->cache.encrypt = old_encrypt;
 		apr_table_set(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS", "true");
 		forced_no_compress = TRUE;
@@ -399,6 +792,7 @@ START_TEST(test_cache_compression_enabled_second_passphrase) {
 		cfg = oidc_test_cfg_get();
 		cfg->crypto_passphrase.secret1 = "cmp_oldsecret012345678901234567";
 		cfg->crypto_passphrase.secret2 = NULL;
+		oidc_test_crypto_passphrase_rederive(cfg);
 		cfg->cache.encrypt = 1;
 	}
 
@@ -408,6 +802,7 @@ START_TEST(test_cache_compression_enabled_second_passphrase) {
 	/* rotate secrets */
 	cfg->crypto_passphrase.secret1 = "cmp_newsecret0123456789012345678";
 	cfg->crypto_passphrase.secret2 = "cmp_oldsecret012345678901234567";
+	oidc_test_crypto_passphrase_rederive(cfg);
 
 	/* retrieve should succeed via secret2 fallback */
 	value = NULL;
@@ -418,6 +813,7 @@ START_TEST(test_cache_compression_enabled_second_passphrase) {
 	/* restore */
 	cfg->crypto_passphrase.secret1 = (char *)old_s1;
 	cfg->crypto_passphrase.secret2 = (char *)old_s2;
+	oidc_test_crypto_passphrase_rederive(cfg);
 	cfg->cache.encrypt = old_encrypt;
 	if (forced_no_compress)
 		apr_table_unset(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS");
@@ -440,23 +836,23 @@ START_TEST(test_cache_compression_enabled_empty_secret2_fallback) {
 
 	cfg->crypto_passphrase.secret1 = "cmp_origsecret012345678901234567";
 	cfg->crypto_passphrase.secret2 = NULL;
+	oidc_test_crypto_passphrase_rederive(cfg);
 	cfg->cache.encrypt = 1;
 
 	/* verify encryption+compression works; fall back to no-compress if not */
-	oidc_crypto_passphrase_t passphrase2;
-	passphrase2.secret1 = oidc_cfg_crypto_passphrase_secret1_get(cfg);
-	passphrase2.secret2 = oidc_cfg_crypto_passphrase_secret2_get(cfg);
 	char *encoded2 = NULL;
 	apr_byte_t forced_no_compress = FALSE;
-	if (!oidc_util_jwt_create(r, &passphrase2, "probe", &encoded2)) {
+	if (!oidc_util_jwt_create(r, oidc_cfg_crypto_passphrase_get(cfg), "probe", &encoded2)) {
 		cfg->crypto_passphrase.secret1 = (char *)old_s1;
 		cfg->crypto_passphrase.secret2 = (char *)old_s2;
+		oidc_test_crypto_passphrase_rederive(cfg);
 		cfg->cache.encrypt = old_encrypt;
 		apr_table_set(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS", "true");
 		forced_no_compress = TRUE;
 		cfg = oidc_test_cfg_get();
 		cfg->crypto_passphrase.secret1 = "cmp_origsecret012345678901234567";
 		cfg->crypto_passphrase.secret2 = NULL;
+		oidc_test_crypto_passphrase_rederive(cfg);
 		cfg->cache.encrypt = 1;
 	}
 
@@ -466,6 +862,7 @@ START_TEST(test_cache_compression_enabled_empty_secret2_fallback) {
 	/* simulate secret1 empty and secret2 containing original */
 	cfg->crypto_passphrase.secret1 = "";
 	cfg->crypto_passphrase.secret2 = "cmp_origsecret012345678901234567";
+	oidc_test_crypto_passphrase_rederive(cfg);
 
 	value = NULL;
 	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "c_emptyrot", &value), TRUE);
@@ -475,11 +872,1557 @@ START_TEST(test_cache_compression_enabled_empty_secret2_fallback) {
 	/* restore */
 	cfg->crypto_passphrase.secret1 = (char *)old_s1;
 	cfg->crypto_passphrase.secret2 = (char *)old_s2;
+	oidc_test_crypto_passphrase_rederive(cfg);
 	cfg->cache.encrypt = old_encrypt;
 	if (forced_no_compress)
 		apr_table_unset(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS");
 }
 END_TEST
+
+/* File-cache tests use a fresh temporary directory and the fixture's existing shared mutex. */
+
+static oidc_cache_t *e2e_switch_to_file_backend(request_rec *r) {
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev = (oidc_cache_t *)cfg->cache.impl;
+	cfg->cache.impl = &oidc_cache_file;
+
+	char *tmpl = apr_pstrdup(r->pool, "/tmp/oidc-test-cache.XXXXXX");
+	ck_assert_msg(mkdtemp(tmpl) != NULL, "could not create temp cache dir at %s", tmpl);
+	cfg->cache.file_dir = tmpl;
+
+	/* disable JWT compression: the cache wrapper's encryption path goes through
+	 * oidc_util_jwt_create which calls zlib's deflate; that step can fail
+	 * intermittently in this minimal test environment and isn't what we're testing */
+	apr_table_set(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS", "true");
+
+	ck_assert_int_eq(oidc_cache_file.post_config(r->server->process->pconf, r->server), OK);
+	return prev;
+}
+
+static void e2e_restore_cache_backend(oidc_cache_t *prev) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	cfg->cache.impl = prev;
+	apr_table_unset(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS");
+}
+
+START_TEST(test_cache_file_set_get_basic) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "file-k1", "file-v1", expiry), TRUE);
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "file-k1", &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "file-v1");
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+START_TEST(test_cache_file_miss) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+
+	char *value = NULL;
+	/* a key that was never set must return TRUE with *value == NULL */
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "no-such-key", &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+START_TEST(test_cache_file_expired_entry_is_miss) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+
+	/* set with an expiry already in the past => get must report a miss */
+	apr_time_t past = apr_time_now() - apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "file-expired", "stale-value", past), TRUE);
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "file-expired", &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+START_TEST(test_cache_file_overwrite_and_delete) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "file-k2", "first-value", expiry), TRUE);
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "file-k2", "second-value", expiry), TRUE);
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "file-k2", &value), TRUE);
+	ck_assert_str_eq(value, "second-value");
+
+	/* setting NULL deletes the cache entry */
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "file-k2", NULL, 0), TRUE);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "file-k2", &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+START_TEST(test_cache_file_default_tmp_dir) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev = (oidc_cache_t *)cfg->cache.impl;
+	cfg->cache.impl = &oidc_cache_file;
+	/* leave cache.file_dir NULL — post_config must pick a system tmp dir via apr_temp_dir_get */
+	cfg->cache.file_dir = NULL;
+	apr_table_set(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS", "true");
+
+	ck_assert_int_eq(oidc_cache_file.post_config(r->server->process->pconf, r->server), OK);
+	ck_assert_ptr_nonnull(cfg->cache.file_dir);
+
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_set(r, OIDC_CACHE_SECTION_SESSION, "file-default-dir", "ok", expiry), TRUE);
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_get(r, OIDC_CACHE_SECTION_SESSION, "file-default-dir", &value), TRUE);
+	ck_assert_str_eq(value, "ok");
+
+	cfg->cache.impl = prev;
+	apr_table_unset(r->subprocess_env, "OIDC_JWT_INTERNAL_NO_COMPRESS");
+}
+END_TEST
+
+/* Use raw file-cache operations so corruption tests can predict and modify the on-disk path. */
+static char *e2e_file_cache_path(request_rec *r, const char *section, const char *key) {
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	return apr_psprintf(r->pool, "%s/mod-auth-openidc-%s-%s", cfg->cache.file_dir, section, key);
+}
+
+static void e2e_file_write_raw(request_rec *r, const char *path, const char *bytes, apr_size_t len) {
+	apr_file_t *fd = NULL;
+	apr_size_t written = 0;
+	ck_assert_int_eq(apr_file_open(&fd, path, APR_FOPEN_WRITE | APR_FOPEN_CREATE | APR_FOPEN_TRUNCATE,
+				       APR_FPROT_UREAD | APR_FPROT_UWRITE, r->pool),
+			 APR_SUCCESS);
+	ck_assert_int_eq(apr_file_write_full(fd, bytes, len, &written), APR_SUCCESS);
+	apr_file_close(fd);
+}
+
+static void e2e_file_truncate(request_rec *r, const char *path, apr_off_t len) {
+	apr_file_t *fd = NULL;
+	ck_assert_int_eq(apr_file_open(&fd, path, APR_FOPEN_WRITE, APR_OS_DEFAULT, r->pool), APR_SUCCESS);
+	ck_assert_int_eq(apr_file_trunc(fd, len), APR_SUCCESS);
+	apr_file_close(fd);
+}
+
+/*
+ * a cache file that is shorter than what its header says must be reported as an error rather than
+ * handed back as a short value: the caller would otherwise get a truncated session or state cookie
+ */
+START_TEST(test_cache_file_truncated_entry_is_an_error) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+	const char *value_written = "0123456789";
+	char *value = NULL;
+	apr_finfo_t fi;
+	apr_size_t header_len = 0;
+
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "trunc", value_written, expiry), TRUE);
+
+	/* derive the header length from a real entry rather than from the (private) header struct,
+	 * so this does not have to track its layout: the file is the header plus the NUL-terminated value */
+	const char *path = e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "trunc");
+	ck_assert_int_eq(apr_stat(&fi, path, APR_FINFO_SIZE, r->pool), APR_SUCCESS);
+	header_len = (apr_size_t)fi.size - (_oidc_strlen(value_written) + 1);
+	ck_assert_int_gt((int)header_len, 0);
+
+	/* the header survives but the value behind it is short */
+	e2e_file_truncate(r, path, (apr_off_t)header_len + 1);
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "trunc", &value), FALSE);
+
+	/* the header itself is short */
+	e2e_file_truncate(r, path, 2);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "trunc", &value), FALSE);
+	ck_assert_ptr_null(value);
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+START_TEST(test_cache_file_rejects_oversized_value_length) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+	const char *path = e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "oversized");
+	struct {
+		apr_size_t len;
+		apr_time_t expire;
+	} header = {
+	    .len = (apr_size_t)(16 * 1024 * 1024 + 1),
+	    .expire = apr_time_now() + apr_time_from_sec(60),
+	};
+	char *value = NULL;
+
+	e2e_file_write_raw(r, path, (const char *)&header, sizeof(header));
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "oversized", &value), FALSE);
+	ck_assert_ptr_null(value);
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+/* Expired reads leave the file for the cleaner, avoiding a race with atomic replacement. */
+START_TEST(test_cache_file_expired_entry_left_for_cleaner) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+	char *value = NULL;
+	apr_finfo_t fi;
+
+	/* keep a write from running a cleaning cycle underneath the assertions below */
+	cfg->cache.file_clean_interval = 3600;
+
+	apr_time_t past = apr_time_now() - apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "stale", "stale-value", past), TRUE);
+	const char *path = e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "stale");
+
+	/* the read reports the miss it found ... */
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "stale", &value), TRUE);
+	ck_assert_ptr_null(value);
+	/* ... and leaves the file for the cleaning cycle */
+	ck_assert_int_eq(apr_stat(&fi, path, APR_FINFO_TYPE, r->pool), APR_SUCCESS);
+
+	/* the regression this pins: an entry freshly written for the same key survives, instead of
+	 * being unlinked by the reader that had just found the previous one expired */
+	apr_time_t future = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "stale", "fresh-value", future), TRUE);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "stale", &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "fresh-value");
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+/*
+ * the cleaning cycle walks the cache directory and has to cope with whatever else is in there:
+ * an entry it cannot open, an entry whose header is unreadable, and files that are not its own
+ */
+START_TEST(test_cache_file_clean_cycle_handles_junk) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+	apr_finfo_t fi;
+
+	/* clean on every write instead of once a minute */
+	cfg->cache.file_clean_interval = 0;
+
+	/* A directory reaches the corrupt-header path but must survive cleaning. */
+	const char *subdir = e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "subdir");
+	ck_assert_int_eq(apr_dir_make(subdir, APR_FPROT_OS_DEFAULT, r->pool), APR_SUCCESS);
+
+	/* a dangling symlink, which is the one shape that cannot be opened at all -- and unlike a
+	 * mode-0000 file it cannot be opened by root either, so this holds however the tests run */
+	const char *dangling = e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "dangling");
+	ck_assert_int_eq(symlink("/nonexistent/target", dangling), 0);
+
+	/* an entry too short to hold a header */
+	const char *corrupt = e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "corrupt");
+	e2e_file_write_raw(r, corrupt, "xx", 2);
+
+	/* and a file that is none of our business */
+	const char *foreign = apr_psprintf(r->pool, "%s/not-ours.txt", cfg->cache.file_dir);
+	e2e_file_write_raw(r, foreign, "leave me alone", 14);
+
+	/* the first write into a fresh directory creates the "last cleaned" marker and runs a cycle */
+	apr_time_t future = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "keep", "keep-value", future), TRUE);
+
+	/* the unreadable entry is gone, the entry just written and the foreign file are not, and the
+	 * directory is left alone rather than being reported as a corrupt entry and removed */
+	ck_assert_int_ne(apr_stat(&fi, corrupt, APR_FINFO_TYPE, r->pool), APR_SUCCESS);
+	ck_assert_int_eq(apr_stat(&fi, foreign, APR_FINFO_TYPE, r->pool), APR_SUCCESS);
+	ck_assert_int_eq(apr_stat(&fi, subdir, APR_FINFO_TYPE, r->pool), APR_SUCCESS);
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "keep", &value), TRUE);
+	ck_assert_str_eq(value, "keep-value");
+
+	/* a second cycle, which unlike the first one runs with entries already in the directory: one
+	 * still valid (kept) and one expired (removed) */
+	ck_assert_int_eq(
+	    oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "stale", "v", apr_time_now() - apr_time_from_sec(60)),
+	    TRUE);
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "keep2", "v2", future), TRUE);
+	ck_assert_int_ne(
+	    apr_stat(&fi, e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "stale"), APR_FINFO_TYPE, r->pool),
+	    APR_SUCCESS);
+	ck_assert_int_eq(
+	    apr_stat(&fi, e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "keep"), APR_FINFO_TYPE, r->pool),
+	    APR_SUCCESS);
+
+	apr_file_remove(dangling, r->pool);
+	apr_dir_remove(subdir, r->pool);
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+/*
+ * a cache directory that cannot be listed must not stop entries from being written: cleaning is
+ * housekeeping, and its failure is logged rather than propagated
+ */
+START_TEST(test_cache_file_clean_cycle_unreadable_dir) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+
+	apr_time_t future = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "before", "v", future), TRUE);
+
+	/* writable and searchable but not listable, so apr_dir_open fails while the write still works.
+	 * NB: running as root defeats the mode bits, in which case this simply exercises a plain
+	 * cleaning cycle instead of the failure -- it does not turn into a false failure */
+	cfg->cache.file_clean_interval = 0;
+	ck_assert_int_eq(apr_file_perms_set(cfg->cache.file_dir, APR_FPROT_UWRITE | APR_FPROT_UEXECUTE), APR_SUCCESS);
+	apr_byte_t rv = oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "after", "v2", future);
+	ck_assert_int_eq(
+	    apr_file_perms_set(cfg->cache.file_dir, APR_FPROT_UREAD | APR_FPROT_UWRITE | APR_FPROT_UEXECUTE),
+	    APR_SUCCESS);
+	ck_assert_int_eq(rv, TRUE);
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "after", &value), TRUE);
+	ck_assert_str_eq(value, "v2");
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+/*
+ * a cache directory that does not exist: neither the "last cleaned" marker nor the entry itself
+ * can be created, and the write has to report that rather than claim the entry was stored
+ */
+START_TEST(test_cache_file_missing_dir_fails_the_write) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+
+	cfg->cache.file_dir = apr_psprintf(r->pool, "%s/does-not-exist", cfg->cache.file_dir);
+
+	apr_time_t future = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "nowhere", "v", future), FALSE);
+
+	/* reading from it is an ordinary miss, not an error */
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "nowhere", &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+/*
+ * deleting an entry that is not there, and a write whose atomic rename into place cannot happen
+ */
+START_TEST(test_cache_file_delete_missing_and_rename_failure) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+	apr_finfo_t fi;
+
+	/* deleting an entry that was never written reports success: the caller asked for it to be
+	 * gone, and it is */
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "never-written", NULL, 0), TRUE);
+
+	/* a non-empty directory sitting where the entry should go: the temporary file is written but
+	 * cannot be renamed over it, and the partial file must not be left behind */
+	const char *target = e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "blocked");
+	ck_assert_int_eq(apr_dir_make(target, APR_FPROT_OS_DEFAULT, r->pool), APR_SUCCESS);
+	e2e_file_write_raw(r, apr_psprintf(r->pool, "%s/occupied", target), "x", 1);
+
+	apr_time_t future = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "blocked", "v", future), FALSE);
+	ck_assert_int_eq(apr_stat(&fi, target, APR_FINFO_TYPE, r->pool), APR_SUCCESS);
+
+	apr_file_remove(apr_psprintf(r->pool, "%s/occupied", target), r->pool);
+	apr_dir_remove(target, r->pool);
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+/*
+ * RLIMIT_FSIZE simulates a failed write. Ignore SIGXFSZ so the write fails instead of killing
+ * the process; the set must fail and remove its partial temp file.
+ */
+START_TEST(test_cache_file_short_write_fails_the_set) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cache_t *prev = e2e_switch_to_file_backend(r);
+	struct rlimit saved, tight;
+	void (*saved_handler)(int) = NULL;
+	apr_byte_t rv_header = TRUE, rv_value = TRUE;
+	apr_byte_t limited = FALSE;
+	apr_finfo_t fi;
+	apr_size_t header_len = 0;
+	const char *value_written = "0123456789";
+	apr_time_t future = apr_time_now() + apr_time_from_sec(60);
+
+	/* create the "last cleaned" marker while writing still works, so that the limit below only
+	 * affects the entry being written, and measure the header from a real entry */
+	ck_assert_int_eq(oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "primer", value_written, future), TRUE);
+	ck_assert_int_eq(
+	    apr_stat(&fi, e2e_file_cache_path(r, OIDC_CACHE_SECTION_SESSION, "primer"), APR_FINFO_SIZE, r->pool),
+	    APR_SUCCESS);
+	header_len = (apr_size_t)fi.size - (_oidc_strlen(value_written) + 1);
+
+	ck_assert_int_eq(getrlimit(RLIMIT_FSIZE, &saved), 0);
+	saved_handler = signal(SIGXFSZ, SIG_IGN);
+
+	tight = saved;
+	tight.rlim_cur = header_len / 2; /* the header write itself cannot complete */
+	if (setrlimit(RLIMIT_FSIZE, &tight) == 0) {
+		limited = TRUE;
+		rv_header = oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "toobig-header", value_written, future);
+		/* room for the header but not for the value behind it */
+		tight.rlim_cur = header_len + 1;
+		setrlimit(RLIMIT_FSIZE, &tight);
+		rv_value = oidc_cache_file.set(r, OIDC_CACHE_SECTION_SESSION, "toobig-value", value_written, future);
+		setrlimit(RLIMIT_FSIZE, &saved);
+	}
+	signal(SIGXFSZ, saved_handler);
+
+	/* asserted only once the limit is back: libcheck's CK_FORK=no mode (which the valgrind runs
+	 * use) shares this process, so a failed assertion inside the limited region would leave the
+	 * rest of the run unable to write */
+	if (limited == FALSE)
+		return;
+	ck_assert_int_eq(rv_header, FALSE);
+	ck_assert_int_eq(rv_value, FALSE);
+
+	/* neither attempt stored anything readable, and neither left a temporary file behind */
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "toobig-header", &value), TRUE);
+	ck_assert_ptr_null(value);
+	ck_assert_int_eq(oidc_cache_file.get(r, OIDC_CACHE_SECTION_SESSION, "toobig-value", &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	e2e_restore_cache_backend(prev);
+}
+END_TEST
+
+#ifdef USE_LIBHIREDIS
+
+/*
+ * Offline Redis tests inject connection and command operations. Mock replies use heap allocation
+ * because hiredis releases them with freeReplyObject().
+ */
+
+typedef struct redis_mock_state_t {
+	int connect_calls;
+	int command_calls;
+	int disconnect_calls;
+	int connect_fail_times; /* connect returns APR_EGENERAL this many times, then APR_SUCCESS */
+	int error_first_n;	/* command returns an ERROR reply for the first n calls */
+	int return_null;	/* command returns a NULL reply */
+	int reply_type;		/* type of the success reply (REDIS_REPLY_*) */
+	const char *reply_str;	/* string payload of the success reply (may be NULL) */
+	int force_len;		/* if >= 0, override reply->len to simulate a length mismatch */
+	char *last_format;	/* the format string passed to the most recent command */
+} redis_mock_state_t;
+
+static redis_mock_state_t redis_mock;
+
+static void redis_mock_reset(void) {
+	memset(&redis_mock, 0, sizeof(redis_mock));
+	redis_mock.reply_type = REDIS_REPLY_STRING;
+	redis_mock.force_len = -1;
+}
+
+static redisReply *redis_mock_make_reply(int type, const char *str, int force_len) {
+	redisReply *reply = calloc(1, sizeof(redisReply));
+	reply->type = type;
+	if (str != NULL) {
+		reply->str = strdup(str);
+		reply->len = (force_len >= 0) ? (size_t)force_len : strlen(str);
+	} else {
+		reply->len = (force_len >= 0) ? (size_t)force_len : 0;
+	}
+	return reply;
+}
+
+static apr_status_t redis_mock_connect(request_rec *r, oidc_cache_cfg_redis_t *context) {
+	(void)r;
+	(void)context;
+	redis_mock.connect_calls++;
+	if (redis_mock.connect_fail_times > 0) {
+		redis_mock.connect_fail_times--;
+		return APR_EGENERAL;
+	}
+	return APR_SUCCESS;
+}
+
+static redisReply *redis_mock_command(request_rec *r, oidc_cache_cfg_redis_t *context, char **errstr,
+				      const char *format, va_list ap) {
+	(void)context;
+	(void)ap;
+	redis_mock.command_calls++;
+	redis_mock.last_format = apr_pstrdup(r->pool, format);
+	*errstr = apr_pstrdup(r->pool, "mock");
+	if (redis_mock.error_first_n > 0) {
+		redis_mock.error_first_n--;
+		return redis_mock_make_reply(REDIS_REPLY_ERROR, "mock error", -1);
+	}
+	if (redis_mock.return_null)
+		return NULL;
+	return redis_mock_make_reply(redis_mock.reply_type, redis_mock.reply_str, redis_mock.force_len);
+}
+
+static apr_status_t redis_mock_disconnect(oidc_cache_cfg_redis_t *context) {
+	redis_mock.disconnect_calls++;
+	context->rctx = NULL;
+	return APR_SUCCESS;
+}
+
+static oidc_cache_t *redis_mock_prev_impl;
+static void *redis_mock_prev_cfg;
+
+/* swap in the redis backend with a fresh, mutex-initialized context and mock operations */
+static oidc_cache_cfg_redis_t *redis_mock_install(request_rec *r) {
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	redis_mock_prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	redis_mock_prev_cfg = cfg->cache.cfg;
+
+	/* a non-NULL server makes oidc_cache_redis_post_config validation pass */
+	cfg->cache.redis_server = "localhost:6379";
+	cfg->cache.cfg = NULL;
+
+	ck_assert_int_eq(oidc_cache_redis_post_config(r->server->process->pconf, r->server, cfg, "redis"), OK);
+
+	oidc_cache_cfg_redis_t *context = (oidc_cache_cfg_redis_t *)cfg->cache.cfg;
+	ck_assert_ptr_nonnull(context);
+	/* the host:port parse and operation pointers are wired up by the static post_config_impl;
+	 * here we supply them (and mocks) directly */
+	context->host_str = "localhost";
+	context->port = 6379;
+	context->connect = redis_mock_connect;
+	context->command = redis_mock_command;
+	context->disconnect = redis_mock_disconnect;
+
+	cfg->cache.impl = &oidc_cache_redis;
+
+	/* keep the reconnect retry loop fast and deterministic */
+	apr_table_set(r->subprocess_env, "OIDC_REDIS_MAX_TRIES", "2");
+	apr_table_set(r->subprocess_env, "OIDC_REDIS_RETRY_INTERVAL", "1");
+
+	redis_mock_reset();
+
+	return context;
+}
+
+static void redis_mock_restore(request_rec *r) {
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	/* exercise the destroy path: locks, mock disconnect, mutex destroy */
+	if ((cfg->cache.impl != NULL) && (cfg->cache.impl->destroy != NULL))
+		cfg->cache.impl->destroy(r->server->process->pconf, r->server);
+	cfg->cache.impl = redis_mock_prev_impl;
+	cfg->cache.cfg = redis_mock_prev_cfg;
+	apr_table_unset(r->subprocess_env, "OIDC_REDIS_MAX_TRIES");
+	apr_table_unset(r->subprocess_env, "OIDC_REDIS_RETRY_INTERVAL");
+}
+
+/*
+ * credentials that an OIDCRedisCacheServer value may carry per server must never reach the log:
+ * everything up to the last '@' of each comma-separated tuple is replaced by a placeholder
+ */
+START_TEST(test_cache_redis_redact) {
+	request_rec *r = oidc_test_request_get();
+	apr_pool_t *pool = r->pool;
+
+	ck_assert_ptr_null(oidc_cache_redis_redact(pool, NULL));
+	ck_assert_str_eq(oidc_cache_redis_redact(pool, ""), "");
+
+	/* no credentials: passed through unchanged */
+	ck_assert_str_eq(oidc_cache_redis_redact(pool, "redis1:6379"), "redis1:6379");
+	ck_assert_str_eq(oidc_cache_redis_redact(pool, "redis1:6379,redis2:6380"), "redis1:6379,redis2:6380");
+
+	/* credentials on one or on every tuple */
+	ck_assert_str_eq(oidc_cache_redis_redact(pool, "u1:p1@redis1:6379"), "<credentials>@redis1:6379");
+	ck_assert_str_eq(oidc_cache_redis_redact(pool, "u1:p1@redis1:6379,redis2:6380"),
+			 "<credentials>@redis1:6379,redis2:6380");
+	ck_assert_str_eq(oidc_cache_redis_redact(pool, "u1:p1@redis1:6379,u2:p2@redis2:6380"),
+			 "<credentials>@redis1:6379,<credentials>@redis2:6380");
+
+	/* a password may itself contain ':' and '@': the last '@' of the tuple delimits it */
+	ck_assert_str_eq(oidc_cache_redis_redact(pool, "u:p@ss:w@rd@redis1:6379"), "<credentials>@redis1:6379");
+
+	/* an unparseable value is redacted too: that is exactly when it gets logged */
+	ck_assert_str_eq(oidc_cache_redis_redact(pool, "u1:p1@redis1"), "<credentials>@redis1");
+}
+END_TEST
+
+START_TEST(test_cache_redis_post_config_no_server) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	void *prev_cfg = cfg->cache.cfg;
+	char *prev_server = cfg->cache.redis_server;
+
+	/* no OIDCRedisCacheServer configured => post_config must fail */
+	cfg->cache.redis_server = NULL;
+	cfg->cache.cfg = NULL;
+	ck_assert_int_eq(oidc_cache_redis_post_config(r->server->process->pconf, r->server, cfg, "redis"),
+			 HTTP_INTERNAL_SERVER_ERROR);
+
+	cfg->cache.impl = prev_impl;
+	cfg->cache.cfg = prev_cfg;
+	cfg->cache.redis_server = prev_server;
+}
+END_TEST
+
+START_TEST(test_cache_redis_post_config_success) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	void *prev_cfg = cfg->cache.cfg;
+	char *prev_server = cfg->cache.redis_server;
+
+	cfg->cache.redis_server = "localhost:6379";
+	cfg->cache.cfg = NULL;
+	ck_assert_int_eq(oidc_cache_redis_post_config(r->server->process->pconf, r->server, cfg, "redis"), OK);
+
+	oidc_cache_cfg_redis_t *context = (oidc_cache_cfg_redis_t *)cfg->cache.cfg;
+	ck_assert_ptr_nonnull(context);
+	ck_assert_ptr_nonnull(context->mutex);
+	/* defaults installed by the cfg-create step (no directives set) */
+	ck_assert_int_eq(context->database, -1);
+	ck_assert_int_eq(context->keepalive, -1);
+
+	/* the public post_config does not wire up the operation pointers, so destroy the
+	 * mutex directly rather than via the backend destroy (which would call disconnect) */
+	oidc_cache_mutex_destroy(r->server, context->mutex);
+	cfg->cache.impl = prev_impl;
+	cfg->cache.cfg = prev_cfg;
+	cfg->cache.redis_server = prev_server;
+}
+END_TEST
+
+START_TEST(test_cache_redis_get_hit) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.reply_type = REDIS_REPLY_STRING;
+	redis_mock.reply_str = "v1";
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "k1", &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "v1");
+	ck_assert_int_eq(redis_mock.command_calls, 1);
+	ck_assert_int_eq(strncmp(redis_mock.last_format, "GET ", 4), 0);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_get_miss) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.reply_type = REDIS_REPLY_NIL;
+
+	char *value = NULL;
+	/* a NIL reply is a normal cache miss: TRUE with *value left NULL */
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "k1", &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_get_len_mismatch) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.reply_type = REDIS_REPLY_STRING;
+	redis_mock.reply_str = "abc";
+	redis_mock.force_len = 2; /* len != strlen("abc") */
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "k1", &value), FALSE);
+	ck_assert_ptr_null(value);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_get_wrong_type) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.reply_type = REDIS_REPLY_INTEGER; /* not a string and not NIL */
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "k1", &value), FALSE);
+	ck_assert_ptr_null(value);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_get_connect_failure) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.connect_fail_times = 5; /* exceeds OIDC_REDIS_MAX_TRIES */
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "k1", &value), FALSE);
+	/* connect attempted on every retry; command never reached */
+	ck_assert_int_eq(redis_mock.connect_calls, 2);
+	ck_assert_int_eq(redis_mock.command_calls, 0);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_get_error_then_recover) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.error_first_n = 1; /* first command errors, forcing a reconnect+retry */
+	redis_mock.reply_type = REDIS_REPLY_STRING;
+	redis_mock.reply_str = "ok";
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "k1", &value), TRUE);
+	ck_assert_str_eq(value, "ok");
+	ck_assert_int_eq(redis_mock.command_calls, 2);
+	ck_assert_int_ge(redis_mock.disconnect_calls, 1);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_get_null_reply) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.return_null = 1; /* command keeps returning NULL */
+
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "k1", &value), FALSE);
+	ck_assert_int_eq(redis_mock.command_calls, 2);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_set_value) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.reply_type = REDIS_REPLY_STATUS;
+	redis_mock.reply_str = "OK";
+
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, "k1", "v1", expiry), TRUE);
+	ck_assert_int_eq(strncmp(redis_mock.last_format, "SET ", 4), 0);
+	ck_assert_ptr_nonnull(strstr(redis_mock.last_format, "EX"));
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_set_delete) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.reply_type = REDIS_REPLY_INTEGER; /* DEL returns the number of keys removed */
+
+	/* a NULL value triggers a DEL */
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, "k1", NULL, 0), TRUE);
+	ck_assert_int_eq(strncmp(redis_mock.last_format, "DEL ", 4), 0);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_set_error) {
+	request_rec *r = oidc_test_request_get();
+	redis_mock_install(r);
+	redis_mock.error_first_n = 5; /* every attempt errors */
+
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, "k1", "v1", expiry), FALSE);
+
+	redis_mock_restore(r);
+}
+END_TEST
+
+START_TEST(test_cache_redis_helpers_short_circuit) {
+	request_rec *r = oidc_test_request_get();
+
+	/* keepalive == 0: returns TRUE without touching the (NULL) context */
+	ck_assert_int_eq(oidc_cache_redis_set_keepalive(r, NULL, 0), TRUE);
+	/* no password: AUTH skipped, returns TRUE */
+	ck_assert_int_eq(oidc_cache_redis_set_auth(r, NULL, NULL, NULL), TRUE);
+	/* database == -1: SELECT skipped, returns TRUE */
+	ck_assert_int_eq(oidc_cache_redis_set_database(r, NULL, -1), TRUE);
+	/* disconnect is a safe no-op on a NULL context */
+	ck_assert_int_eq((int)oidc_cache_redis_disconnect(NULL), (int)APR_SUCCESS);
+}
+END_TEST
+
+/*
+ * Exercise raw Redis operations against OIDC_TEST_REDIS_SERVER. This test is registered only
+ * when that variable is set; wrapper encryption and compression are covered elsewhere.
+ */
+START_TEST(test_cache_redis_live_roundtrip) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	void *prev_cfg = cfg->cache.cfg;
+	char *prev_server = cfg->cache.redis_server;
+
+	/* wire the real backend ops against the live server (host:port parsed here) */
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_pstrdup(r->pool, getenv("OIDC_TEST_REDIS_SERVER"));
+	cfg->cache.impl = &oidc_cache_redis;
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server), OK);
+
+	/* the per-child initialization sets up the child's view of the global mutex */
+	ck_assert_int_eq(oidc_cache_redis_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+
+	/* a key unique to this run so repeated CI runs against a persistent server don't collide */
+	char *key = apr_psprintf(r->pool, "live-%" APR_TIME_T_FMT, apr_time_now());
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	char *value = NULL;
+
+	/* a key that was never set is a normal miss: TRUE with *value left NULL */
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	/* set then get returns the stored value */
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, "live-v1", expiry), TRUE);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "live-v1");
+
+	/* overwrite replaces the value */
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, "live-v2", expiry), TRUE);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_str_eq(value, "live-v2");
+
+	/* a NULL value deletes the entry; the next get is a miss */
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, NULL, 0), TRUE);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	/* tear down the live connection + mutex, then restore the fixture's backend */
+	oidc_cache_redis.destroy(r->server->process->pconf, r->server);
+	cfg->cache.impl = prev_impl;
+	cfg->cache.cfg = prev_cfg;
+	cfg->cache.redis_server = prev_server;
+}
+END_TEST
+
+/* drive the raw connection helpers (connect/keepalive/AUTH/SELECT) against the live
+ * server; these are wired into the (re)connect path but their error and option arms
+ * never fire in the plain round-trip above */
+START_TEST(test_cache_redis_live_connection_helpers) {
+	request_rec *r = oidc_test_request_get();
+	char *server = apr_pstrdup(r->pool, getenv("OIDC_TEST_REDIS_SERVER"));
+	char *host = server;
+	int port = 6379;
+	char *p = strrchr(server, ':');
+	if (p != NULL) {
+		*p = '\0';
+		port = atoi(p + 1);
+	}
+	struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+
+	/* a connect to a dead port fails and returns NULL */
+	ck_assert_ptr_null(oidc_cache_redis_connect_with_timeout(r, "127.0.0.1", 1, tv, tv, "dead"));
+
+	/* connect to the live server */
+	redisContext *rctx = oidc_cache_redis_connect_with_timeout(r, host, port, tv, tv, "live");
+	ck_assert_ptr_nonnull(rctx);
+
+	/* keepalive: both the default-interval and explicit-interval arms */
+	ck_assert_int_eq(oidc_cache_redis_set_keepalive(r, rctx, -1), TRUE);
+	ck_assert_int_eq(oidc_cache_redis_set_keepalive(r, rctx, 30), TRUE);
+
+	/* AUTH against a server without authentication configured errors out, with and
+	 * without a username; a NULL password skips authentication altogether */
+	ck_assert_int_eq(oidc_cache_redis_set_auth(r, rctx, NULL, NULL), TRUE);
+	ck_assert_int_eq(oidc_cache_redis_set_auth(r, rctx, NULL, "not-the-password"), FALSE);
+	ck_assert_int_eq(oidc_cache_redis_set_auth(r, rctx, "someuser", "not-the-password"), FALSE);
+
+	/* SELECT: the explicit-database arm, the unset (-1) skip and an out-of-range error */
+	ck_assert_int_eq(oidc_cache_redis_set_database(r, rctx, -1), TRUE);
+	ck_assert_int_eq(oidc_cache_redis_set_database(r, rctx, 2), TRUE);
+	ck_assert_int_eq(oidc_cache_redis_set_database(r, rctx, 999999), FALSE);
+
+	redisFree(rctx);
+}
+END_TEST
+
+/* all the optional OIDCRedisCache* settings propagated into the connection: username +
+ * password (the default redis user is "nopass" so any password authenticates), database
+ * selection, connect/request timeouts and the keepalive interval */
+START_TEST(test_cache_redis_live_config_options) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	void *prev_cfg = cfg->cache.cfg;
+	char *prev_server = cfg->cache.redis_server;
+
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_pstrdup(r->pool, getenv("OIDC_TEST_REDIS_SERVER"));
+	cfg->cache.redis_username = apr_pstrdup(r->pool, "default");
+	cfg->cache.redis_password = apr_pstrdup(r->pool, "any-password-works-for-nopass");
+	cfg->cache.redis_database = 2;
+	cfg->cache.redis_connect_timeout = 3;
+	cfg->cache.redis_timeout = 3;
+	cfg->cache.redis_keepalive = 30;
+	cfg->cache.impl = &oidc_cache_redis;
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server), OK);
+	ck_assert_int_eq(oidc_cache_redis_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+
+	char *key = apr_psprintf(r->pool, "live-opts-%" APR_TIME_T_FMT, apr_time_now());
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, "opts-v1", expiry), TRUE);
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "opts-v1");
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, NULL, 0), TRUE);
+
+	oidc_cache_redis.destroy(r->server->process->pconf, r->server);
+	cfg->cache.redis_username = NULL;
+	cfg->cache.redis_password = NULL;
+	cfg->cache.redis_database = OIDC_CONFIG_POS_INT_UNSET;
+	cfg->cache.redis_connect_timeout = OIDC_CONFIG_POS_INT_UNSET;
+	cfg->cache.redis_timeout = OIDC_CONFIG_POS_INT_UNSET;
+	cfg->cache.redis_keepalive = OIDC_CONFIG_POS_INT_UNSET;
+	cfg->cache.impl = prev_impl;
+	cfg->cache.cfg = prev_cfg;
+	cfg->cache.redis_server = prev_server;
+}
+END_TEST
+
+/* OIDCRedisCacheServer values that fail to parse, and one without a port */
+START_TEST(test_cache_redis_live_server_spec) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	void *prev_cfg = cfg->cache.cfg;
+	char *prev_server = cfg->cache.redis_server;
+	cfg->cache.impl = &oidc_cache_redis;
+
+	/* an unparsable address (port out of range) */
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_pstrdup(r->pool, "127.0.0.1:77777");
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server),
+			 HTTP_INTERNAL_SERVER_ERROR);
+
+	/* a port without a hostname */
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_pstrdup(r->pool, ":6379");
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server),
+			 HTTP_INTERNAL_SERVER_ERROR);
+
+	/* an empty server value parses but yields no hostname */
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_pstrdup(r->pool, "");
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server),
+			 HTTP_INTERNAL_SERVER_ERROR);
+
+	/* a database that cannot be selected fails the connection setup */
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_pstrdup(r->pool, getenv("OIDC_TEST_REDIS_SERVER"));
+	cfg->cache.redis_database = 999999;
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server), OK);
+	ck_assert_int_eq(oidc_cache_redis_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+	apr_table_set(r->subprocess_env, "OIDC_REDIS_RETRY_INTERVAL", "10");
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "no-such-db-key", &value), FALSE);
+	oidc_cache_redis.destroy(r->server->process->pconf, r->server);
+	cfg->cache.redis_database = OIDC_CONFIG_POS_INT_UNSET;
+
+	/* a password without a username fails to authenticate against a no-auth server */
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_password = apr_pstrdup(r->pool, "password-on-a-passwordless-server");
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server), OK);
+	ck_assert_int_eq(oidc_cache_redis_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "no-auth-key", &value), FALSE);
+	apr_table_unset(r->subprocess_env, "OIDC_REDIS_RETRY_INTERVAL");
+	oidc_cache_redis.destroy(r->server->process->pconf, r->server);
+	cfg->cache.redis_password = NULL;
+
+	/* a bare hostname gets the default port 6379 (which is where the live server is) */
+	const char *env_server = getenv("OIDC_TEST_REDIS_SERVER");
+	if (_oidc_strstr(env_server, "localhost:6379") == env_server) {
+		cfg->cache.cfg = NULL;
+		cfg->cache.redis_server = apr_pstrdup(r->pool, "localhost");
+		ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server), OK);
+		ck_assert_int_eq(oidc_cache_redis_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+		char *key = apr_psprintf(r->pool, "live-dflt-%" APR_TIME_T_FMT, apr_time_now());
+		ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, "dflt-v1",
+						      apr_time_now() + apr_time_from_sec(60)),
+				 TRUE);
+		oidc_cache_redis.destroy(r->server->process->pconf, r->server);
+	}
+
+	cfg->cache.impl = prev_impl;
+	cfg->cache.cfg = prev_cfg;
+	cfg->cache.redis_server = prev_server;
+}
+END_TEST
+
+/* the legacy shared-connection model: one connection under the process mutex,
+ * reused across calls and torn down via the disconnect hook */
+START_TEST(test_cache_redis_live_legacy_shared_connection) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	void *prev_cfg = cfg->cache.cfg;
+	char *prev_server = cfg->cache.redis_server;
+
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_pstrdup(r->pool, getenv("OIDC_TEST_REDIS_SERVER"));
+	cfg->cache.impl = &oidc_cache_redis;
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server), OK);
+	ck_assert_int_eq(oidc_cache_redis_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+
+	oidc_cache_cfg_redis_t *context = (oidc_cache_cfg_redis_t *)cfg->cache.cfg;
+	context->request_scoped = FALSE;
+
+	char *key = apr_psprintf(r->pool, "live-legacy-%" APR_TIME_T_FMT, apr_time_now());
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	char *value = NULL;
+	/* the first call connects, the second reuses the shared connection */
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, "legacy-v1", expiry), TRUE);
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_str_eq(value, "legacy-v1");
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, NULL, 0), TRUE);
+	ck_assert_ptr_nonnull(context->rctx);
+
+	/* destroy tears the shared connection down through the disconnect hook */
+	oidc_cache_redis.destroy(r->server->process->pconf, r->server);
+	cfg->cache.impl = prev_impl;
+	cfg->cache.cfg = prev_cfg;
+	cfg->cache.redis_server = prev_server;
+}
+END_TEST
+
+/* the request-scoped idle pool: a connection returned at request-pool teardown is
+ * picked up by the next request, and destroy releases any connections still idle */
+START_TEST(test_cache_redis_live_idle_pool) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	void *prev_cfg = cfg->cache.cfg;
+	char *prev_server = cfg->cache.redis_server;
+
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_pstrdup(r->pool, getenv("OIDC_TEST_REDIS_SERVER"));
+	cfg->cache.impl = &oidc_cache_redis;
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server), OK);
+	ck_assert_int_eq(oidc_cache_redis_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+
+	oidc_cache_cfg_redis_t *context = (oidc_cache_cfg_redis_t *)cfg->cache.cfg;
+	char *key = apr_psprintf(r->pool, "live-pool-%" APR_TIME_T_FMT, apr_time_now());
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+
+	/* "request" 1: a shallow request copy with its own pool checks a connection out;
+	 * destroying the pool returns the healthy connection to the idle pool */
+	apr_pool_t *subpool = NULL;
+	ck_assert_int_eq(apr_pool_create(&subpool, r->pool), APR_SUCCESS);
+	request_rec *r2 = apr_pmemdup(subpool, r, sizeof(request_rec));
+	r2->pool = subpool;
+	ck_assert_int_eq(oidc_cache_redis_set(r2, OIDC_CACHE_SECTION_SESSION, key, "pool-v1", expiry), TRUE);
+	apr_pool_destroy(subpool);
+	ck_assert_int_eq(context->idle_num, 1);
+
+	/* "request" 2: the pooled connection is reused rather than a fresh connect */
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_str_eq(value, "pool-v1");
+	ck_assert_int_eq(context->idle_num, 0);
+	ck_assert_int_eq(oidc_cache_redis_set(r, OIDC_CACHE_SECTION_SESSION, key, NULL, 0), TRUE);
+
+	/* leave a connection in the idle pool for destroy to release */
+	ck_assert_int_eq(apr_pool_create(&subpool, r->pool), APR_SUCCESS);
+	request_rec *r3 = apr_pmemdup(subpool, r, sizeof(request_rec));
+	r3->pool = subpool;
+	char *v3 = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r3, OIDC_CACHE_SECTION_SESSION, key, &v3), TRUE);
+	apr_pool_destroy(subpool);
+	ck_assert_int_eq(context->idle_num, 1);
+
+	oidc_cache_redis.destroy(r->server->process->pconf, r->server);
+	cfg->cache.impl = prev_impl;
+	cfg->cache.cfg = prev_cfg;
+	cfg->cache.redis_server = prev_server;
+}
+END_TEST
+
+/* a server that accepts connections but never answers: the command times out and the
+ * connection is torn down; once the listener is gone the reconnect itself fails */
+START_TEST(test_cache_redis_live_half_dead_server) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	oidc_cache_t *prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	void *prev_cfg = cfg->cache.cfg;
+	char *prev_server = cfg->cache.redis_server;
+
+	/* a socket that listens but never accepts/answers */
+	apr_socket_t *sock = NULL;
+	apr_sockaddr_t *sa = NULL;
+	ck_assert_int_eq(apr_sockaddr_info_get(&sa, "127.0.0.1", APR_INET, 0, 0, r->pool), APR_SUCCESS);
+	ck_assert_int_eq(apr_socket_create(&sock, sa->family, SOCK_STREAM, APR_PROTO_TCP, r->pool), APR_SUCCESS);
+	apr_socket_opt_set(sock, APR_SO_REUSEADDR, 1);
+	ck_assert_int_eq(apr_socket_bind(sock, sa), APR_SUCCESS);
+	ck_assert_int_eq(apr_socket_listen(sock, 2), APR_SUCCESS);
+	apr_sockaddr_t *bound = NULL;
+	ck_assert_int_eq(apr_socket_addr_get(&bound, APR_LOCAL, sock), APR_SUCCESS);
+
+	cfg->cache.cfg = NULL;
+	cfg->cache.redis_server = apr_psprintf(r->pool, "127.0.0.1:%d", (int)bound->port);
+	cfg->cache.redis_timeout = 1;
+	cfg->cache.redis_connect_timeout = 1;
+	cfg->cache.impl = &oidc_cache_redis;
+	ck_assert_int_eq(oidc_cache_redis.post_config(r->server->process->pconf, r->server), OK);
+	ck_assert_int_eq(oidc_cache_redis_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+
+	/* the command times out on the accepted-but-mute connection (with an internal retry) */
+	apr_table_set(r->subprocess_env, "OIDC_REDIS_RETRY_INTERVAL", "10");
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "half-dead-key", &value), FALSE);
+
+	/* with the listener gone even the (re)connect fails */
+	apr_socket_close(sock);
+	ck_assert_int_eq(oidc_cache_redis_get(r, OIDC_CACHE_SECTION_SESSION, "half-dead-key", &value), FALSE);
+	apr_table_unset(r->subprocess_env, "OIDC_REDIS_RETRY_INTERVAL");
+
+	oidc_cache_redis.destroy(r->server->process->pconf, r->server);
+	cfg->cache.redis_timeout = OIDC_CONFIG_POS_INT_UNSET;
+	cfg->cache.redis_connect_timeout = OIDC_CONFIG_POS_INT_UNSET;
+	cfg->cache.impl = prev_impl;
+	cfg->cache.cfg = prev_cfg;
+	cfg->cache.redis_server = prev_server;
+}
+END_TEST
+
+/* Reset static Redis mock state for CK_FORK=no runs. */
+static void redis_test_setup(void) {
+	oidc_test_setup();
+	redis_mock_reset();
+}
+
+#endif /* USE_LIBHIREDIS */
+
+#ifdef USE_MEMCACHE
+
+/* Mock add_server to test memcache pool sizing without its eager network connection. */
+
+typedef struct memcache_mock_state_t {
+	int add_calls;	       /* number of times the per-server op was invoked */
+	apr_uint32_t last_min; /* pool sizes seen by the most recent invocation */
+	apr_uint32_t last_smax;
+	apr_uint32_t last_hmax;
+	apr_interval_time_t last_ttl;
+	int fail; /* if non-zero, the add_server op returns HTTP_INTERNAL_SERVER_ERROR */
+
+	/* data-path mock */
+	int get_calls;
+	int set_calls;
+	int delete_calls;
+	int status_calls;
+	apr_status_t getp_rv;	/* return code for the getp op */
+	const char *getp_value; /* value handed back on a getp hit (may be NULL) */
+	int getp_len;		/* override the returned length; < 0 means strlen(getp_value) */
+	apr_byte_t status_rv;	/* return code for the status op */
+	apr_status_t set_rv;	/* return code for the set op */
+	apr_status_t delete_rv; /* return code for the delete op */
+	const char *last_key;	/* key seen by the most recent data-path op */
+	const char *last_value; /* value seen by the most recent set op */
+} memcache_mock_state_t;
+
+static memcache_mock_state_t memcache_mock;
+
+static void memcache_mock_reset(void) {
+	memset(&memcache_mock, 0, sizeof(memcache_mock));
+	memcache_mock.getp_len = -1;
+}
+
+/* mock per-server op: records the pool sizes, never connects */
+static int memcache_mock_add_server(server_rec *s, apr_pool_t *p, struct oidc_cache_cfg_memcache_t *context,
+				    char *split, apr_uint32_t min, apr_uint32_t smax, apr_uint32_t hmax,
+				    apr_interval_time_t ttl) {
+	(void)s;
+	(void)p;
+	(void)context;
+	(void)split;
+	memcache_mock.add_calls++;
+	memcache_mock.last_min = min;
+	memcache_mock.last_smax = smax;
+	memcache_mock.last_hmax = hmax;
+	memcache_mock.last_ttl = ttl;
+	return memcache_mock.fail ? HTTP_INTERNAL_SERVER_ERROR : OK;
+}
+
+/* mock data-path ops: fabricate results without a live memcached */
+static apr_status_t memcache_mock_getp(struct oidc_cache_cfg_memcache_t *context, apr_pool_t *p, const char *key,
+				       char **baton, apr_size_t *len) {
+	(void)context;
+	memcache_mock.get_calls++;
+	memcache_mock.last_key = key;
+	if (memcache_mock.getp_rv == APR_SUCCESS) {
+		*baton = memcache_mock.getp_value ? apr_pstrdup(p, memcache_mock.getp_value) : NULL;
+		*len = (memcache_mock.getp_len >= 0)
+			   ? (apr_size_t)memcache_mock.getp_len
+			   : (memcache_mock.getp_value ? strlen(memcache_mock.getp_value) : 0);
+	}
+	return memcache_mock.getp_rv;
+}
+
+static apr_status_t memcache_mock_set(struct oidc_cache_cfg_memcache_t *context, const char *key, char *baton,
+				      apr_size_t len, apr_uint32_t timeout) {
+	(void)context;
+	(void)len;
+	(void)timeout;
+	memcache_mock.set_calls++;
+	memcache_mock.last_key = key;
+	memcache_mock.last_value = baton;
+	return memcache_mock.set_rv;
+}
+
+static apr_status_t memcache_mock_delete(struct oidc_cache_cfg_memcache_t *context, const char *key) {
+	(void)context;
+	memcache_mock.delete_calls++;
+	memcache_mock.last_key = key;
+	return memcache_mock.delete_rv;
+}
+
+static apr_byte_t memcache_mock_status(const struct oidc_cache_cfg_memcache_t *context) {
+	(void)context;
+	memcache_mock.status_calls++;
+	return memcache_mock.status_rv;
+}
+
+static oidc_cache_t *memcache_prev_impl;
+static void *memcache_prev_cfg;
+static char *memcache_prev_servers;
+static int memcache_prev_min;
+static int memcache_prev_smax;
+static int memcache_prev_hmax;
+
+static void memcache_save(oidc_cfg_t *cfg) {
+	memcache_prev_impl = (oidc_cache_t *)cfg->cache.impl;
+	memcache_prev_cfg = cfg->cache.cfg;
+	memcache_prev_servers = cfg->cache.memcache_servers;
+	memcache_prev_min = cfg->cache.memcache_min;
+	memcache_prev_smax = cfg->cache.memcache_smax;
+	memcache_prev_hmax = cfg->cache.memcache_hmax;
+	/* force post_config to run rather than short-circuit on an existing context */
+	cfg->cache.cfg = NULL;
+	memcache_mock_reset();
+}
+
+static void memcache_restore(oidc_cfg_t *cfg) {
+	cfg->cache.impl = memcache_prev_impl;
+	cfg->cache.cfg = memcache_prev_cfg;
+	cfg->cache.memcache_servers = memcache_prev_servers;
+	cfg->cache.memcache_min = memcache_prev_min;
+	cfg->cache.memcache_smax = memcache_prev_smax;
+	cfg->cache.memcache_hmax = memcache_prev_hmax;
+}
+
+/*
+ * run the offline post_config path: validate + size the pool (no connection), then run the
+ * add-server loop with the mock op swapped in so no real server is created
+ */
+static oidc_cache_cfg_memcache_t *memcache_mock_run(request_rec *r, oidc_cfg_t *cfg) {
+	ck_assert_int_eq(oidc_cache_memcache_post_config(r->server->process->pconf, r->server, cfg), OK);
+	oidc_cache_cfg_memcache_t *context = (oidc_cache_cfg_memcache_t *)cfg->cache.cfg;
+	ck_assert_ptr_nonnull(context);
+	context->add_server = memcache_mock_add_server;
+	ck_assert_int_eq(oidc_cache_memcache_add_servers(r->server->process->pconf, r->server, cfg, context), OK);
+	return context;
+}
+
+/*
+ * build a context (no connection) and swap in the data-path mock ops so get/set can be exercised
+ * offline against fabricated apr_memcache results
+ */
+static oidc_cache_cfg_memcache_t *memcache_mock_install(request_rec *r, oidc_cfg_t *cfg) {
+	cfg->cache.memcache_servers = "127.0.0.1:11211";
+	ck_assert_int_eq(oidc_cache_memcache_post_config(r->server->process->pconf, r->server, cfg), OK);
+	oidc_cache_cfg_memcache_t *context = (oidc_cache_cfg_memcache_t *)cfg->cache.cfg;
+	ck_assert_ptr_nonnull(context);
+	context->getp = memcache_mock_getp;
+	context->set = memcache_mock_set;
+	context->del = memcache_mock_delete;
+	context->status = memcache_mock_status;
+	return context;
+}
+
+START_TEST(test_cache_memcache_post_config_no_servers) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+
+	/* no OIDCMemCacheServers configured => post_config must fail */
+	cfg->cache.memcache_servers = NULL;
+	ck_assert_int_eq(oidc_cache_memcache_post_config(r->server->process->pconf, r->server, cfg),
+			 HTTP_INTERNAL_SERVER_ERROR);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_post_config_single_server) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+
+	cfg->cache.memcache_servers = "127.0.0.1:11211";
+	memcache_mock_run(r, cfg);
+	ck_assert_int_eq(memcache_mock.add_calls, 1);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_post_config_multi_server) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+
+	/* two servers exercise the server-counting and add-server loops */
+	cfg->cache.memcache_servers = "127.0.0.1:11211 127.0.0.1:11212";
+	memcache_mock_run(r, cfg);
+	ck_assert_int_eq(memcache_mock.add_calls, 2);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_post_config_pool_clamp) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+
+	/* smax > hmax and min > smax exercise both connection-pool clamp branches */
+	cfg->cache.memcache_servers = "127.0.0.1:11211";
+	cfg->cache.memcache_hmax = 5;
+	cfg->cache.memcache_smax = 10;
+	cfg->cache.memcache_min = 8;
+	oidc_cache_cfg_memcache_t *context = memcache_mock_run(r, cfg);
+
+	/* both branches clamp down to hmax, so min == smax == hmax == 5 */
+	ck_assert_int_eq(context->hmax, 5);
+	ck_assert_int_eq(context->smax, 5);
+	ck_assert_int_eq(context->min, 5);
+	ck_assert_int_eq(memcache_mock.add_calls, 1);
+	ck_assert_int_eq(memcache_mock.last_hmax, 5);
+	ck_assert_int_eq(memcache_mock.last_smax, 5);
+	ck_assert_int_eq(memcache_mock.last_min, 5);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_get_hit) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+	memcache_mock_install(r, cfg);
+
+	memcache_mock.getp_rv = APR_SUCCESS;
+	memcache_mock.getp_value = "v1";
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_memcache_get(r, OIDC_CACHE_SECTION_SESSION, "k1", &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "v1");
+	ck_assert_int_eq(memcache_mock.get_calls, 1);
+	/* the section/key are combined and hashed into the lookup key */
+	char *expected_key = NULL;
+	ck_assert_int_eq(
+	    oidc_util_hash_string_and_base64url_encode(r, "sha256", OIDC_CACHE_SECTION_SESSION ":k1", &expected_key),
+	    TRUE);
+	ck_assert_str_eq(memcache_mock.last_key, expected_key);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_get_miss_alive) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+	memcache_mock_install(r, cfg);
+
+	/* a genuine miss: not found, but at least one server is alive => OK with NULL value */
+	memcache_mock.getp_rv = APR_NOTFOUND;
+	memcache_mock.status_rv = TRUE;
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_memcache_get(r, OIDC_CACHE_SECTION_SESSION, "k", &value), TRUE);
+	ck_assert_ptr_null(value);
+	ck_assert_int_eq(memcache_mock.status_calls, 1);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_get_miss_all_dead) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+	memcache_mock_install(r, cfg);
+
+	/* not found and all servers dead => treated as an error (FALSE) */
+	memcache_mock.getp_rv = APR_NOTFOUND;
+	memcache_mock.status_rv = FALSE;
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_memcache_get(r, OIDC_CACHE_SECTION_SESSION, "k", &value), FALSE);
+	ck_assert_int_eq(memcache_mock.status_calls, 1);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_get_error) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+	memcache_mock_install(r, cfg);
+
+	/* a hard error from the server => FALSE */
+	memcache_mock.getp_rv = APR_EGENERAL;
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_memcache_get(r, OIDC_CACHE_SECTION_SESSION, "k", &value), FALSE);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_get_len_mismatch) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+	memcache_mock_install(r, cfg);
+
+	/* a returned length that disagrees with the string length => FALSE */
+	memcache_mock.getp_rv = APR_SUCCESS;
+	memcache_mock.getp_value = "hello";
+	memcache_mock.getp_len = 3;
+	char *value = NULL;
+	ck_assert_int_eq(oidc_cache_memcache_get(r, OIDC_CACHE_SECTION_SESSION, "k", &value), FALSE);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_set_value) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+	memcache_mock_install(r, cfg);
+
+	memcache_mock.set_rv = APR_SUCCESS;
+	ck_assert_int_eq(oidc_cache_memcache_set(r, OIDC_CACHE_SECTION_SESSION, "k", "v", apr_time_now()), TRUE);
+	ck_assert_int_eq(memcache_mock.set_calls, 1);
+	ck_assert_str_eq(memcache_mock.last_value, "v");
+	/* the section/key are combined and hashed into the lookup key */
+	char *expected_key = NULL;
+	ck_assert_int_eq(
+	    oidc_util_hash_string_and_base64url_encode(r, "sha256", OIDC_CACHE_SECTION_SESSION ":k", &expected_key),
+	    TRUE);
+	ck_assert_str_eq(memcache_mock.last_key, expected_key);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_set_error) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+	memcache_mock_install(r, cfg);
+
+	memcache_mock.set_rv = APR_EGENERAL;
+	ck_assert_int_eq(oidc_cache_memcache_set(r, OIDC_CACHE_SECTION_SESSION, "k", "v", apr_time_now()), FALSE);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+START_TEST(test_cache_memcache_set_delete) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg);
+	memcache_mock_install(r, cfg);
+
+	/* a NULL value clears the entry; APR_NOTFOUND on delete is treated as success */
+	memcache_mock.delete_rv = APR_NOTFOUND;
+	ck_assert_int_eq(oidc_cache_memcache_set(r, OIDC_CACHE_SECTION_SESSION, "k", NULL, 0), TRUE);
+	ck_assert_int_eq(memcache_mock.delete_calls, 1);
+
+	/* a successful delete is also success */
+	memcache_mock.delete_rv = APR_SUCCESS;
+	ck_assert_int_eq(oidc_cache_memcache_set(r, OIDC_CACHE_SECTION_SESSION, "k", NULL, 0), TRUE);
+
+	/* a hard error on delete => FALSE */
+	memcache_mock.delete_rv = APR_EGENERAL;
+	ck_assert_int_eq(oidc_cache_memcache_set(r, OIDC_CACHE_SECTION_SESSION, "k", NULL, 0), FALSE);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+/* Exercise real memcache operations when OIDC_TEST_MEMCACHE_SERVER is configured. */
+START_TEST(test_cache_memcache_live_roundtrip) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	memcache_save(cfg); /* saves impl/cfg/servers/pool sizes and nulls cfg->cache.cfg */
+
+	cfg->cache.memcache_servers = apr_pstrdup(r->pool, getenv("OIDC_TEST_MEMCACHE_SERVER"));
+	cfg->cache.impl = &oidc_cache_memcache;
+	ck_assert_int_eq(oidc_cache_memcache.post_config(r->server->process->pconf, r->server), OK);
+
+	/* a key unique to this run so repeated CI runs against a persistent server don't collide */
+	char *key = apr_psprintf(r->pool, "live-%" APR_TIME_T_FMT, apr_time_now());
+	apr_time_t expiry = apr_time_now() + apr_time_from_sec(60);
+	char *value = NULL;
+
+	/* set then get returns the stored value */
+	ck_assert_int_eq(oidc_cache_memcache_set(r, OIDC_CACHE_SECTION_SESSION, key, "live-v1", expiry), TRUE);
+	ck_assert_int_eq(oidc_cache_memcache_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_ptr_nonnull(value);
+	ck_assert_str_eq(value, "live-v1");
+
+	/* overwrite replaces the value */
+	ck_assert_int_eq(oidc_cache_memcache_set(r, OIDC_CACHE_SECTION_SESSION, key, "live-v2", expiry), TRUE);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_memcache_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_str_eq(value, "live-v2");
+
+	/* a NULL value deletes the entry; the next get is a miss (server still alive => TRUE/NULL) */
+	ck_assert_int_eq(oidc_cache_memcache_set(r, OIDC_CACHE_SECTION_SESSION, key, NULL, 0), TRUE);
+	value = NULL;
+	ck_assert_int_eq(oidc_cache_memcache_get(r, OIDC_CACHE_SECTION_SESSION, key, &value), TRUE);
+	ck_assert_ptr_null(value);
+
+	memcache_restore(cfg);
+}
+END_TEST
+
+/* reset the memcache mock per test; see redis_test_setup for the rationale */
+static void memcache_test_setup(void) {
+	oidc_test_setup();
+	memcache_mock_reset();
+}
+
+#endif /* USE_MEMCACHE */
 
 int main(void) {
 	TCase *core = tcase_create("core");
@@ -492,16 +2435,105 @@ int main(void) {
 	tcase_add_test(core, test_cache_encrypt_no_secret);
 	tcase_add_test(core, test_cache_status2str_success);
 	tcase_add_test(core, test_cache_second_passphrase_retry);
+	tcase_add_test(core, test_cache_shm_eviction_and_delete);
+	tcase_add_test(core, test_cache_shm_churn_never_crosses_keys);
 	tcase_add_test(core, test_cache_shm_get_key_bounds_negative);
+	tcase_add_test(core, test_cache_shm_hash_size_and_value_boundaries);
+	tcase_add_test(core, test_cache_shm_delete_missing_from_full_cache_is_noop);
+	tcase_add_test(core, test_cache_shm_pressure_reclaims_expired_before_live);
+	tcase_add_test(core, test_cache_shm_concurrent_shard_churn);
+#if APR_HAS_FORK
+	tcase_add_test(core, test_cache_shm_multiprocess_churn);
+#endif
 	tcase_add_test(core, test_cache_secret1_empty_secret2_fallback);
 	tcase_add_test(core, test_cache_backend_true_null_miss);
+	tcase_add_test(core, test_cache_unencrypted_hit_and_long_key);
+	tcase_add_test(core, test_cache_second_passphrase_retry_backend_error);
 	/* compression-enabled permutations */
 	tcase_add_test(core, test_cache_compression_enabled_set_get);
 	tcase_add_test(core, test_cache_compression_enabled_second_passphrase);
 	tcase_add_test(core, test_cache_compression_enabled_empty_secret2_fallback);
 
+	TCase *file = tcase_create("file");
+	tcase_add_checked_fixture(file, oidc_test_setup, oidc_test_teardown);
+	tcase_add_test(file, test_cache_file_set_get_basic);
+	tcase_add_test(file, test_cache_file_miss);
+	tcase_add_test(file, test_cache_file_expired_entry_is_miss);
+	tcase_add_test(file, test_cache_file_overwrite_and_delete);
+	tcase_add_test(file, test_cache_file_default_tmp_dir);
+	tcase_add_test(file, test_cache_file_truncated_entry_is_an_error);
+	tcase_add_test(file, test_cache_file_rejects_oversized_value_length);
+	tcase_add_test(file, test_cache_file_expired_entry_left_for_cleaner);
+	tcase_add_test(file, test_cache_file_clean_cycle_handles_junk);
+	tcase_add_test(file, test_cache_file_clean_cycle_unreadable_dir);
+	tcase_add_test(file, test_cache_file_missing_dir_fails_the_write);
+	tcase_add_test(file, test_cache_file_delete_missing_and_rename_failure);
+	tcase_add_test(file, test_cache_file_short_write_fails_the_set);
+
 	Suite *s = suite_create("cache");
 	suite_add_tcase(s, core);
+	suite_add_tcase(s, file);
+
+#ifdef USE_LIBHIREDIS
+	TCase *redis = tcase_create("redis");
+	tcase_add_checked_fixture(redis, redis_test_setup, oidc_test_teardown);
+	tcase_add_test(redis, test_cache_redis_redact);
+	tcase_add_test(redis, test_cache_redis_post_config_no_server);
+	tcase_add_test(redis, test_cache_redis_post_config_success);
+	tcase_add_test(redis, test_cache_redis_get_hit);
+	tcase_add_test(redis, test_cache_redis_get_miss);
+	tcase_add_test(redis, test_cache_redis_get_len_mismatch);
+	tcase_add_test(redis, test_cache_redis_get_wrong_type);
+	tcase_add_test(redis, test_cache_redis_get_connect_failure);
+	tcase_add_test(redis, test_cache_redis_get_error_then_recover);
+	tcase_add_test(redis, test_cache_redis_get_null_reply);
+	tcase_add_test(redis, test_cache_redis_set_value);
+	tcase_add_test(redis, test_cache_redis_set_delete);
+	tcase_add_test(redis, test_cache_redis_set_error);
+	tcase_add_test(redis, test_cache_redis_helpers_short_circuit);
+	suite_add_tcase(s, redis);
+
+	/* live round-trip against a real redis, only when a server is configured */
+	if (getenv("OIDC_TEST_REDIS_SERVER") != NULL) {
+		TCase *redis_live = tcase_create("redis-live");
+		tcase_add_checked_fixture(redis_live, oidc_test_setup, oidc_test_teardown);
+		tcase_add_test(redis_live, test_cache_redis_live_roundtrip);
+		tcase_add_test(redis_live, test_cache_redis_live_connection_helpers);
+		tcase_add_test(redis_live, test_cache_redis_live_config_options);
+		tcase_add_test(redis_live, test_cache_redis_live_server_spec);
+		tcase_add_test(redis_live, test_cache_redis_live_legacy_shared_connection);
+		tcase_add_test(redis_live, test_cache_redis_live_idle_pool);
+		tcase_add_test(redis_live, test_cache_redis_live_half_dead_server);
+		tcase_set_timeout(redis_live, 30);
+		suite_add_tcase(s, redis_live);
+	}
+#endif
+
+#ifdef USE_MEMCACHE
+	TCase *memcache = tcase_create("memcache");
+	tcase_add_checked_fixture(memcache, memcache_test_setup, oidc_test_teardown);
+	tcase_add_test(memcache, test_cache_memcache_post_config_no_servers);
+	tcase_add_test(memcache, test_cache_memcache_post_config_single_server);
+	tcase_add_test(memcache, test_cache_memcache_post_config_multi_server);
+	tcase_add_test(memcache, test_cache_memcache_post_config_pool_clamp);
+	tcase_add_test(memcache, test_cache_memcache_get_hit);
+	tcase_add_test(memcache, test_cache_memcache_get_miss_alive);
+	tcase_add_test(memcache, test_cache_memcache_get_miss_all_dead);
+	tcase_add_test(memcache, test_cache_memcache_get_error);
+	tcase_add_test(memcache, test_cache_memcache_get_len_mismatch);
+	tcase_add_test(memcache, test_cache_memcache_set_value);
+	tcase_add_test(memcache, test_cache_memcache_set_error);
+	tcase_add_test(memcache, test_cache_memcache_set_delete);
+	suite_add_tcase(s, memcache);
+
+	/* live round-trip against a real memcached, only when a server is configured */
+	if (getenv("OIDC_TEST_MEMCACHE_SERVER") != NULL) {
+		TCase *memcache_live = tcase_create("memcache-live");
+		tcase_add_checked_fixture(memcache_live, memcache_test_setup, oidc_test_teardown);
+		tcase_add_test(memcache_live, test_cache_memcache_live_roundtrip);
+		suite_add_tcase(s, memcache_live);
+	}
+#endif
 
 	return oidc_test_suite_run(s);
 }

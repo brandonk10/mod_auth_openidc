@@ -123,8 +123,17 @@ static apr_byte_t _oidc_util_rand_bytes(request_rec *r, unsigned char *buf, apr_
  * generate a random integer value in the specified modulo range
  */
 unsigned int oidc_util_rand_int(unsigned int mod) {
-	unsigned int v;
-	_oidc_util_rand((unsigned char *)&v, sizeof(v));
+	unsigned int v = 0;
+	unsigned int reject;
+
+	if (mod == 0)
+		return 0;
+	/* reject the short tail [0, 2^N mod `mod`) so v % mod is uniformly distributed */
+	reject = (0u - mod) % mod;
+	do {
+		if (_oidc_util_rand((unsigned char *)&v, sizeof(v)) != TRUE)
+			return 0;
+	} while (v < reject);
 	return v % mod;
 }
 
@@ -137,7 +146,7 @@ apr_byte_t oidc_util_rand_str(request_rec *r, char **str, int len) {
 		oidc_error(r, "_oidc_util_rand_bytes returned an error");
 		return FALSE;
 	}
-	if (oidc_util_base64url_encode(r, str, (const char *)bytes, len, TRUE) <= 0) {
+	if (oidc_util_base64url_encode(r, str, (const char *)bytes, len, OIDC_BASE64URL_PADDING_STRIP) <= 0) {
 		oidc_error(r, "oidc_base64url_encode returned an error");
 		return FALSE;
 	}

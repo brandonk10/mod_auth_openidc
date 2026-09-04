@@ -52,18 +52,6 @@
 #define OIDC_AUTH_TYPE_OPENID_OAUTH20 "oauth20"
 #define OIDC_AUTH_TYPE_OPENID_BOTH "auth-openidc"
 
-/* keys for storing info in the request state */
-#define OIDC_REQUEST_STATE_KEY_AUTHN_POST "a"
-#define OIDC_REQUEST_STATE_KEY_CLAIMS "c"
-#define OIDC_REQUEST_STATE_KEY_DISCOVERY "d"
-#define OIDC_REQUEST_STATE_KEY_HTTP "hp"
-#define OIDC_REQUEST_STATE_KEY_HTML "hl"
-#define OIDC_REQUEST_STATE_KEY_IDTOKEN "i"
-#define OIDC_REQUEST_STATE_KEY_SCOPE "sc"
-#define OIDC_REQUEST_STATE_KEY_AUTHN_PRESERVE "p"
-#define OIDC_REQUEST_STATE_KEY_SAVE "s"
-#define OIDC_REQUEST_STATE_TRACE_ID "t"
-
 /* parameter name of the original method in the discovery response */
 #define OIDC_DISC_RM_PARAM "method"
 
@@ -71,13 +59,12 @@
 #define OIDC_DEFAULT_HEADER_PREFIX "OIDC_"
 
 /* the (global) key for the mod_auth_openidc related state that is stored in the request userdata context */
-#define OIDC_USERDATA_KEY "mod_auth_openidc_state"
 #define OIDC_USERDATA_SESSION "mod_auth_openidc_session"
-#define OIDC_USERDATA_POST_PARAMS_KEY "oidc_userdata_post_params"
 
-#define OIDC_POST_PRESERVE_ESCAPE_NONE 0
-#define OIDC_POST_PRESERVE_ESCAPE_HTML 1
-#define OIDC_POST_PRESERVE_ESCAPE_JAVASCRIPT 2
+typedef enum {
+	OIDC_REDIRECT_URL_ANY_HOST = 0,	 /* allow redirects to other hosts */
+	OIDC_REDIRECT_URL_SAME_HOST = 1, /* restrict redirects to the current host */
+} oidc_redirect_url_scope_t;
 
 /* defines for how long provider metadata will be cached */
 #define OIDC_CACHE_PROVIDER_METADATA_EXPIRY_DEFAULT 86400
@@ -142,29 +129,25 @@ int oidc_check_user_id(request_rec *r);
 int oidc_fixups(request_rec *r);
 apr_byte_t oidc_enabled(request_rec *r, oidc_cfg_t *c);
 
-void oidc_request_state_set(request_rec *r, const char *key, const char *value);
-const char *oidc_request_state_get(request_rec *r, const char *key);
-json_t *oidc_request_state_json_get(request_rec *r, const char *key);
-void oidc_request_state_json_set(request_rec *r, const char *key, json_t *value);
-
 void oidc_scrub_headers(request_rec *r);
 void oidc_strip_cookies(request_rec *r);
+apr_byte_t oidc_subrequest_recycle_user(request_rec *r);
 apr_byte_t oidc_get_remote_user(request_rec *r, const char *claim_name, const char *replace, const char *reg_exp,
-				json_t *json, char **request_user);
-apr_byte_t oidc_get_provider_from_session(request_rec *r, oidc_cfg_t *c, oidc_session_t *session,
+				const oidc_json_t *json, char **request_user);
+apr_byte_t oidc_get_provider_from_session(request_rec *r, oidc_cfg_t *c, const oidc_session_t *session,
 					  oidc_provider_t **provider);
-apr_byte_t oidc_check_cookie_domain(request_rec *r, oidc_cfg_t *cfg, oidc_session_t *session);
-apr_byte_t oidc_session_pass_tokens(request_rec *r, oidc_cfg_t *cfg, oidc_session_t *session, apr_byte_t extend_session,
-				    apr_byte_t *needs_save);
+apr_byte_t oidc_check_cookie_domain(request_rec *r, const oidc_cfg_t *cfg, const oidc_session_t *session);
+void oidc_session_pass_tokens(request_rec *r, const oidc_cfg_t *cfg, oidc_session_t *session, apr_byte_t extend_session,
+			      apr_byte_t *needs_save);
 void oidc_log_session_expires(request_rec *r, const char *msg, apr_time_t session_expires);
 apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg_t *c, oidc_provider_t **provider);
 const char *oidc_original_request_method(request_rec *r, oidc_cfg_t *cfg, apr_byte_t handle_discovery_response);
 oidc_provider_t *oidc_get_provider_for_issuer(request_rec *r, oidc_cfg_t *c, const char *issuer,
 					      apr_byte_t allow_discovery);
 int oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg_t *c, const char *currentCookieName, int delete_oldest);
-apr_byte_t oidc_is_auth_capable_request(request_rec *r);
-apr_byte_t oidc_validate_redirect_url(request_rec *r, oidc_cfg_t *c, const char *redirect_to_url,
-				      apr_byte_t restrict_to_host, char **err_str, char **err_desc);
-apr_byte_t oidc_set_app_claims(request_rec *r, oidc_cfg_t *cfg, json_t *claims);
+apr_byte_t oidc_is_auth_capable_request(const request_rec *r);
+apr_byte_t oidc_validate_redirect_url(request_rec *r, const oidc_cfg_t *c, const char *redirect_to_url,
+				      oidc_redirect_url_scope_t scope, char **err_str, char **err_desc);
+apr_byte_t oidc_set_app_claims(request_rec *r, const oidc_cfg_t *cfg, oidc_json_t *claims);
 
 #endif /* _MOD_AUTH_OPENIDC_H_ */

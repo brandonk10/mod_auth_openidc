@@ -42,11 +42,15 @@
  */
 
 #include "util/util.h"
-#include "mod_auth_openidc.h"
+#include "util/request_state.h"
+#include "util/util_cfg.h"
 
 #include <apr_lib.h>
 
 #include <http_protocol.h>
+
+#include <openssl/crypto.h>   /* CRYPTO_memcmp() in oidc_util_strcmp_const_time() */
+#include <openssl/opensslv.h> /* OPENSSL_VERSION_STR / OPENSSL_VERSION_TEXT in oidc_util_openssl_version() */
 
 /*
  * convert a character to an ENVIRONMENT-variable-safe variant
@@ -55,14 +59,7 @@ static int oidc_util_char_to_env(int c) {
 	return apr_isalnum(c) ? apr_toupper(c) : '_';
 }
 
-/*
- * compare two strings based on how they would be converted to an
- * environment variable, as per oidc_char_to_env. If len is specified
- * as less than zero, then the full strings will be compared. Returns
- * less than, equal to, or greater than zero based on whether the
- * first argument's conversion to an environment variable is less
- * than, equal to, or greater than the second.
- */
+/* Compare strings after oidc_char_to_env conversion; a negative len compares the full strings. */
 int oidc_util_strnenvcmp(const char *a, const char *b, int len) {
 	int d = 0;
 	int i = 0;
@@ -138,9 +135,6 @@ int oidc_util_http_send(request_rec *r, const char *data, size_t data_len, const
 			   rc);
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
-	/*
-	 *r->status = success_rvalue;
-	 */
 
 	if ((success_rvalue == OK) && (r->user == NULL)) {
 		/*
@@ -189,7 +183,7 @@ int oidc_util_http_content_send(request_rec *r) {
 }
 
 /* the maximum size of data that we accept in a single POST value: 1MB */
-#define OIDC_MAX_POST_DATA_LEN 1024 * 1024
+#define OIDC_MAX_POST_DATA_LEN (1024 * 1024)
 
 /*
  * read all bytes from the HTTP request
@@ -237,9 +231,20 @@ static apr_byte_t oidc_util_read(request_rec *r, char **rbuf) {
 }
 
 /*
- * read form-encoded parameters from a string in to a table
+ * TRUE when key is one of the NUL-terminated no_repeat parameter names (a NULL list matches nothing)
  */
-apr_byte_t oidc_util_read_form_encoded_params(request_rec *r, apr_table_t *table, char *data) {
+static apr_byte_t oidc_util_param_must_not_repeat(const char *const *no_repeat, const char *key) {
+	if (no_repeat == NULL)
+		return FALSE;
+	for (const char *const *n = no_repeat; *n != NULL; n++)
+		if (_oidc_strcmp(*n, key) == 0)
+			return TRUE;
+	return FALSE;
+}
+
+/* Parse form parameters, optionally rejecting repeated names from no_repeat. */
+static apr_byte_t oidc_util_read_form_encoded_params_impl(request_rec *r, apr_table_t *table, const char *data,
+							  const char *const *no_repeat) {
 	const char *key = NULL;
 	const char *val = NULL;
 	const char *p = data;
@@ -251,7 +256,13 @@ apr_byte_t oidc_util_read_form_encoded_params(request_rec *r, apr_table_t *table
 		key = ap_getword(r->pool, &val, OIDC_CHAR_EQUAL);
 		key = oidc_http_url_decode(r, key);
 		val = oidc_http_url_decode(r, val);
-		oidc_debug(r, "read: %s=%s", key, val);
+		if (oidc_util_param_must_not_repeat(no_repeat, key) && (apr_table_get(table, key) != NULL)) {
+			oidc_error(r, "duplicate \"%s\" parameter is not allowed", key);
+			return FALSE;
+		}
+		/* this parses the front-channel authorization response and the back-channel logout
+		 * request, so the values include the authorization code and bare tokens */
+		oidc_debug(r, "read: %s=%s", key, oidc_http_param_is_sensitive(key) ? "***" : val);
 		apr_table_set(table, key, val);
 	}
 
@@ -259,6 +270,15 @@ apr_byte_t oidc_util_read_form_encoded_params(request_rec *r, apr_table_t *table
 		   apr_table_elts(table)->nelts);
 
 	return TRUE;
+}
+
+apr_byte_t oidc_util_read_form_encoded_params(request_rec *r, apr_table_t *table, const char *data) {
+	return oidc_util_read_form_encoded_params_impl(r, table, data, NULL);
+}
+
+apr_byte_t oidc_util_read_form_encoded_params_reject_dup(request_rec *r, apr_table_t *table, const char *data,
+							 const char *const *no_repeat) {
+	return oidc_util_read_form_encoded_params_impl(r, table, data, no_repeat);
 }
 
 static void oidc_util_userdata_set_post_param(request_rec *r, const char *post_param_name,
@@ -274,13 +294,12 @@ static void oidc_util_userdata_set_post_param(request_rec *r, const char *post_p
 /*
  * read the POST parameters in to a table
  */
-apr_byte_t oidc_util_read_post_params(request_rec *r, apr_table_t *table, apr_byte_t propagate,
-				      const char *strip_param_name) {
+static apr_byte_t oidc_util_read_post_params_impl(request_rec *r, apr_table_t *table, apr_byte_t propagate,
+						  const char *strip_param_name, const char *const *no_repeat) {
 	apr_byte_t rc = FALSE;
 	char *data = NULL;
 	const apr_array_header_t *arr = NULL;
 	const apr_table_entry_t *elts = NULL;
-	int i = 0;
 	const char *content_type = NULL;
 
 	content_type = oidc_http_hdr_in_content_type_get(r);
@@ -293,7 +312,7 @@ apr_byte_t oidc_util_read_post_params(request_rec *r, apr_table_t *table, apr_by
 	if (oidc_util_read(r, &data) != TRUE)
 		goto end;
 
-	rc = oidc_util_read_form_encoded_params(r, table, data);
+	rc = oidc_util_read_form_encoded_params_impl(r, table, data, no_repeat);
 	if (rc != TRUE)
 		goto end;
 
@@ -302,13 +321,23 @@ apr_byte_t oidc_util_read_post_params(request_rec *r, apr_table_t *table, apr_by
 
 	arr = apr_table_elts(table);
 	elts = (const apr_table_entry_t *)arr->elts;
-	for (i = 0; i < arr->nelts; i++)
+	for (int i = 0; i < arr->nelts; i++)
 		if (_oidc_strcmp(elts[i].key, strip_param_name) != 0)
 			oidc_util_userdata_set_post_param(r, elts[i].key, elts[i].val);
 
 end:
 
 	return rc;
+}
+
+apr_byte_t oidc_util_read_post_params(request_rec *r, apr_table_t *table, apr_byte_t propagate,
+				      const char *strip_param_name) {
+	return oidc_util_read_post_params_impl(r, table, propagate, strip_param_name, NULL);
+}
+
+apr_byte_t oidc_util_read_post_params_reject_dup(request_rec *r, apr_table_t *table, apr_byte_t propagate,
+						 const char *strip_param_name, const char *const *no_repeat) {
+	return oidc_util_read_post_params_impl(r, table, propagate, strip_param_name, no_repeat);
 }
 
 /*
@@ -320,11 +349,13 @@ apr_byte_t oidc_util_issuer_match(const char *a, const char *b) {
 	if (_oidc_strcmp(a, b) != 0) {
 
 		/* no strict match, but we are going to accept if the difference is only a trailing slash */
-		int n1 = _oidc_strlen(a);
-		int n2 = _oidc_strlen(b);
-		int n = ((n1 == n2 + 1) && (a[n1 - 1] == OIDC_CHAR_FORWARD_SLASH))
-			    ? n2
-			    : (((n2 == n1 + 1) && (b[n2 - 1] == OIDC_CHAR_FORWARD_SLASH)) ? n1 : 0);
+		int n1 = (int)_oidc_strlen(a);
+		int n2 = (int)_oidc_strlen(b);
+		int n = 0;
+		if ((n1 == n2 + 1) && (a[n1 - 1] == OIDC_CHAR_FORWARD_SLASH))
+			n = n2;
+		else if ((n2 == n1 + 1) && (b[n2 - 1] == OIDC_CHAR_FORWARD_SLASH))
+			n = n1;
 		if ((n == 0) || (_oidc_strncmp(a, b, n) != 0))
 			return FALSE;
 	}
@@ -336,7 +367,7 @@ apr_byte_t oidc_util_issuer_match(const char *a, const char *b) {
  * parse a space separated string in to a hash table
  */
 apr_hash_t *oidc_util_spaced_string_to_hashtable(apr_pool_t *pool, const char *str) {
-	char *val;
+	const char *val;
 	const char *data = apr_pstrdup(pool, str);
 	apr_hash_t *result = apr_hash_make(pool);
 	while (data && (*data)) {
@@ -365,8 +396,7 @@ apr_byte_t oidc_util_spaced_string_equals(apr_pool_t *pool, const char *a, const
 		return FALSE;
 
 	/* then loop over all entries */
-	apr_hash_index_t *hi;
-	for (hi = apr_hash_first(NULL, ht_a); hi; hi = apr_hash_next(hi)) {
+	for (apr_hash_index_t *hi = apr_hash_first(NULL, ht_a); hi; hi = apr_hash_next(hi)) {
 		apr_hash_this(hi, &k, NULL, &v);
 		if (apr_hash_get(ht_b, k, APR_HASH_KEY_STRING) == NULL)
 			return FALSE;
@@ -407,10 +437,71 @@ void oidc_util_table_add_query_encoded_params(apr_pool_t *pool, apr_table_t *tab
 }
 
 char *oidc_util_hex_encode(apr_pool_t *pool, const unsigned char *bytes, unsigned int len) {
-	char *s = "";
-	for (int i = 0; i < len; i++)
-		s = apr_psprintf(pool, "%s%02x", s, bytes[i]);
+	static const char hex[] = "0123456789abcdef";
+	char *s = apr_palloc(pool, ((size_t)len * 2) + 1);
+	for (unsigned int i = 0; i < len; i++) {
+		s[i * 2] = hex[bytes[i] >> 4];
+		s[(i * 2) + 1] = hex[bytes[i] & 0x0f];
+	}
+	s[(size_t)len * 2] = '\0';
 	return s;
+}
+
+#define OIDC_UTIL_MASK_VALUE_PREFIX_LEN 4
+
+/*
+ * redact a secret/token value for logging purposes, keeping a short prefix and the
+ * length so log lines can still be correlated across requests without exposing the
+ * value itself
+ */
+/*
+ * whether secrets are masked in the log for this request's server; OIDCDebugMaskSecrets is
+ * RSRC_CONF, so this is a per-virtual-host answer and cannot be relaxed from a directory or
+ * location section
+ */
+apr_byte_t oidc_util_log_mask_secrets(request_rec *r) {
+	const oidc_cfg_t *cfg = NULL;
+	if (r == NULL)
+		return TRUE;
+	cfg = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+	if (cfg == NULL)
+		return TRUE;
+	return (oidc_cfg_debug_mask_secrets_get(cfg) != 0) ? TRUE : FALSE;
+}
+
+const char *oidc_util_mask_value(request_rec *r, const char *value) {
+	apr_size_t len = 0;
+	if (value == NULL)
+		return "(null)";
+	/* OIDCDebugMaskSecrets Off: hand back the value itself, which is the whole point of it */
+	if (oidc_util_log_mask_secrets(r) == FALSE)
+		return value;
+	len = _oidc_strlen(value);
+	if (len <= OIDC_UTIL_MASK_VALUE_PREFIX_LEN)
+		return "***";
+	return apr_psprintf(r->pool, "%.*s...(%" APR_SIZE_T_FMT " chars)", OIDC_UTIL_MASK_VALUE_PREFIX_LEN, value, len);
+}
+
+/*
+ * compare two strings in constant time with respect to their content, so a failing
+ * comparison against a request-supplied value (state, XSRF token, CSRF token, ...)
+ * cannot be used to learn how many leading bytes matched; NULL is only considered
+ * equal to NULL
+ */
+apr_byte_t oidc_util_strcmp_const_time(const char *a, const char *b) {
+	apr_size_t len_a = 0;
+	apr_size_t len_b = 0;
+
+	if ((a == NULL) || (b == NULL))
+		return (a == b) ? TRUE : FALSE;
+
+	len_a = _oidc_strlen(a);
+	len_b = _oidc_strlen(b);
+
+	if (len_a != len_b)
+		return FALSE;
+
+	return (CRYPTO_memcmp(a, b, len_a) == 0) ? TRUE : FALSE;
 }
 
 /*
@@ -421,13 +512,14 @@ apr_byte_t oidc_util_hash_string_and_base64url_encode(request_rec *r, const char
 	oidc_jose_error_t err;
 	unsigned char *hashed = NULL;
 	unsigned int hashed_len = 0;
-	if (oidc_jose_hash_bytes(r->pool, openssl_hash_algo, (const unsigned char *)input, _oidc_strlen(input), &hashed,
-				 &hashed_len, &err) == FALSE) {
+	if (oidc_jose_hash_bytes(r->pool, openssl_hash_algo, (const unsigned char *)input,
+				 (unsigned int)_oidc_strlen(input), &hashed, &hashed_len, &err) == FALSE) {
 		oidc_error(r, "oidc_jose_hash_bytes returned an error: %s", err.text);
 		return FALSE;
 	}
 
-	if (oidc_util_base64url_encode(r, output, (const char *)hashed, hashed_len, TRUE) <= 0) {
+	if (oidc_util_base64url_encode(r, output, (const char *)hashed, hashed_len, OIDC_BASE64URL_PADDING_STRIP) <=
+	    0) {
 		oidc_error(r, "oidc_base64url_encode returned an error");
 		return FALSE;
 	}
@@ -435,21 +527,38 @@ apr_byte_t oidc_util_hash_string_and_base64url_encode(request_rec *r, const char
 }
 
 /*
+ * return TRUE when "hostname" is equal to "suffix" or is a proper subdomain of it,
+ * i.e. the part of "hostname" that precedes "suffix" ends with a dot; comparison
+ * is case-insensitive
+ */
+apr_byte_t oidc_util_hostname_endswith(const char *hostname, const char *suffix) {
+	size_t hlen;
+	size_t slen;
+	const char *tail = NULL;
+	if ((hostname == NULL) || (suffix == NULL))
+		return FALSE;
+	hlen = _oidc_strlen(hostname);
+	slen = _oidc_strlen(suffix);
+	if ((slen == 0) || (hlen < slen))
+		return FALSE;
+	tail = hostname + (hlen - slen);
+	if (_oidc_strnatcasecmp(tail, suffix) != 0)
+		return FALSE;
+	return ((tail == hostname) || (*(tail - 1) == '.')) ? TRUE : FALSE;
+}
+
+/*
  * check if the provided cookie domain value is valid
  */
 apr_byte_t oidc_util_cookie_domain_valid(const char *hostname, const char *cookie_domain) {
-	const char *p = NULL;
 	const char *check_cookie = cookie_domain;
+	if (check_cookie == NULL)
+		return FALSE;
 	// Skip past the first char of a cookie_domain that starts
 	// with a ".", ASCII 46
 	if (check_cookie[0] == 46)
 		check_cookie++;
-	p = oidc_util_strcasestr(hostname, check_cookie);
-
-	if ((p == NULL) || (_oidc_strnatcasecmp(check_cookie, p) != 0)) {
-		return FALSE;
-	}
-	return TRUE;
+	return oidc_util_hostname_endswith(hostname, check_cookie);
 }
 
 #define OIDC_TP_TRACE_ID_LEN 16
@@ -462,15 +571,15 @@ trace-id         = 32HEXDIGLC  ; 16 bytes array identifier. All zeroes forbidden
 parent-id        = 16HEXDIGLC  ; 8 bytes array identifier. All zeroes forbidden
 trace-flags      = 2HEXDIGLC   ; 8 bit flags. Currently, only one bit is used.
  */
-void oidc_util_set_trace_parent(request_rec *r, oidc_cfg_t *c, const char *span) {
-	// apr_table_get(r->subprocess_env, "UNIQUE_ID");
+void oidc_util_set_trace_parent(request_rec *r, const oidc_cfg_t *c, const char *span) {
 	unsigned char trace_id[OIDC_TP_TRACE_ID_LEN];
 	unsigned char parent_id[OIDC_TP_PARENT_ID_LEN];
 	unsigned char trace_flags = 0;
-	char *s_parent_id = "", *s_trace_id = "";
+	char *s_parent_id = "";
+	char *s_trace_id = "";
 	const char *v = NULL;
 	int i = 0;
-	char *hostname = "localhost";
+	const char *hostname = "localhost";
 	const uint64_t P1 = 7;
 	const uint64_t P2 = 31;
 	uint64_t hash = P1;
@@ -502,7 +611,11 @@ void oidc_util_set_trace_parent(request_rec *r, oidc_cfg_t *c, const char *span)
 		s_parent_id = apr_psprintf(r->pool, "%s%02x", s_parent_id, parent_id[i]);
 
 	if (v == NULL) {
-		apr_generate_random_bytes(trace_id, OIDC_TP_TRACE_ID_LEN);
+		if (apr_generate_random_bytes(trace_id, OIDC_TP_TRACE_ID_LEN) != APR_SUCCESS) {
+			oidc_warn(r, "apr_generate_random_bytes failed: no \"%s\" header will be set",
+				  OIDC_HTTP_HDR_TRACE_PARENT);
+			return;
+		}
 		for (i = 0; i < OIDC_TP_TRACE_ID_LEN; i++)
 			s_trace_id = apr_psprintf(r->pool, "%s%02x", s_trace_id, trace_id[i]);
 		oidc_request_state_set(r, OIDC_REQUEST_STATE_TRACE_ID, s_trace_id);
@@ -521,13 +634,40 @@ void oidc_util_set_trace_parent(request_rec *r, oidc_cfg_t *c, const char *span)
  * clear the contents of a hash table (used for older versions of libapr missing this)
  */
 void oidc_util_apr_hash_clear(apr_hash_t *ht) {
-	apr_hash_index_t *hi = NULL;
 	const void *key = NULL;
 	apr_ssize_t klen = 0;
-	for (hi = apr_hash_first(NULL, ht); hi; hi = apr_hash_next(hi)) {
+	for (apr_hash_index_t *hi = apr_hash_first(NULL, ht); hi; hi = apr_hash_next(hi)) {
 		apr_hash_this(hi, &key, &klen, NULL);
 		apr_hash_set(ht, key, klen, NULL);
 	}
+}
+
+/* the largest whole number of seconds apr_time_from_sec can represent */
+#define OIDC_UTIL_APR_TIME_SEC_MAX (APR_INT64_MAX / APR_USEC_PER_SEC)
+
+/*
+ * Convert seconds to apr_time_t without undefined casts or overflow in apr_time_from_sec().
+ * Negative and non-finite values become 0; values above the APR range saturate.
+ */
+apr_time_t oidc_util_apr_time_from_sec(double seconds) {
+	/* NB: also catches NaN, which compares false against everything */
+	if (!(seconds > 0))
+		return 0;
+	if (seconds >= (double)OIDC_UTIL_APR_TIME_SEC_MAX)
+		return APR_INT64_MAX;
+	return apr_time_from_sec((apr_time_t)seconds);
+}
+
+/*
+ * add two non-negative apr_time_t values, saturating at APR_INT64_MAX rather than wrapping; used to
+ * turn a relative expiry into an absolute one without a far-future value folding back into the past
+ */
+apr_time_t oidc_util_apr_time_add(apr_time_t a, apr_time_t b) {
+	if ((a < 0) || (b < 0))
+		return (a > b) ? a : b;
+	if (a > APR_INT64_MAX - b)
+		return APR_INT64_MAX;
+	return a + b;
 }
 
 /*

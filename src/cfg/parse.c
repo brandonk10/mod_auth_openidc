@@ -56,22 +56,34 @@
 #define OIDC_LIST_OPTIONS_QUOTE "'"
 
 /*
- * flatten the provided list of string options
+ * flatten the provided list of n {value, string} options into a "['a'|'b']" display string
  */
-char *oidc_cfg_parse_flatten_options(apr_pool_t *pool, const char *options[]) {
-	int i = 0;
-	char *result = OIDC_LIST_OPTIONS_START;
-	while (options[i] != NULL) {
-		if (i == 0)
-			result = apr_psprintf(pool, "%s%s%s%s", OIDC_LIST_OPTIONS_START, OIDC_LIST_OPTIONS_QUOTE,
-					      options[i], OIDC_LIST_OPTIONS_QUOTE);
-		else
-			result = apr_psprintf(pool, "%s%s%s%s%s", result, OIDC_LIST_OPTIONS_SEPARATOR,
-					      OIDC_LIST_OPTIONS_QUOTE, options[i], OIDC_LIST_OPTIONS_QUOTE);
-		i++;
+char *oidc_cfg_parse_options_flatten(apr_pool_t *pool, const oidc_cfg_option_t options[], int n) {
+	char *result = NULL;
+	if (n <= 0)
+		return OIDC_LIST_OPTIONS_START OIDC_LIST_OPTIONS_END;
+	result = apr_psprintf(pool, "%s%s%s%s", OIDC_LIST_OPTIONS_QUOTE, options[--n].str, OIDC_LIST_OPTIONS_QUOTE,
+			      OIDC_LIST_OPTIONS_END);
+	for (--n; n >= 0; --n)
+		result = apr_psprintf(pool, "%s%s%s%s%s", OIDC_LIST_OPTIONS_QUOTE, options[n].str,
+				      OIDC_LIST_OPTIONS_QUOTE, OIDC_LIST_OPTIONS_SEPARATOR, result);
+	return apr_psprintf(pool, "%s%s", OIDC_LIST_OPTIONS_START, result);
+}
+
+/*
+ * flatten the provided NULL-terminated list of plain string options into the same
+ * "['a'|'b']" display format, delegating to oidc_cfg_parse_options_flatten
+ */
+static char *oidc_cfg_parse_string_options_flatten(apr_pool_t *pool, const char *options[]) {
+	int n = 0;
+	while (options[n] != NULL)
+		n++;
+	oidc_cfg_option_t *opts = apr_pcalloc(pool, n * sizeof(oidc_cfg_option_t));
+	for (int i = 0; i < n; i++) {
+		opts[i].val = i;
+		opts[i].str = options[i];
 	}
-	result = apr_psprintf(pool, "%s%s", result, OIDC_LIST_OPTIONS_END);
-	return result;
+	return oidc_cfg_parse_options_flatten(pool, opts, n);
 }
 
 /*
@@ -86,21 +98,9 @@ const char *oidc_cfg_parse_is_valid_option(apr_pool_t *pool, const char *arg, co
 	}
 	if (options[i] == NULL) {
 		return apr_psprintf(pool, "invalid value %s%s%s, must be one of %s", OIDC_LIST_OPTIONS_QUOTE, arg,
-				    OIDC_LIST_OPTIONS_QUOTE, oidc_cfg_parse_flatten_options(pool, options));
+				    OIDC_LIST_OPTIONS_QUOTE, oidc_cfg_parse_string_options_flatten(pool, options));
 	}
 	return NULL;
-}
-
-/*
- * flatten the provided list of n options
- */
-char *oidc_cfg_parse_options_flatten(apr_pool_t *pool, const oidc_cfg_option_t options[], int n) {
-	char *result = apr_psprintf(pool, "%s%s%s%s", OIDC_LIST_OPTIONS_QUOTE, options[--n].str,
-				    OIDC_LIST_OPTIONS_QUOTE, OIDC_LIST_OPTIONS_END);
-	for (--n; n >= 0; --n)
-		result = apr_psprintf(pool, "%s%s%s%s%s", OIDC_LIST_OPTIONS_QUOTE, options[n].str,
-				      OIDC_LIST_OPTIONS_QUOTE, OIDC_LIST_OPTIONS_SEPARATOR, result);
-	return apr_psprintf(pool, "%s%s", OIDC_LIST_OPTIONS_START, result);
 }
 
 /*
@@ -170,12 +170,12 @@ const char *oidc_cfg_parse_boolean(apr_pool_t *pool, const char *arg, int *bool_
  * parse a string into an integer
  */
 const char *oidc_cfg_parse_int(apr_pool_t *pool, const char *arg, int *int_value) {
-	int v = -1;
-	if ((arg == NULL) || (*arg == '\0') || (_oidc_strcmp(arg, "") == 0))
+	if ((arg == NULL) || (*arg == '\0'))
 		return apr_psprintf(pool, "no integer value");
-	if (sscanf(arg, "%d", &v) != 1)
-		return apr_psprintf(pool, "invalid integer value: %s", arg);
-	*int_value = v;
+	/* the shared core rejects non-numeric input, trailing junk ("300x") and overflow, all of which
+	 * the previous sscanf("%d") accepted silently */
+	if (_oidc_str_to_int_checked(arg, int_value) == FALSE)
+		return apr_psprintf(pool, "invalid or out-of-range integer value: %s", arg);
 	return NULL;
 }
 
@@ -192,6 +192,27 @@ const char *oidc_cfg_parse_int_min_max(apr_pool_t *pool, const char *arg, int *i
 	rv = oidc_cfg_parse_is_valid_int(pool, v, min_value, max_value);
 	if (rv != NULL)
 		return rv;
+	*int_value = v;
+	return NULL;
+}
+
+/*
+ * parse an integer value that must lie in [min_value, max_value], or be exactly 0,
+ * which turns the feature off rather than sizing it; the range would otherwise
+ * reject the very value that documents how to disable it
+ */
+const char *oidc_cfg_parse_int_min_max_or_zero(apr_pool_t *pool, const char *arg, int *int_value, int min_value,
+					       int max_value) {
+	int v = 0;
+	const char *rv = NULL;
+	rv = oidc_cfg_parse_int(pool, arg, &v);
+	if (rv != NULL)
+		return rv;
+	if (v != 0) {
+		rv = oidc_cfg_parse_is_valid_int(pool, v, min_value, max_value);
+		if (rv != NULL)
+			return rv;
+	}
 	*int_value = v;
 	return NULL;
 }
@@ -233,7 +254,7 @@ const char *oidc_cfg_parse_timeout_min_max(apr_pool_t *pool, const char *arg, ap
 				    " is greater than the maximum allowed value %" APR_TIME_T_FMT,
 				    timeout, max_value);
 	}
-	*timeout_value = (int)timeout;
+	*timeout_value = timeout;
 	return NULL;
 }
 
@@ -422,12 +443,17 @@ static char *oidc_cfg_parse_base64url(apr_pool_t *pool, const char *input, char 
  * parse a hexadecimal encoded binary value from the provided string
  */
 static char *oidc_cfg_parse_hex(apr_pool_t *pool, const char *input, char **output, int *output_len) {
-	*output_len = _oidc_strlen(input) / 2;
+	size_t input_len = _oidc_strlen(input);
+	if ((input_len % 2) != 0)
+		return apr_psprintf(pool, "hex-decoding failed: input length (%" APR_SIZE_T_FMT ") is not even",
+				    input_len);
+	*output_len = (int)(input_len / 2);
 	const char *pos = input;
 	unsigned char *val = apr_pcalloc(pool, *output_len);
-	size_t count = 0;
-	for (count = 0; (count < (*output_len) / sizeof(unsigned char)) && (pos != NULL); count++) {
-		sscanf(pos, "%2hhx", &val[count]);
+	for (size_t count = 0; count < (*output_len) / sizeof(unsigned char); count++) {
+		if (sscanf(pos, "%2hhx", &val[count]) != 1)
+			return apr_psprintf(pool, "hex-decoding failed at offset %" APR_SIZE_T_FMT ": non-hex input",
+					    count * 2);
 		pos += 2;
 	}
 	*output = (char *)val;
@@ -454,7 +480,7 @@ static const char *oidc_cfg_parse_key_value(apr_pool_t *pool, const char *enc, c
 		return oidc_cfg_parse_hex(pool, input, key, key_len);
 	if (_oidc_strcmp(enc, OIDC_KEY_ENCODING_PLAIN) == 0) {
 		*key = apr_pstrdup(pool, input);
-		*key_len = _oidc_strlen(*key);
+		*key_len = (int)_oidc_strlen(*key);
 		return NULL;
 	}
 	// NB: when we get here we'll return an error displaying the valid options
@@ -464,14 +490,63 @@ static const char *oidc_cfg_parse_key_value(apr_pool_t *pool, const char *enc, c
 #define OIDC_KEY_TUPLE_SEPARATOR "#"
 #define OIDC_KEY_SIG_PREFIX OIDC_JOSE_JWK_SIG_STR ":"
 #define OIDC_KEY_ENC_PREFIX OIDC_JOSE_JWK_ENC_STR ":"
+#define OIDC_KEY_ALG_SEPARATOR OIDC_STR_AT
+#define OIDC_KEY_ALG_LIST_SEPARATOR "+"
 
 /*
- * parse a <use>:<encoding>#<key-identifier>#<key> tuple
+ * the JOSE "alg" names the key tuple prefix may carry (RFC 7518 and registered successors),
+ * matched in full: a kid or filename segment that merely resembles one ("RSbank", "key") must
+ * not pass, which rules out oidc_alg2kty()'s two-character matching here
+ */
+static apr_byte_t oidc_cfg_parse_key_alg_is_known(const char *alg) {
+	static const char *known[] = {"RS256",	   "RS384",    "RS512",	       "PS256",	       "PS384",
+				      "PS512",	   "HS256",    "HS384",	       "HS512",	       "ES256",
+				      "ES384",	   "ES512",    "ES256K",       "EdDSA",	       "dir",
+				      "RSA1_5",	   "RSA-OAEP", "RSA-OAEP-256", "RSA-OAEP-384", "RSA-OAEP-512",
+				      "A128KW",	   "A192KW",   "A256KW",       "A128GCMKW",    "A192GCMKW",
+				      "A256GCMKW", "ECDH-ES",  "PBES2-HS256",  "PBES2-HS384",  "PBES2-HS512"};
+	for (unsigned int i = 0; i < sizeof(known) / sizeof(known[0]); i++)
+		if (_oidc_strcmp(alg, known[i]) == 0)
+			return TRUE;
+	return FALSE;
+}
+
+/*
+ * Treat text before @ as an algorithm list only when every token is known and no kid/path
+ * separator occurs; otherwise @ remains part of the key ID or filename.
+ */
+static const char *oidc_cfg_parse_key_alg_prefix(apr_pool_t *pool, const char *tuple, char **alg) {
+	const char *at = _oidc_strstr(tuple, OIDC_KEY_ALG_SEPARATOR);
+	char *last = NULL;
+	int n = 0;
+	if ((at == NULL) || (at == tuple))
+		return tuple;
+	for (const char *c = tuple; c < at; c++)
+		if ((*c == OIDC_KEY_TUPLE_SEPARATOR[0]) || (*c == OIDC_CHAR_FORWARD_SLASH))
+			return tuple;
+	char *candidate = apr_pstrndup(pool, tuple, at - tuple);
+	for (const char *tok = apr_strtok(apr_pstrdup(pool, candidate), OIDC_KEY_ALG_LIST_SEPARATOR, &last);
+	     tok != NULL; tok = apr_strtok(NULL, OIDC_KEY_ALG_LIST_SEPARATOR, &last), n++)
+		if (oidc_cfg_parse_key_alg_is_known(tok) == FALSE)
+			return tuple;
+	if (n == 0)
+		return tuple;
+	*alg = candidate;
+	return at + _oidc_strlen(OIDC_KEY_ALG_SEPARATOR);
+}
+
+/*
+ * parse a [<use>:][<alg>[+<alg>...]@][<key-identifier>#]<key> tuple (or, when format is TRUE, a
+ * [<use>:]<encoding>#<key-identifier>#<key> tuple); the optional "<alg>[+<alg>...]@" list is only
+ * recognized when a non-NULL alg out-parameter is passed
  */
 const char *oidc_cfg_parse_key_record(apr_pool_t *pool, const char *tuple, char **kid, char **key, int *key_len,
-				      char **use, apr_byte_t triplet) {
+				      char **use, char **alg, oidc_key_record_format_t format) {
 	const char *rv = NULL;
-	char *s = NULL, *p = NULL, *q = NULL, *enc = NULL;
+	char *s = NULL;
+	char *p = NULL;
+	char *q = NULL;
+	const char *enc = NULL;
 
 	if ((tuple == NULL) || (_oidc_strcmp(tuple, "") == 0))
 		return "tuple value not set";
@@ -486,9 +561,13 @@ const char *oidc_cfg_parse_key_record(apr_pool_t *pool, const char *tuple, char 
 		}
 	}
 
+	/* optional "<alg>[+<alg>...]@" list preceding the "[<kid>#]<key>" record */
+	if (alg)
+		tuple = oidc_cfg_parse_key_alg_prefix(pool, tuple, alg);
+
 	s = apr_pstrdup(pool, tuple);
 	p = _oidc_strstr(s, OIDC_KEY_TUPLE_SEPARATOR);
-	if (p && triplet)
+	if (p && format)
 		q = _oidc_strstr(p + 1, OIDC_KEY_TUPLE_SEPARATOR);
 
 	if (p) {
@@ -504,12 +583,12 @@ const char *oidc_cfg_parse_key_record(apr_pool_t *pool, const char *tuple, char 
 			*p = '\0';
 			*kid = s;
 			*key = p + 1;
-			*key_len = _oidc_strlen(*key);
+			*key_len = (int)_oidc_strlen(*key);
 		}
 	} else {
 		*kid = NULL;
 		*key = s;
-		*key_len = _oidc_strlen(*key);
+		*key_len = (int)_oidc_strlen(*key);
 	}
 
 	return rv;
@@ -535,8 +614,8 @@ const char *oidc_cfg_parse_action_on_error_refresh_as(apr_pool_t *pool, const ch
  */
 const char *oidc_cfg_parse_passphrase(apr_pool_t *pool, const char *arg, char **passphrase) {
 	char **argv = NULL;
-	char *result = NULL;
-	int arglen = _oidc_strlen(arg);
+	const char *result = NULL;
+	int arglen = (int)_oidc_strlen(arg);
 	/* Based on code from mod_session_crypto. */
 	if (arglen > 5 && _oidc_strncmp(arg, "exec:", 5) == 0) {
 		if (apr_tokenize_to_argv(arg + 5, &argv, pool) != APR_SUCCESS) {
@@ -561,16 +640,36 @@ const char *oidc_cfg_parse_passphrase(apr_pool_t *pool, const char *arg, char **
 }
 
 /*
- * add a public key from an X.509 file to our list of JWKs with public keys
+ * parse the PEM key in file "fname" into a JWK with key identifier "kid" (auto-derived when NULL)
  */
-const char *oidc_cfg_parse_public_key_files(apr_pool_t *pool, const char *arg, apr_array_header_t **keys) {
-	oidc_jwk_t *jwk = NULL;
+static const char *oidc_cfg_parse_pem_key(apr_pool_t *pool, apr_byte_t is_private, const char *kid, const char *fname,
+					  oidc_jwk_t **jwk) {
 	oidc_jose_error_t err;
-	char *use = NULL;
+	apr_byte_t rv = is_private ? oidc_jwk_parse_pem_private_key(pool, kid, fname, jwk, &err)
+				   : oidc_jwk_parse_pem_public_key(pool, kid, fname, jwk, &err);
+	if (rv == FALSE)
+		return apr_psprintf(pool, "oidc_jwk_parse_pem_%s_key failed for (kid=%s) \"%s\": %s",
+				    is_private ? "private" : "public", kid ? kid : "", fname, oidc_jose_e2s(pool, err));
+	return NULL;
+}
 
-	char *kid = NULL, *name = NULL, *fname = NULL;
+/*
+ * Parse [<use>:][<alg>[+<alg>...]@][<kid>#]<filename>. Multiple algorithms publish the key once
+ * per algorithm with distinct derived key IDs; no algorithm produces one key.
+ */
+static const char *oidc_cfg_parse_key_files(apr_pool_t *pool, const char *arg, apr_array_header_t **keys,
+					    apr_byte_t is_private) {
+	oidc_jwk_t *jwk = NULL;
+	char *use = NULL;
+	char *alg = NULL;
+	char *kid = NULL;
+	char *name = NULL;
+	char *fname = NULL;
 	int fname_len;
-	const char *rv = oidc_cfg_parse_key_record(pool, arg, &kid, &name, &fname_len, &use, FALSE);
+	char *last = NULL;
+
+	const char *rv =
+	    oidc_cfg_parse_key_record(pool, arg, &kid, &name, &fname_len, &use, &alg, OIDC_KEY_RECORD_PAIR);
 	if (rv != NULL)
 		return rv;
 
@@ -578,22 +677,74 @@ const char *oidc_cfg_parse_public_key_files(apr_pool_t *pool, const char *arg, a
 	if (rv != NULL)
 		return rv;
 
-	if (oidc_jwk_parse_pem_public_key(pool, kid, fname, &jwk, &err) == FALSE) {
-		return apr_psprintf(pool, "oidc_jwk_parse_pem_public_key failed for (kid=%s) \"%s\": %s", kid, fname,
-				    oidc_jose_e2s(pool, err));
+	/* split the optional "+"-separated algorithm list; an empty list yields a single pass with alg == NULL */
+	apr_array_header_t *algs = apr_array_make(pool, 2, sizeof(char *));
+	for (char *tok = alg ? apr_strtok(alg, OIDC_KEY_ALG_LIST_SEPARATOR, &last) : NULL; tok != NULL;
+	     tok = apr_strtok(NULL, OIDC_KEY_ALG_LIST_SEPARATOR, &last))
+		APR_ARRAY_PUSH(algs, char *) = tok;
+	if (algs->nelts == 0)
+		APR_ARRAY_PUSH(algs, char *) = NULL;
+
+	apr_byte_t multi = (algs->nelts > 1);
+
+	/* when duplicating a key without an explicit kid, derive the shared base kid from the key material once */
+	const char *base_kid = kid;
+	if ((base_kid == NULL) && (multi == TRUE)) {
+		rv = oidc_cfg_parse_pem_key(pool, is_private, NULL, fname, &jwk);
+		if (rv != NULL)
+			return rv;
+		/* keep a pool copy of the derived kid; the probe JWK itself is re-parsed per algorithm below */
+		base_kid = apr_pstrdup(pool, jwk->kid);
+		oidc_jwk_destroy(jwk);
+		jwk = NULL;
 	}
 
 	if (*keys == NULL)
 		*keys = apr_array_make(pool, 4, sizeof(const oidc_jwk_t *));
-	if (use)
-		jwk->use = apr_pstrdup(pool, use);
-	APR_ARRAY_PUSH(*keys, const oidc_jwk_t *) = jwk;
+
+	for (int i = 0; i < algs->nelts; i++) {
+		char *a = APR_ARRAY_IDX(algs, i, char *);
+		/* keep kids distinct across the per-alg duplicates; a single key keeps its (explicit or derived) kid */
+		const char *this_kid =
+		    ((base_kid != NULL) && (multi == TRUE)) ? apr_psprintf(pool, "%s-%s", base_kid, a) : base_kid;
+
+		rv = oidc_cfg_parse_pem_key(pool, is_private, this_kid, fname, &jwk);
+		if (rv != NULL)
+			return rv;
+
+		if (use)
+			jwk->use = apr_pstrdup(pool, use);
+		if (a != NULL) {
+			if (oidc_alg2kty(a) != jwk->kty) {
+				const char *msg = apr_psprintf(
+				    pool, "algorithm \"%s\" is not compatible with the key type of \"%s\"", a, fname);
+				oidc_jwk_destroy(jwk);
+				return msg;
+			}
+			jwk->alg = apr_pstrdup(pool, a);
+		}
+		APR_ARRAY_PUSH(*keys, const oidc_jwk_t *) = jwk;
+	}
 
 	return NULL;
 }
 
 /*
- * parse a triplet of 3 provided config values into a remote_user_claim struct
+ * add a public key from an X.509 file to our list of JWKs with public keys
+ */
+const char *oidc_cfg_parse_public_key_files(apr_pool_t *pool, const char *arg, apr_array_header_t **keys) {
+	return oidc_cfg_parse_key_files(pool, arg, keys, FALSE);
+}
+
+/*
+ * add a private key from an RSA/EC private key file to our list of JWKs with private keys
+ */
+const char *oidc_cfg_parse_private_key_files(apr_pool_t *pool, const char *arg, apr_array_header_t **keys) {
+	return oidc_cfg_parse_key_files(pool, arg, keys, TRUE);
+}
+
+/*
+ * parse a format of 3 provided config values into a remote_user_claim struct
  */
 const char *oidc_parse_remote_user_claim(apr_pool_t *pool, const char *v1, const char *v2, const char *v3,
 					 oidc_remote_user_claim_t *remote_user_claim) {
@@ -606,24 +757,37 @@ const char *oidc_parse_remote_user_claim(apr_pool_t *pool, const char *v1, const
 }
 
 /*
- * parse a triplet of 3 provided config values into a http_timeout struct
+ * parse a format of 3 provided config values into a http_timeout struct
  */
 const char *oidc_cfg_parse_http_timeout(apr_pool_t *pool, const char *arg1, const char *arg2, const char *arg3,
 					oidc_http_timeout_t *http_timeout) {
-	char *s = NULL, *p = NULL;
-	if (arg1)
-		http_timeout->request_timeout = _oidc_str_to_int(arg1, http_timeout->request_timeout);
-	if (arg2)
-		http_timeout->connect_timeout = _oidc_str_to_int(arg2, http_timeout->connect_timeout);
+	const char *rv = NULL;
+	const char *s = NULL;
+	char *p = NULL;
+	/* validate strictly rather than defaulting a typo silently to 0 (= an infinite curl timeout) */
+	if (arg1) {
+		rv = oidc_cfg_parse_int(pool, arg1, &http_timeout->request_timeout);
+		if (rv != NULL)
+			return rv;
+	}
+	if (arg2) {
+		rv = oidc_cfg_parse_int(pool, arg2, &http_timeout->connect_timeout);
+		if (rv != NULL)
+			return rv;
+	}
 	if (arg3) {
 		s = apr_pstrdup(pool, arg3);
 		p = _oidc_strstr(s, OIDC_STR_COLON);
 		if (p) {
 			*p = '\0';
 			p++;
-			http_timeout->retry_interval = _oidc_str_to_int(p, http_timeout->retry_interval);
+			rv = oidc_cfg_parse_int(pool, p, &http_timeout->retry_interval);
+			if (rv != NULL)
+				return rv;
 		}
-		http_timeout->retries = _oidc_str_to_int(s, http_timeout->retries);
+		rv = oidc_cfg_parse_int(pool, s, &http_timeout->retries);
+		if (rv != NULL)
+			return rv;
 	}
 	return NULL;
 }

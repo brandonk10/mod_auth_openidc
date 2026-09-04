@@ -1,5 +1,1360 @@
+09/01/2026
+- release 2.4.20.3
+
+08/30/2026
+- util/appinfo: join array claims and propagate a token's claims in linear instead of quadratic memory
+  and time, so a large or claim-heavy token cannot exhaust or stall a worker (OSS-Fuzz 554464974)
+- http: redact logged request bodies and provider responses in linear instead of quadratic memory
+  (OSS-Fuzz 554483423)
+
+08/27/2026
+- proto/jwt: retry a failed no-"kid" signature verification with a forced JWKs refresh only when the keys
+  came from a JWKs URI: with none configured the retry handed the HTTP layer a NULL URL and a retry
+  back-off, a delay any client could trigger with a bad token (found by the new fuzz targets)
+- session: drop the stale oidc_session_set_client_id() prototype that had no definition
+- test/fuzz: add seven fuzz targets for the browser/internet-facing surfaces -- the back-channel logout
+  endpoint, the authorization response, the Host/X-Forwarded-*/Forwarded parsers, OAuth resource-server
+  bearer tokens, the redirect_uri dispatcher, POST preservation and the request string helpers -- and run
+  the chunked-cookie reassembly and state-cookie sweep in fuzz_cookie; 19 targets in total
+
+08/24/2026
+- http/handle: build the authorization request's query string (and POST auto-submit form) in a single
+  join instead of re-printing the accumulated string per parameter, which made the memory (and CPU)
+  quadratic in the parameter count; a client can drive that count through "auth_request_params" on a
+  discovery response, turning it into an out-of-memory (OSS-Fuzz 551746349, found by the
+  discovery_response fuzz target)
+
+08/23/2026
+- jose: build the PEM wrapper for an "x5c" JWK element in a single allocation; re-printing the accumulated
+  string per line made the memory (and CPU) spent on one key quadratic in the length of the x5c value,
+  which a provider controls through its JWKs document (OSS-Fuzz 551146117, found by the jwks fuzz target);
+  the same accumulate-per-element pattern is replaced in the preserved-POST parameter JSON (whose element
+  count a client controls), in the published JWKs document and in oidc_util_hex_encode()
+- jose: fail the import of an RSA or EC key whose required public components (n/e, x/y) OpenSSL 3.x cannot
+  supply instead of dereferencing a NULL BIGNUM (OSS-Fuzz 550951150, found by the pem_key fuzz target)
+
+08/21/2026
+- test/fuzz: build the fuzz targets with the library's USE_* feature macros so oidc_cfg_t has the same
+  layout on both sides; fixes fuzz_url crashing on every input in the OSS-Fuzz build
+
+08/20/2026
+- util/jose: fix a NULL-pointer crash in oidc_util_url_parameter_get() when the query string is only
+  separators (e.g. "&"), reachable from any handler that reads a query parameter; also release the
+  partially built key list in oidc_jwks_parse_json() when a later JWKs element fails to parse
+- test/fuzz: add jwks, discovery_response and pem_key fuzz targets, and extend fuzz_jwt to verify
+  and decrypt against a key set and fuzz_url to cover the OIDCRedirectURLsAllowed configuration
+- ci: drop the live per-push fuzzing run and keep only the deterministic seed-corpus replay; continuous
+  fuzzing is covered by OSS-Fuzz, and live-fuzzing the JWE targets against the older distro cjose made CI
+  fail nondeterministically
+
+08/19/2026
+- cache/shm: serialize shared-memory operations with one cross-process mutex and use an exact
+  expired-or-LRU scan only when the cache is full
+
+08/15/2026
+- cache/shm: shard hash locking, use per-segment SipHash, safely bound segment sizing, preferentially
+  sweep expired slots, and rate-limit capacity warnings outside cache locks; extend pressure/concurrency tests
+
+08/14/2026
+- source/test: simplify overly detailed comments while preserving essential rationale and invariants
+
+08/12/2026
+- handle/oauth/util: reject a duplicated security-critical protocol parameter at the endpoints that
+  consume it - "state"/"code"/"access_token"/"id_token" in an authorization response, "access_token"
+  in a bearer-token request body/query, "logout_token" in a back-channel logout - instead of
+  silently taking the last value; generic form parsing and POST preservation keep last-wins
+- metadata: fail the JWKs forced-refresh throttle closed when its shared-cache lookup errors instead
+  of reading the error as "not throttled", and stop a throttled or failed forced refresh from falling
+  through to a second unguarded fetch: during a cache outage that let every request carrying an
+  unknown "kid"/"x5t" drive a synchronous OP JWKs fetch and pin a worker thread. An ordinary initial
+  cache miss is still fetched normally (not throttled)
+- proto/handle: log a warning when the cache read or write behind nonce / logout-token "jti" replay
+  detection returns an error, instead of silently ignoring it: the cache API distinguishes a miss
+  from a backend error, and a backend error still fails open (accepts) as before, but is now visible
+- session: store session timestamps as full 64-bit seconds instead of narrowing them through an
+  (int) cast: an expiry past January 2038 wrapped negative on persist and then read back as
+  already-expired, sending the user round the authentication loop. Wire-compatible: values below
+  2^31 serialize identically
+- json: reject a successfully parsed non-object (e.g. a top-level array) from
+  oidc_json_decode_object_err even when logging is disabled: the log flag controlled rejection as
+  well, so a userinfo response that was a JSON array was accepted as claims instead of being
+  retried as a JWT
+- proto: saturate out-of-range JWT "exp"/"iat" timestamps instead of casting an arbitrary JSON
+  number to apr_time_t (undefined behaviour): compare "exp" in the double domain and route session
+  expiry through oidc_util_apr_time_from_sec, so a signed but far-future ("exp":1e300) token can no
+  longer flip validity or wrap the stored expiry depending on the platform
+- cache: NUL-terminate the file-cache value buffer (allocate len + 1) so a corrupt or externally
+  planted cache file whose data is not \0-terminated cannot make a caller over-read past it
+- util: reject a value that is not an importable, GCM-authenticated JWE in oidc_util_jwt_verify
+  instead of passing it back verbatim as if it had been verified (fail-open hardening)
+
+08/11/2026
+- jose: stream brotli decompression into a growing buffer instead of a fixed 4 * input_len one,
+  which made any payload that compressed better than 4:1 unreadable
+- util: remove the undocumented OIDC_JWT_INTERNAL_STRIP_HDR environment variable: stripping the
+  internal JWE header was mutually broken with a rotating (two-secret) OIDCCryptoPassphrase
+- util/metadata: follow symlinks when reading operator-managed files (provider/client metadata,
+  HTML templates, keys) and require the target to be a regular file, instead of refusing the
+  symlink itself
+- metadata: serve the in-memory provider metadata when live discovery succeeded and validated
+  but only the disk write of the cache file failed
+- jose: pass a payload that zlib cannot fully inflate through instead of failing the read: the
+  two-byte header heuristic has false positives among raw cache values ("80...", "HK...") and
+  inflate() cannot always disprove one - a fixed-Huffman continuation emits literal bytes
+  before the stream turns invalid - so partial output no longer makes the failure fatal; only
+  the decompression-bomb cap still fails hard. Also pass a heuristic match through in a build
+  without zlib (which never wrote zlib itself) instead of erroring out
+- session: killing a session no longer deletes the per-user "sub" logout index when it points
+  at a surviving session of the same user: the index is a single slot shared by all of that
+  user's sessions (last writer wins), so logging out - or merely expiring - an older session
+  removed the entry for the newest one and a back-channel logout token carrying only a sub
+  (Back-Channel Logout 1.0 allows omitting the sid) silently no longer terminated it
+- config: only read the "<alg>[+<alg>...]@" key tuple prefix as an algorithm list when every
+  token names a known JOSE algorithm exactly: a kid containing '@' (key@example.org) or a
+  slash-less server-root-relative filename (cert@2024.pem) in OIDCPublicKeyFiles /
+  OIDCPrivateKeyFiles / OIDC(Provider|OAuth)VerifyCertFiles was misread as an algorithm -
+  failing startup, or, when the segment happened to pass oidc_alg2kty()'s two-character match
+  ("RSbank"), silently truncating the kid and publishing a bogus "alg" in the RP JWKs
+- http: register the curl easy-handle pool's cleanup after the process cleanup: pool cleanups
+  run last-in-first-out, so the pooled handles were curl_easy_cleanup()d only after
+  oidc_process_cleanup had already run curl_global_cleanup() - undefined behavior in libcurl
+  that can crash a process that both served requests and destroys its configuration pool (the
+  Windows winnt MPM child, httpd -X) at shutdown or restart
+- proto: share the duplicate guard's directive-added key tracking across OIDCAuthRequestParams
+  and the per-path/dynamic parameters: a key the first directive added is not one this module
+  owns, so a per-path or discovery-supplied occurrence of the same key (RFC 8707 "resource" per
+  audience) was dropped with a misleading warning instead of being sent alongside it
+- cache/redis: do not unlock the serialized-model process mutex when the retry backoff released
+  it for the sleep and could not re-acquire it: posting the semaphore twice hands the shared
+  connection to two threads at once, interleaving their hiredis replies from then on
+- session: drop the decoded object when rejecting a payload with a newer format version instead
+  of leaving it on the session struct: the callers treat the rejection as "no session" and the
+  OIDCSessionCacheFallbackToCookie load then overwrote the pointer, leaking the refcounted
+  object once per rejected read in a mixed-version fleet
+- proto: only fire the extra-parameter duplicate guard against parameters that were already in
+  the authorization request before the directive was processed: a key repeated within
+  OIDCAuthRequestParams / OIDCPathAuthRequestParams itself (RFC 8707 sends "resource" once per
+  audience) collided with its own first occurrence and all but one value were silently lost
+- cache/redis: flush the idle connection pool when a checked-out connection turns out dead:
+  checkout only inspects hiredis' err flag, which cannot see the peer closing an idle socket, so
+  after a Redis restart or server-side idle timeout each retry popped the next dead socket and
+  the operation failed - bouncing an authenticated user back through login - with Redis
+  perfectly reachable
+- jose: pass a payload that brotli cannot decode through instead of failing the read: a libbrotli
+  build assumed every non-zlib-framed payload was brotli, so a payload written uncompressed
+  (OIDC_JWT_INTERNAL_NO_COMPRESS, or a writer built without brotli) made every session, state and
+  encrypted-cache read fail; also make the zlib helpers available alongside brotli so a build
+  defining both macros compiles
+- http: use ceil division for the chunked-cookie chunk count: a value whose length is an exact
+  multiple of OIDCSessionCookieChunkSize advertised a trailing empty chunk that set_cookie turns
+  into a delete, so the browser stored one chunk fewer than the counter claimed and the reader
+  (since it stopped accepting partial assemblies) dropped the whole client-cookie session,
+  sending the affected user round the login loop indefinitely
+- logout: zero the stack session struct in the back-channel/front-channel cleanup: the session
+  cache load reports a sid/sub index entry whose session entry is gone (superseded login,
+  eviction) as success without touching the struct, so the token-revocation step read
+  uninitialized memory as a session
+- metadata: actually fall back to the filename-derived issuer when a provider file carries no
+  "issuer" string: the JSON getter reports an absent key as success with a NULL value, so checking
+  its return code passed a NULL issuer onward and crashed in the issuer-to-filename conversion
+  when listing providers
+
+08/10/2026
+- http: bound the trailing CRLF strip on a captured response header value to the value's length, so
+  an empty header value cannot read (and, if the adjacent byte happens to match, write) before the
+  start of the buffer
+- http: return NULL instead of a truncated prefix when a chunked cookie is missing one of its
+  chunks, so a broken cookie set falls back to re-authentication instead of failing session decode
+  with a value that keeps getting resubmitted
+- revocation: require the remove_at_cache parameter before looking up the access token cache,
+  matching revoke_session's existing check, instead of probing the cache with a NULL key
+- session: skip the prompt=none "user changed" check when there is no prior remote_user, so a first
+  prompt=none response can establish a session instead of being rejected outright
+- DPoP: reject an omitted token_type explicitly when DPoP is required, and log a placeholder instead
+  of passing NULL to the error message
+- util/file, cache/file: reject symlinks/non-regular files and cap read size before loading a
+  metadata file or cached value into memory; metadata writes are now atomic (temp file + rename)
+- metadata: preserve the issuer's scheme when listing providers, instead of assuming https and
+  silently dropping HTTP-only providers from the list
+
+08/10/2026
+- remove the process-local derived-object cache tier (util/cache_local) and the five caches on it:
+  parsed session state, appinfo claim pairs, provider metadata, JWKs selection and compiled
+  Require-claim regexes. It was worth 24-34% of the module's own CPU, nearly all of that the
+  session cache alone, which does not pay for the concurrency and teardown surface it added
+- add OIDCDebugMaskSecrets, a server-level directive that turns off the masking of secrets and
+  tokens in the debug log for short-lived troubleshooting; it defaults to On and warns at startup
+  for as long as it is Off
+- cache/file: report an expired entry as a miss without unlinking it, leaving that to the cleaning
+  cycle; a writer's rename could land in between and the unlink then threw away the entry that had
+  just replaced it
+- cache/file: have the cleaning cycle confirm an entry is still the file it inspected before
+  removing it, so it cannot unlink an entry a writer replaced in the meantime either
+- cache/shm: compute the per-slot value size limit signed, so it cannot wrap into a huge limit when
+  the configured slot size is smaller than the entry header
+- do not strand a failed regular-expression compile in the pool it was handed: oidc_pcre_compile
+  now allocates nothing unless the compile succeeds, and takes a NULL error_str
+- release 2.4.20.2
+
+08/09/2026
+- store the process-local JWKS selection cache serialized and give each request its own parsed
+  copy, instead of sharing imported keys that could never be released; a worker no longer retains
+  another set of keys per OIDCJWKSRefreshInterval for the life of the process, at the cost of
+  parsing the one or two selected keys per request
+- fix a data race on the process-local caches' last-access stamp, which was written under the
+  read lock; it is now a whole-second value updated atomically, which is the resolution the
+  eviction order already had
+- do not leak a process-local cache's private pool when its creation fails part-way, and count an
+  entry dropped by a declining rebuild towards the compaction that reclaims its key
+- reduce the process-local cache to two operations, get_use and set_build, both of which run the
+  caller's callback under the lock, so that no cached pointer outlives it
+- only infer the OpenID Connect RP role from an OIDCRedirectURI that a vhost sets itself, not from
+  one it inherited from the base server: a server-level redirect URI lands in the merged config of
+  every vhost, including those that do no OpenID Connect at all (a static site, a health check, a
+  redirect-only vhost), and refusing to start over one of those would take down the whole server
+  for a configuration that worked before
+- name the (virtual) host in the messages of the post-config check: httpd does not record which
+  server_rec a startup message was logged against, so with more than one vhost neither the refusals
+  nor the warnings said which one to fix
+- release 2.4.20.1
+
+08/08/2026
+- do not lose an uncompressed payload whose first two bytes happen to look like a zlib header:
+  19 printable two-character prefixes satisfy that test ("x ", "H,", "80", "X(", "h$", ...), and
+  cache values -- unlike sessions and state cookies -- are arbitrary strings, so such a value was
+  declared compressed, failed to inflate and was silently dropped. Only reachable when payloads
+  are written uncompressed (OIDC_JWT_INTERNAL_NO_COMPRESS, or a build with neither zlib nor
+  brotli). A payload that does start inflating and then fails is still reported as an error
+- performance: grow the decompression buffer by doubling rather than by a fixed 8KB chunk;
+  inflating up to the 10MB cap took ~1280 rounds and left 6.25GB of dead buffers behind in the
+  request pool, which is the outcome that cap exists to prevent. It now costs under 30MB
+- fix oidc_proto_jwt_header_peek handing back no key id to a caller that asks only for the "kid"
+- test: raise line coverage from 94.2% to 95.6% and start measuring branch coverage (54.9%),
+  both gated in CI; the test suite no longer runs twice per coverage job
+
+08/07/2026
+- recognize whether a stored payload is compressed instead of assuming the local setting, so a
+  session survives a change to OIDC_JWT_INTERNAL_NO_COMPRESS and is readable across servers
+  built with and without compression; previously flipping that variable handed the compressed
+  bytes back as the session contents. The written format is unchanged.
+- stamp the session payload with a format version and discard a session written in a newer
+  format instead of misreading it; sessions written before this carry no version and still
+  load, so upgrading and downgrading are both unaffected
+- docs: correct five wrong statements in auth_openidc.conf about the defaults of
+  OIDCMemCacheConnectionsMin, OIDCHTTPTimeoutShort, OIDCClientName, OIDCResponseMode and
+  OIDCProviderMetadataRefreshInterval
+- security: give each process-local cache its own memory pool instead of sharing one across all
+  five, which let two threads in two different caches allocate from that pool concurrently
+  under different locks (threaded MPMs only)
+- performance: re-check the entry under the write lock when replacing a process-local cache
+  entry, so concurrent refreshers no longer each rebuild it
+- performance: release the cross-process refresh mutex while backing off for a refresh that
+  another caller is performing, so one waiter no longer blocks every refresh on the machine
+- security: do not revoke a session's tokens at the OP on an unauthenticated front-channel
+  logout that names it only by sid, matching what the back-channel handler already did
+- security: do not let an extra authorization request parameter duplicate one that the
+  module sets itself; a request-supplied one is dropped and a configured one replaces
+  ours, rather than both being sent and the provider deciding which wins
+- security: HTML-escape the three values still interpolated raw into an attribute on a
+  generated page: the redirect URI in the discovery page's provider links and form action,
+  which a relative OIDCRedirectURI resolves against the request's host, and the provider's
+  authorization endpoint in the auto-POST form
+- security: start a new session on login instead of writing the newly authenticated
+  identity into whatever session id the browser presented, which let anyone able to set a
+  cookie for the host keep a handle on the session and leave state in it beforehand;
+  server-cache sessions only, but client-cookie sessions are re-keyed too
+- security: ignore the "scopes" and "auth_request_params" query parameters unless the
+  Discovery response passes CSRF validation; they shape the authorization request and are
+  documented as values returned from the Discovery page, but were honoured on 3rd-party
+  initiated SSO too, so any cross-site link could choose the scopes a session ends up with.
+  NB a deployment that passes either of these on a 3rd-party initiated login URL will now
+  see them ignored, with a warning logged
+- security: require the "iat" and "jti" claims in a back-channel logout token, both of
+  which OpenID Connect Back-Channel Logout 1.0 makes REQUIRED; without them a captured
+  logout token stayed valid indefinitely and its replay was undetectable
+- security: redact the credentials that were written verbatim to the log: the provider's
+  response body, the authorization code and tokens parsed out of a front-channel response
+  or back-channel logout request, the unhashed cache key (which is the session id or a
+  token, and was logged at warning level), a refresh token and full cookie values
+- security: scrub client-supplied OIDC_* headers on the request paths that are let
+  through without authentication - the CORS preflight (OPTIONS) shortcuts and the two
+  redirect-URI/JWKS content-handler dispatches - so a forged claim header cannot reach
+  the application on a request where no authentication took place
+- cfg: accept "OIDCSessionCookieChunkSize 0", which auth_openidc.conf and the directive
+  help both document as the way to disable chunking, and which the runtime already
+  honours, but which the parser rejected as below the 256 minimum
+- test: fail the build when auth_openidc.conf has drifted from the code: every directive
+  must be documented, every documented directive must exist, and the OIDCMetricsData
+  class list must match the metrics classes the parser accepts
+- doc: correct 17 directive descriptions shown by "httpd -L", most importantly the three
+  OIDCUserInfo*ResponseAlg entries, which claimed to apply only to dynamic client
+  registration although they are required to verify and decrypt a UserInfo JWT
+- doc: correct the OIDCMetricsData class list in auth_openidc.conf, which offered an
+  invalid "requests" class that makes Apache refuse to start, omitted "provider" from
+  the syntax line and omitted the "logout" class entirely
+- metrics: flush on a scratch pool and serve a scrape from the request pool, rather than
+  copying and re-serializing the whole document onto the never-cleared process pool
+- metrics: build the per-sample lookup key on the request pool, so only the copy the
+  hash retains on insert is allocated from the never-cleared process pool
+- cache: fail a file cache write when the value could not be fully written, instead of
+  reporting success and leaving a truncated entry that only fails on the next read;
+  also drop the partially written temporary file rather than leaking a locked fd
+- metrics: add counters and timers for the remaining outbound provider calls and
+  operational events: JWKs retrieval, pushed authorization requests, dynamic client
+  registration, token revocation, DPoP nonce retries, back-channel logout outcomes,
+  session-cache-to-cookie fallbacks and cache operation retries
+- metadata: avoid a NULL pointer dereference (segfault) when the OP selection/discovery
+  page is served while no OIDCMetadataDir is configured, and catch an RP vhost that
+  configures OIDCRedirectURI without any provider source at startup
+- test: increase unit test line coverage from 91% to over 94% with negative-path and
+  option-matrix tests across the http, jose, session, cache, oauth and handler code
+- test: fail the fuzz seed corpus replay when no target actually ran, instead of
+  reporting a pass after skipping all of them
+- jose: test the compression backend macro with "#elif defined(USE_ZLIB)", matching
+  the "#ifdef USE_LIBBROTLI" above it and keeping the file -Wundef clean
+- src: drop the include of mod_auth_openidc.h from 11 files that use nothing from it,
+  and include session.h directly in session.c, which was picking it up transitively
+- ci: set an explicit GITHUB_TOKEN permission scope on all three workflows, which ran
+  at the repository default; only the issue-triage job gets a write scope
+- configure: fail when --with-jq is given but libjq is absent, instead of silently
+  building a module with the claims-expression directives compiled out
+- proto: pass the server config in explicitly rather than looking it up from the global
+  module config, so no protocol code depends on a live Apache server record
+- ci: promote -Wformat-security, -Wimplicit-fallthrough and -Wpointer-arith to errors
+  on the gcc and clang legs, which the tree already passes
+- test: cast the seven size_t lengths that were narrowed implicitly to int/unsigned,
+  so the suite also builds clean under the clang leg's -Wshorten-64-to-32
+- ci: run "make check" on the clang static-analysis leg too, so those type checks
+  cover the test suite rather than only the module sources
+- ci: pin the third-party GitHub Actions by commit SHA instead of by mutable tag
+- configure: fail when --with-hiredis is given but hiredis is absent; the unflagged
+  default still probes and degrades silently, as its help string advertises
+
+08/03/2026
+- metrics: fix the description of the "authtype.handler" timer, which read
+  "authz+authz" instead of "authn+authz". The string is published verbatim in
+  the Prometheus "# HELP" line and in the description field of the JSON format,
+  so it was user-visible output, not just an internal comment
+
+08/01/2026
+- release 2.4.20
+
+07/31/2026
+- refresh: validate a refreshed id_token before applying it to the session.
+  oidc_refresh_token_grant_apply_id_token took the id_token returned by the token
+  endpoint apart with a bare oidc_jwt_parse and stored its claims unconditionally:
+  no decryption keys, no signature verification and none of the payload checks. It
+  now runs the same oidc_proto_idtoken_parse as the id_token obtained at
+  authentication time, as OpenID Connect Core 1.0 section 12.2 requires - keeping
+  the section 3.1.3.7 item 6 exception for an unsigned id_token received over the
+  TLS-protected back-channel, which a refresh response is - and additionally
+  refuses a refreshed id_token whose "sub" differs from the one the session was
+  established with. An id_token that does not validate no longer contributes its
+  claims, is no longer stored in its serialized form and is no longer handed back
+  to the caller; the refresh grant itself still succeeds, so the refreshed access
+  token is unaffected. Thanks to Sun Liqiang for reporting the missing signature
+  verification
+
+07/30/2026
+- metadata: report an "mtls_endpoint_aliases" entry that is not a valid URL as
+  an error instead of quietly using the conventional endpoint for it. RFC 8705
+  section 5 has the client use the alias for the endpoints that are listed, and
+  the conventional endpoint is precisely the one that does not bind the access
+  token to the TLS client certificate, so the fallback silently produced the
+  unbound tokens the aliases exist to avoid. An endpoint the aliases do not
+  mention at all still falls back, as it should
+- build: parenthesize the arithmetic in the object-like macros defining size and
+  interval bounds; no behaviour change, since every current use happens to sit
+  in a context where the operators bind the intended way
+- util: size the output buffer of a regular-expression substitution from what
+  the result actually needs, so OIDCRemoteUserClaim/OIDCOAuthRemoteUserClaim no
+  longer fail on a long claim value. The buffer was fixed and the input was
+  capped at 254 characters to compensate - a limit taken from an unrelated
+  constant (the maximum number of capture groups) and reported as "the maximum
+  allowed for pcre_subst". The remaining cap on the input is now its own
+  constant, at 4096 characters
+- oauth: clamp a token expiry claim instead of letting it wrap. A NumericDate is
+  a JSON number, so it may carry a value no integer type can hold; converting
+  one that does not fit is undefined, and converting seconds to the internal
+  microsecond representation multiplies by a million, which wraps into a
+  negative - i.e. already expired - timestamp somewhere beyond the year 292277.
+  A far-future expiry therefore made the validation result uncacheable, turning
+  every request into an introspection call. The same conversion of an id_token
+  "exp" when refreshing the session is clamped as well
+- dpop: apply the FAPI 2.0 "mutual-TLS or DPoP" rule to a statically configured
+  OP too, i.e. one whose endpoints are all set with OIDCProvider* directives
+  rather than obtained from OIDCProviderMetadataURL or OIDCMetadataDir. Standing
+  down from mandating DPoP relied on OIDCCertBoundAccessTokens having been
+  resolved while parsing the provider metadata, which never happens for such an
+  OP, so DPoP was still required of it and only an explicit
+  OIDCCertBoundAccessTokens "on" worked around it
+- session: refuse to write a client-side session cookie that would have to be
+  split over more chunks than can be read back. The reader rejects a chunk
+  count above 99 but the writer had no bound at all, so a session larger than
+  99 times OIDCSessionCookieChunkSize was written out and then dropped on the
+  very next request, sending the user round the authentication loop for ever
+  rather than failing visibly. With the default chunk size of 4000 that needs a
+  ~400Kb session, but OIDCSessionCookieChunkSize can be set as low as 256, at
+  which point ~25Kb is enough. It is now an error naming both the chunk size
+  and OIDCSessionType "server-cache" as the ways out
+- http: redact every occurrence of a sensitive parameter in the debug log of an
+  outgoing request body, and only match a parameter name at a parameter
+  boundary so that e.g. "xcode=" is no longer taken for "code=". The scan
+  restarted from the beginning of the body after each rewrite, where it kept
+  finding the "<name>=***" it had just written, so a second occurrence was
+  never reached and three quarters of the work was a no-op repeated on every
+  outgoing HTTP call regardless of the log level
+- util: fix an out-of-bounds read in the "$<n>" replacement handling used by
+  OIDCRemoteUserClaim/OIDCOAuthRemoteUserClaim, in builds against libpcre 1.x
+  (the libpcre2 path is unaffected). A group reference one past the number of
+  capture groups the pattern actually has was accepted, and the arrays holding
+  the captured substrings were cleared with a byte count instead of their size,
+  leaving all but the first few entries holding stack garbage. So a replacement
+  referring to e.g. "$2" against a pattern with a single capture group could
+  size the output buffer from an uninitialized length and copy from an
+  uninitialized pointer, crashing the child process or overflowing the heap
+- metadata: obtain RFC 8705 section 3 certificate-bound access tokens with a
+  configured TLS client certificate (OIDCClientTokenEndpointCert/Key) when that
+  certificate is not used for client authentication, e.g. alongside
+  private_key_jwt or client_secret_basic. Until now the "mtls_endpoint_aliases"
+  endpoints of the OP and the "tls_client_certificate_bound_access_tokens"
+  client registration parameter were tied to the mutual-TLS client
+  authentication methods, so a certificate presented for token binding only
+  kept talking to the conventional endpoints and silently ended up with
+  unbound tokens against an OP that separates the two. The new
+  OIDCCertBoundAccessTokens directive controls it: "auto" (the default) also
+  applies the aliases when a certificate is configured and the OP advertises
+  "tls_client_certificate_bound_access_tokens", "on" does not require the OP to
+  advertise it and "off" restores the previous behaviour of never inferring it
+  from the certificate alone. FAPI 2.0 (OIDCProfile) implies "on". The same
+  applies to the introspection endpoint on the OAuth 2.0 Resource Server side,
+  and it can be set per OP in the .conf metadata with the "cert_bound_tokens"
+  key
+- metadata: take the RFC 8705 mutual-TLS decisions - which token endpoint
+  authentication method to select out of
+  "token_endpoint_auth_methods_supported" and whether to prefer the
+  "mtls_endpoint_aliases" endpoints - against the settings of the OP they are
+  about. They were taken while parsing the provider metadata, i.e. before the
+  .conf metadata of that OP was applied, so in a multi-provider
+  (OIDCMetadataDir) setup a TLS client certificate ("token_endpoint_tls_client_
+  cert") or profile ("profile") configured there went unnoticed and its OP kept
+  talking to the conventional endpoints with unbound access tokens; only the
+  global OIDCClientTokenEndpointCert/OIDCProfile had any effect
+- metadata: apply an "mtls_endpoint_aliases" registration_endpoint (as
+  advertised by e.g. the OpenID Foundation conformance suite) to dynamic client
+  registration too, and present the configured TLS client certificate on the
+  registration request like at the other endpoints
+- dpop: do not require DPoP under OIDCProfile "FAPI20" when the access tokens
+  are sender-constrained through RFC 8705 mutual-TLS certificate binding
+  instead: FAPI 2.0 Security Profile section 5.3.2.1 allows either mechanism,
+  while DPoP was mandated unconditionally - and could not be turned off, since
+  the profile overrode OIDCDPoPMode - which broke the mutual-TLS variant of the
+  profile against an OP that does not support DPoP at all (the token endpoint
+  call failed on the "Bearer" token type it returns). An OP that advertises
+  "dpop_signing_alg_values_supported" keeps requiring DPoP, so this never
+  downgrades an OP that offers it; OIDCDPoPMode/"dpop_mode" now applies under
+  FAPI 2.0 for the certificate-bound case and can ask for DPoP on top
+- metadata: never override an explicitly configured endpoint URL
+  (OIDCProviderTokenEndpoint, OIDCProviderUserInfoEndpoint,
+  OIDCProviderRevocationEndpoint,
+  OIDCProviderPushedAuthorizationRequestEndpoint) with an
+  "mtls_endpoint_aliases" entry from the provider metadata; the precedence is
+  now explicit configuration, then the mutual-TLS alias, then the conventional
+  metadata endpoint
+
+07/29/2026
+- dpop: re-create the token endpoint client authentication when retrying a token
+  endpoint call with a server-provided DPoP nonce: a client_secret_jwt or
+  private_key_jwt assertion carries a one-time jti and a 60-second exp, so
+  resending the assertion of the "use_dpop_nonce" attempt could be rejected by
+  the OP as a replay
+- jwks: make the forced-refresh overload guard configurable with the
+  OIDC_JWKS_FORCED_REFRESH_INTERVAL environment variable (0-3600 seconds, 0
+  disables it) instead of fixed at 60; an out-of-range or non-integer value is
+  ignored with a warning and the default applies
+- id_token: accept an unsigned (alg "none") id_token obtained over the
+  back-channel again when the signing algorithm has been pinned to "none"
+  itself, through OIDCIDTokenSignedResponseAlg or the client metadata. Since
+  2.4.19.4 any pinned algorithm suppressed the "code"-flow exception that
+  OpenID Connect Core 1.0 section 3.1.3.7 item 6 allows, so a pin of "none" -
+  the way an operator, or the OP's own client registration, declares that this
+  OP issues unsigned id_tokens - demanded a signature that cannot exist and
+  failed every login. A pin of any other algorithm still overrides the
+  exception and rejects the unsigned token, and an unsigned id_token received
+  over the front channel is still rejected in all cases
+- request: make the scope=openid parameter that accompanies a request_uri on the
+  authorization request dependent on the configured OIDCProfile: OpenID Connect
+  Core 1.0 requires it, but FAPI 2.0 Security Profile section 5.3.3.2 allows the
+  client_id and request_uri parameters only, so it is now omitted when the
+  profile is FAPI20; this fixes a regression for FAPI 2.0 deployments introduced
+  in 2.4.19.3 (and present in 2.4.19.4), which sent the parameter unconditionally
+
+07/28/2026
+- security: never log the credentials that an OIDCRedisCacheServer value may
+  carry: the value is echoed verbatim when it fails to parse, and the failover
+  backend accepts per-server credentials in it as
+  [<username>:<password>@]<host>:<port>, so a misconfigured value could put a
+  password in the error log; the credentials part of each comma-separated tuple
+  is replaced with a placeholder now
+- security: don't log the cached value when the sanity check on a Redis reply
+  fails: the length mismatch that check guards against is a property of the
+  reply, not of its content, so report the two lengths instead of the value,
+  which is cached (session) data that has no business in the error log
+- session: take the OIDCSessionCacheFallbackToCookie fallback when the cache has
+  no entry for the session cookie, not only when the cache reports an error. On a
+  save that cannot reach the cache the module stores the whole session in the
+  cookie, but the load treated that cookie as a stale cache key: it deleted the
+  cookie and returned success, so the fallback branch never ran and the user was
+  sent round the authentication loop on every request. A backend whose writes fail
+  while its reads report a plain miss - a file cache on a directory it cannot
+  write to - hit this on every request
+
+07/27/2026
+- security: add OIDCOAuthVerifyAudience and OIDCOAuthVerifyIssuer to bind
+  locally validated JWT access tokens to this resource server. The local
+  (non-introspection) OAuth 2.0 Resource Server path verified only the
+  signature of a JWT access token: neither "aud" nor "iss" was checked, and no
+  directive existed to configure what to check them against, so any token
+  signed by the configured key (set) was accepted - including one that the
+  Authorization Server issued for a completely different resource server, whose
+  claims were then used to set REMOTE_USER (RFC 9068 section 4).
+  OIDCOAuthVerifyAudience takes one or more identifiers of this resource server
+  and accepts a token when its "aud" claim - a string or an array - contains at
+  least one of them; OIDCOAuthVerifyIssuer matches the "iss" claim. Both are
+  also applied to claims served from the validation cache, which is keyed on
+  the token and the crypto passphrase and therefore shared between vhosts that
+  inherit the same OIDCCryptoPassphrase. When neither is configured nothing
+  changes, so existing deployments keep working; a startup warning is logged
+  when JWT access tokens are validated locally without an audience configured.
+  As an alternative (or in addition) the audience can be enforced in the
+  authorization policy with "Require claim aud:<value>", which works on earlier
+  releases as well. Note that the OAuth 2.0 Resource Server functionality has
+  been deprecated since 2.4.0 and is superseded by mod_oauth2. Reported by
+  EQSTLab, see:
+    https://github.com/OpenIDC/mod_auth_openidc/security/advisories/GHSA-wcvh-g65p-v576
+- security: require the "exp" claim in locally validated JWT access tokens: it
+  was optional, so a JWT access token without an expiry was accepted forever
+- fix: accept a token expiry claim that carries a non-integer value: a
+  NumericDate is a JSON number and may hold a fraction (RFC 7519 section 2), but
+  the claim was read back as a JSON integer when it bounds the validation cache
+  entry, whereas it is verified as a JSON number. A JWT access token with a
+  fractional "exp" was therefore cached for the 60 second default instead of
+  until its expiry, and an introspection result whose expiry claim was
+  configured as mandatory (OIDCOAuthTokenExpiryClaim ... mandatory) was rejected
+  outright, failing the whole introspection
+
+07/22/2026
+- perf: give the process-local derived-object caches a proper LRU eviction and
+  an overflow warning: on a full cache the least-recently-used entry is evicted
+  (retaining the hot working set) instead of clearing the whole cache, and a
+  rate-limited warning is logged when a still-recently-used entry has to be
+  evicted so an operator can tell the cache is undersized for the concurrency;
+  the session and appinfo cache defaults are raised (500->2000, 256->1000) for
+  high-concurrency deployments (e.g. OIDCCacheShmMax-sized session stores)
+- fix: cache/shm: anchor the shm segment (and round the per-slot stride) to a
+  64-byte boundary so the aligned(64) entry slots really are 64-aligned; without
+  this the compiler's aligned SIMD stores into an under-aligned slot fault
+  (SIGSEGV) on builds that vectorize them (e.g. amazonlinux 2023's
+  -march=x86-64-v2)
+- refactor: consolidate the five per-file process-local derived-object caches
+  (compiled authz regexes, parsed provider metadata, parsed session state,
+  flattened appinfo claim pairs, selected JWKs) onto a single reusable
+  util/cache_local module, so the rwlock, write-lock-only pool allocation,
+  bounding/reset, config-reload owner-reset and pool-cleanup ordering live in
+  one tested place instead of being re-implemented in each cache; behavior is
+  unchanged (same keys, freshness validators and refcount/retire semantics)
+- perf: check Redis connections out per request from a per-process idle pool
+  instead of serializing every worker thread's network round-trip on one
+  shared connection under a mutex; the mutex now only guards the (short) pool
+  push/pop, a connection-level failure tears down only the request's own
+  connection (the retry then reconnects), and setting OIDC_REDIS_MUTEX_GLOBAL
+  restores the legacy single-connection global-lock model; the
+  cluster/sentinel/failover backends keep their existing serialized model
+- perf: extend the parsed-session cache to client-cookie sessions, with the
+  cookie value acting as both cache key and validator, so an unchanged session
+  cookie skips the per-request JWE decryption, decompression and JSON parse; a
+  full authenticated request with client-cookie sessions measures 50% faster
+  (35.8us -> 18.0us), on par with server-cache sessions
+- perf: keep a small pool of reusable libcurl easy handles instead of creating
+  and destroying one per outbound call: a reused handle retains its connection
+  cache, DNS cache and TLS session cache, so consecutive requests to the same
+  endpoint (token, userinfo, introspection, JWKs, metadata) reuse the TCP/TLS
+  connection instead of paying DNS + TCP + TLS handshake every time; handles
+  whose request failed are destroyed rather than reused, handles inherited
+  over fork() are dropped in the child (their connections share descriptors
+  and TLS state with the parent), and TCP keepalive is enabled on outbound
+  connections
+- perf: index the shm cache with an in-segment hash table (bucket chains plus
+  a free list, 1-based slot indexes) instead of linearly scanning all slots on
+  every get/set while holding the global mutex: operations become O(chain)
+  independent of OIDCCacheShmMax - at just 500 slots a miss measures 87%
+  faster (1136ns -> 149ns) and a set 72% faster (963ns -> 268ns), with the
+  gap growing linearly with the slot count (default 10000) - and the mutex
+  hold time shrinks accordingly for all worker processes; a full cache evicts
+  via bounded random sampling picking the least-recently-used of the sample
+  (the Redis approach) rather than a full LRU scan
+- perf: cache the flattened claim name/value pairs (header-name construction,
+  value rendering of object/array claims, base64url/latin1 encoding) keyed by
+  the identity of the shared claims object from the parsed-session cache, so
+  the per-claim flattening work runs once per session change instead of on
+  every request; each entry pins its claims object through a JSON reference
+  so the pointer key cannot be reused while cached; a full authenticated
+  request measures another 8% faster (18.1us -> 16.6us), more with
+  object/array-heavy claim sets
+- perf: release the Redis serialization mutex while sleeping between
+  connect-retry attempts (default 300ms): other worker threads in the process
+  can then proceed (and fail fast themselves) instead of queueing behind the
+  sleeping thread for the whole interval on a transient Redis outage
+- perf: compress internal encrypted JWTs (state/session cookies, encrypted
+  cache values) with deflate level/window/memory parameters sized for their
+  small payloads instead of Z_BEST_COMPRESSION with a 32KB window, cutting the
+  ~256KB of per-call zlib allocations by an order of magnitude and halving the
+  envelope creation cost (51us -> 21us for a 3KB session) at ~1% ratio loss;
+  zlib streams are self-describing so old and new binaries decode each other's
+  values unchanged
+- perf: hoist the string-length evaluation out of the per-character loop in
+  oidc_http_hdr_normalize_name (was re-evaluated every iteration)
+- perf: keep the parsed session state of server-cache sessions in a per-process
+  cache keyed by session id and validated against the raw cached session
+  document, so the multi-KB JSON parse of the session runs only when the
+  session actually changed; the parsed object is shared read-only (requires
+  atomic JSON reference counting, disabled otherwise) and the session setters
+  copy-on-write for the rare mutating request; a full authenticated request
+  through the authentication + authorization hooks measures 44% faster
+  (31.5us -> 17.8us)
+- perf: keep parsed provider metadata from the metadata directory in a
+  process-level cache validated by the file's mtime+size, so the per-request
+  disk read + JSON parse of the provider .provider file only happens when the
+  file actually changed; requires the JSON library's atomic reference counting
+  (the cache stays disabled otherwise) and multi-process consistency is
+  retained through the shared file's timestamp
+- perf: hand out JWKs-cache keys as shared objects instead of per-request
+  refcounted copies: cjose's key refcount is not atomic, so the previous
+  copy-with-retain on the (concurrent) cache read path was a data race under
+  threaded MPMs; shared keys are marked so oidc_jwk_destroy leaves the backend
+  object alone, and purged/replaced keys are retired until pool cleanup since
+  in-flight requests may still use them
+- perf: restore the parsed id_token/userinfo/scope request state from the
+  previous request on internal redirects (ErrorDocument, mod_rewrite) instead
+  of re-loading and re-parsing the whole session from the cache; the session
+  reload remains as a fallback when the previous request carries no state
+- perf: cache parsed JWKs selection results per process keyed by
+  (jwks-uri, kid, x5t, kty) so repeated JWT validations against the same
+  signing key skip the per-validation JSON decode of the JWKs document and
+  the bignum-parsing cjose key imports (~4us per RSA key import); entries
+  expire in lockstep with the JWKs refresh interval, a forced refresh
+  (suspected key rollover) purges the cache, and the refcounted cjose keys
+  keep request-held copies safe across a purge
+- perf: take a shared (instead of exclusive) file lock when reading file-cache
+  entries so concurrent requests reading the same (session) entry no longer
+  serialize; writers are unaffected (they write a temp file and atomically
+  rename it) and the expiry cleaner's exclusive lock still excludes readers;
+  tolerate a concurrent reader having already removed an expired entry
+- fix: authorization regression (some "Require claim" checks that should grant
+  wrongly denied with 401) from memoizing the merged authorization claim set in
+  the request state across a request; Apache evaluates the authorization
+  provider in phases/subrequests where the underlying claim state differs, so
+  the cached merge could go stale - build it fresh for each evaluation again
+- perf: register request-state JSON cleanups on the main request's pool so a
+  subrequest can no longer tear down state the main request still uses;
+  introduces oidc_request_state_json_set_new (ownership-transferring)
+- perf: cache locally validated JWT access token claims keyed by the token and
+  bounded by its "exp" claim (60s without one), mirroring the existing
+  introspection-result cache, so repeated resource-server requests with the
+  same bearer token skip decryption-key setup and signature re-verification;
+  OIDCOAuthTokenIntrospectionInterval semantics apply: -1 disables the cache
+  and a value > 0 bounds result reuse (e.g. to pick up JWKs key rotation)
+- perf: cache compiled Require-claim regular expressions for the lifetime of the
+  server process instead of recompiling them on every authorization evaluation;
+  a full "Require claim <name>~<regex>" evaluation measures 43% faster
+  (1374ns -> 782ns)
+- perf: replace the curl-based URL encode/decode in http.c with a plain RFC 3986
+  percent-codec, avoiding a throwaway CURL handle init/cleanup plus heap churn
+  on every call; measures 10x faster (761ns -> 74ns per encode)
+
+07/21/2026
+- proto/token: fix a NULL-pointer dereference (Apache worker crash) when the
+  token endpoint returns a "use_dpop_nonce" error while DPoP is disabled
+- util/jq: fix a negative OIDC_JQ_FILTER_CACHE_TTL causing jq filter results to
+  be cached under a NULL key with an already-past expiry; only cache when the
+  TTL is positive, matching the cache-read guard
+- cfg/metadata: fix the globally configured OIDCProviderSignedJwksUri
+  verification keys being silently dropped in metadata-directory mode when a
+  provider's .conf did not itself supply a "signed_jwks_uri_key", which caused
+  the signed JWKs signature verification to be skipped
+- metadata: fix the client-metadata "response_types" fallback never running in
+  metadata-directory mode; .conf parsing pre-set response_type to the "code"
+  default, so an OP that only advertises other response types (e.g. implicit)
+  was still sent response_type=code
+- oauth: fix a configured OIDCProviderMetadataRefreshInterval being applied to
+  the OAuth AS metadata cache expiry as microseconds instead of seconds, which
+  made the metadata document re-fetched over HTTP on almost every bearer-token
+  request
+- metadata: fix several JSON/JWT memory leaks on the provider-metadata refresh,
+  dynamic client (re-)registration and signed-JWKs validation error paths that
+  accumulated over a worker process's lifetime
+- cfg/parse: reject overflowing and trailing-junk integer values ("300x",
+  out-of-range) that were silently accepted before, share one strict parse core
+  so the lenient _oidc_str_to_int() falls back to its default (not 0) on bad
+  input, stop truncating timeout values above INT_MAX microseconds, and make an
+  invalid OIDCHTTPTimeoutLong/Short value fail config load instead of becoming a
+  0 (infinite) curl timeout
+- oauth: parse OIDCOAuthServerMetadataURL metadata into a private per-request
+  config view instead of mutating the shared server config with request-pool
+  memory, which was a cross-request use-after-free / data race under threaded
+  MPMs (worker/event)
+- cfg: fix the "method[:alg]" token/introspection endpoint-authentication pair
+  merging member-wise across virtual hosts, so a vhost that re-set only the
+  method wrongly inherited the base server's algorithm instead of resetting it
+- metadata: fix a per-authentication heap leak of the inline "keys" from a
+  provider .conf in metadata-directory mode (the parsed cjose keys were never
+  released); release them with the request pool
+- metadata: also release the signed-JWKs verification keys per request; a .conf
+  "signed_jwks_uri_key" was parsed into an owned key set that leaked, and the
+  global-keys fallback now inherits a private copy so it is cleaned up uniformly
+- json: fix oidc_json_object_get_string_array pushing a NULL entry for each
+  non-string array element instead of skipping it (e.g. a numeric value in a
+  .conf "id_token_aud_values" array)
+
+07/20/2026
+- metrics: give the revoke-session counter a unique name
+  ("request.revoke_session") instead of colliding with the session-management
+  counter
+- cfg/oauth: fix OIDCOAuthIntrospectionEndpointKeyPassword being lost in
+  merged (virtual host) configurations
+- cfg/cache: fix OIDCCacheShmMax/OIDCCacheShmEntrySizeMax explicitly set to
+  their default value in a vhost not overriding a differing base server value
+- proto/request_object: fix a leak of the parsed OIDCRequestObject
+  configuration on the request-object-type error paths
+- refactor for readability/maintainability: deduplicate security-relevant
+  logic (log-redaction list, HTML/JS escaping, RFC 8705 endpoint-auth
+  selection, JOSE digest/hash-length mapping, refresh-error policy, RFC 7009
+  revocation, no-cache headers, per-flow response-parameter stripping), share
+  one config merge-helper trio, split proto/request_object.c out of
+  proto/request.c, move authentication-request emission into the handle
+  layer, dispatch per-profile behavior through an ops table, add a portable
+  OIDC_STATIC_ASSERT, and table-drive the authz handlers and redirect-URL
+  character checks
+- jose/config: support publishing an "alg" (algorithm) parameter on the keys in
+  the client JWKs and duplicating a single RSA/EC key under multiple algorithms;
+  OIDCPublicKeyFiles/OIDCPrivateKeyFiles now accept an optional
+  "<alg>[+<alg>...]@" prefix, e.g. "enc:RSA-OAEP@<file>" publishes the key with
+  "alg":"RSA-OAEP" and "enc:RSA-OAEP+RSA-OAEP-256@<file>" publishes it once per
+  algorithm under distinct, alg-derived "kid"s; this lets an OP (e.g. Keycloak)
+  fetch the key from OIDCClientJwksUri and select a key-management algorithm
+  itself, instead of the RP having to register the encryption JWK inline
+
+07/19/2026
+- request: emit "cty":"JWT" on an encrypted request object and stop appending a
+  trailing NUL byte to the JWE plaintext, so that OPs which strictly follow
+  RFC 7519 section 5.2 (e.g. Keycloak) can decrypt and parse a signed-then-
+  encrypted request object; previously such a request was rejected with
+  "invalid_request"/"Failed to deserialize JWT" because the decrypted Nested JWT
+  was neither flagged with a content type nor cleanly base64url-decodable; adds a
+  "cty" field to the JOSE header struct
+- add support for RFC 8705 OAuth 2.0 Mutual-TLS Client Authentication:
+  "tls_client_auth" and "self_signed_tls_client_auth" can now be configured
+  as the authentication method in OIDCProviderTokenEndpointAuth and
+  OIDCOAuthIntrospectionEndpointAuth (and the per-provider
+  token_endpoint_auth .conf key), using the TLS client certificate configured
+  with OIDCClientTokenEndpointCert/Key resp.
+  OIDCOAuthIntrospectionEndpointCert/Key; an mTLS method is auto-selected
+  from token_endpoint_auth_methods_supported resp.
+  introspection_endpoint_auth_methods_supported only when such a
+  certificate is configured and no client secret is set (with a client
+  secret configured, client_secret_basic remains preferred and the
+  certificate is used solely for RFC 8705 section 3 certificate-bound
+  access tokens)
+- metadata: apply the RFC 8705 section 5 "mtls_endpoint_aliases" from the
+  provider metadata to the token, userinfo, revocation and pushed
+  authorization request endpoints, and from the AS metadata to the
+  introspection endpoint, when a mutual-TLS authentication method is in
+  effect
+- http: also present the configured TLS client certificate at the userinfo,
+  revocation, pushed authorization request and aggregated/distributed-claims
+  endpoints (previously only at the token and introspection endpoints) so
+  RFC 8705 section 3 certificate-bound access tokens can be used against
+  those endpoints
+- registration: request "tls_client_certificate_bound_access_tokens" during
+  dynamic client registration when a mutual-TLS authentication method is
+  configured
+
+07/18/2026
+- id_token: fix a memory leak on the id_token parse failure path: the
+  symmetric decryption key derived from the client secret was only freed
+  after a successful JWT parse, so every authorization response carrying an
+  unparseable id_token leaked the (process-lifetime allocated) key material
+- request: fix a memory leak on the authentication request error path: when
+  the original URL could not be stored in the state the freshly created
+  proto state object was not destroyed before returning the error
+- cfg: fix the token endpoint authentication method validation so that
+  private_key_jwt is consistently rejected for configurations without private
+  signing keys: the candidate-method list was a static array that got the
+  private_key_jwt entry added in place when a private-key-carrying config
+  validated first (e.g. another virtual host) and never removed, so later
+  no-private-key validations wrongly accepted it too
+- refresh: bound the back-off loop that waits for a sibling caller's
+  in-progress refresh grant to the refresh-lock TTL, so a cache backend that
+  does not expire the lock entry promptly can no longer stall the request
+  indefinitely; this also makes the "timeout waiting for refresh token cache
+  to unlock" recovery branch reachable again - it had become dead code since
+  the wait loop could only ever exit once the lock value was gone
+- jose: size the zlib deflate output buffer with deflateBound(); the fixed
+  input_len * 2 allocation was smaller than zlib's constant header/trailer
+  overhead for values of just a few bytes, so compressing such values failed
+  and any cache write of a tiny value (e.g. a cached jq expression result of
+  "null") was silently dropped with a "could NOT store" warning
+
+07/17/2026
+- logout: support back-channel logout tokens that carry only "sub" (allowed by
+  OpenID Connect Back-Channel Logout 1.0 section 2.6) for sessions that were
+  created with a distinct "sid"; when the OP supports back-channel logout, a
+  session is now additionally indexed by "sub" so such a logout token can
+  locate it, and a logout cleans up all of the session's index entries. The
+  secondary index is only maintained when back-channel logout is enabled on
+  the provider (OIDCProviderBackChannelLogoutSupported or the OP's discovery
+  metadata), so there is no extra cache usage otherwise. Also fixes a latent
+  session-state leak on the logout cleanup path
+- session management: persist the per-path authentication request parameters
+  (OIDCPathAuthRequestParams) and scope (OIDCPathScope) used at initial
+  authentication in the session, and reuse them for the silent "check"
+  re-authentication triggered by the RP iframe; previously that re-check ran
+  at the redirect URI and therefore picked up the redirect URI's own per-path
+  configuration (usually empty), silently dropping the values that applied to
+  the originally protected path; the values are only stored when session
+  management is enabled (a check_session_iframe is configured), so there is no
+  session-size impact otherwise, and sessions predating this fall back to the
+  old behaviour
+- metadata: inherit the token endpoint authentication algorithm from the
+  global configuration in per-client .conf files; when a .conf does not set
+  "token_endpoint_auth" the globally configured method was inherited but its
+  ":<alg>" suffix (e.g. private_key_jwt:RS256) was dropped, so multi-provider
+  setups silently signed client-authentication JWTs with the default
+  algorithm; the fallback now re-appends the global algorithm (an explicit
+  "token_endpoint_auth" in the .conf still overrides both)
+- logout: support decrypting a symmetrically encrypted back-channel logout
+  token by adding a symmetric key derived from the configured provider's
+  client secret to the decryption key set (alongside the RP's private keys);
+  the JOSE header is peeked to size that key correctly, since the issuer -
+  and thus the provider - is only known after the token has been parsed
+- appinfo: when concatenating a multi-valued (array) claim into a single
+  delimiter-separated application header/environment variable, backslash-escape
+  any delimiter (and the backslash escape character itself) occurring inside an
+  element value, so a value that contains the delimiter can no longer be
+  mistaken for - or used to inject - additional elements by the application
+  (e.g. a group DN "CN=Admins,OU=Groups" no longer splits on its commas when
+  the delimiter is ","); the escaping is reversible and only affects values
+  that actually contain the delimiter or a backslash
+- userinfo: only refresh the access token and retry the userinfo request when
+  the endpoint responded with a 401 (invalid/expired token); other HTTP
+  errors (e.g. 403 or 5xx) are no longer "resolved" by pointlessly presenting
+  a freshly refreshed token, which also avoids needlessly spending a refresh
+  token on a transient server-side error
+- proto: when verifying a JWT signature, give dynamically obtained JWKS keys
+  precedence over statically configured keys that carry the same "kid",
+  instead of the other way around; the provider's currently published JWKS
+  is authoritative for its signing keys, so a stale locally configured key
+  with a colliding kid no longer permanently shadows a rotated JWKS key
+  (a warning is logged when such a collision is detected)
+- refresh: when our own refresh token grant fails (typically because another
+  cluster node or worker already spent and rotated the exact same refresh
+  token in a rolling-refresh setup), do a final best-effort re-read of the
+  refresh token cache before locking the token out, and re-use the results
+  another caller populated in the meantime instead of needlessly failing the
+  refresh and killing the session
+
+07/16/2026
+- cache: allocate the cache mutex on the provided (per-config-generation)
+  pool again and register the server-config cleanup as a pool *pre*-cleanup,
+  so it runs before libapr closes the underlying POSIX semaphore; this fixes
+  a parent-process segfault (sem_post on an unmapped semaphore during
+  oidc_cache_shm_destroy) on graceful restarts that previously had to be
+  worked around by keeping the mutex on the never-cleared process pool, and
+  removes the accompanying long TODO/valgrind-trace comment block
+- discovery: strip leading/trailing whitespace from the user-typed
+  issuer/account-name input submitted from the OP-selection discovery page,
+  so copy-pasted values with stray whitespace no longer fail issuer matching
+  or account-based (webfinger) discovery
+- oauth: add the OIDCOAuthDecryptSharedKeys directive to configure dedicated
+  symmetric key(s) - using the same key specification syntax as
+  OIDCOAuthVerifySharedKeys - for decrypting encrypted JWT access tokens
+  locally, instead of reusing the client secret configured for the OpenID
+  Connect provider; when not configured the client-secret fallback keeps
+  working for backwards compatibility, and OIDCPrivateKeyFiles key material
+  is used alongside in both cases
+- oauth: use the JWKs refresh interval (OIDCJWKSRefreshInterval) as the cache
+  TTL for keys retrieved from OIDCOAuthVerifyJwksUri, as was documented and
+  intended, instead of accidentally using OIDCUserInfoRefreshInterval (whose
+  -1 default happened to resolve to the correct 3600s, but any explicitly
+  configured userinfo refresh interval - including 0, i.e. refetch on every
+  bearer-token request - silently became the OAuth JWKs cache TTL); configs
+  that relied on that coupling should set OIDCJWKSRefreshInterval
+- build: add a minimum-line-coverage gate (lcov --fail-under-lines 85) to the
+  coverage CI job so coverage slippage fails the pull request instead of only
+  being reported in the job summary; as a side effect the job now also fails
+  on test failures, which the AX_CODE_COVERAGE "-make -k check" recipe
+  otherwise swallows
+- handle: split the two remaining 100+ line request handlers into focused
+  static helpers: oidc_content_handler() delegates redirect-URI content and
+  session-info requests to oidc_content_handle_redirect_uri_request()/
+  oidc_content_handle_info_request(), and oidc_discovery_request() delegates
+  the external-discovery redirect and the two discovery-page HTML fragments to
+  oidc_discovery_request_external()/oidc_discovery_page_providers()/
+  oidc_discovery_page_form(); no functional changes
+- doc: document the OIDC_ERROR/OIDC_ERROR_DESC error-reporting environment
+  variables (and their REDIRECT_-prefixed ErrorDocument forms) in
+  auth_openidc.conf and on oidc_util_html_send_error(), including the caveat
+  that they are set unescaped so custom error pages rendering them into HTML
+  must apply HTML-escaping to avoid cross-site scripting
+- util: check the apr_generate_random_bytes() return value when generating a
+  trace-id in oidc_util_set_trace_parent() and skip setting the traceparent
+  header (with a warning) on failure, instead of hashing uninitialized stack
+  bytes into the header
+- const: make the NULL-safe _oidc_strcmp() wrapper a byte-exact strcmp()
+  instead of apr_strnatcmp() "natural ordering", which skips whitespace and
+  compares digit runs numerically so two different byte strings could compare
+  equal - surprising equality semantics for the protocol values (nonce, state,
+  issuer, client_id) it guards; no caller relies on the natural sort order and
+  the NULL-rejection semantics are unchanged
+- jose: complete step 2 of the cjose encapsulation: turn the cjose_jwk/cjose_jws
+  members of the public oidc_jwk_t/oidc_jwt_t structs into backend-private void
+  pointers and drop the cjose type forward-declarations from jose.h, so the
+  public header exposes no JOSE-backend types and a future JOSE-backend
+  migration stays contained to jose.c and the jose/ subdirectory
+
+07/04/2026
+- build: add a .clang-tidy configuration with a deliberately narrow,
+  warning-free check set (bugprone-* minus the checks that conflict with
+  documented project conventions, plus the nested-conditional guard) and a
+  clang-tidy CI job that runs it with warnings-as-errors over a
+  bear-generated compilation database, so new findings fail the build close
+  to the change instead of surfacing post-hoc in SonarCloud
+- mod_auth_openidc: rewrite oidc_handle_redirect_uri_request()'s long if/else
+  chain into a declarative dispatch table: each redirect_uri sub-feature is one
+  table entry carrying its matcher (protocol predicate or query-parameter
+  name), authentication requirement, handler, metrics counter and timing flag,
+  so adding a sub-feature becomes a one-line table addition; no functional
+  changes
+- jose: split the JWK, JWS/JWT and JWE implementations out of the 2000+ line
+  jose.c into a new jose/ source subdirectory (jose/jwk.c, jose/jws.c,
+  jose/jwe.c plus the internal-only jose/internal.h carrying the shared
+  cjose error/kty helpers), leaving jose.c with the backend-independent
+  common core (error reporting, hashing, compression, supported-algorithm
+  lists, version reporting); a pure code move with no functional changes,
+  mirroring the source-tree subdirectory convention
+- metadata/cfg: fix the client-metadata "response_types" fallback in
+  oidc_metadata_client_parse_response_type(): it was unreachable because the
+  response_type getter substitutes the "code" default and so never returns
+  NULL; add oidc_cfg_provider_response_type_is_set() to detect an explicitly
+  configured value instead. When no response_type is configured and the client
+  metadata advertises a "response_types" array that does not include the
+  global/default value, the first advertised entry is now actually used, as
+  documented
+
+07/03/2026
+- cfg/mod_auth_openidc: memoize the PBKDF2-HMAC-SHA256 crypto-passphrase key
+  derivation (oidc_crypto_passphrase_derive_keys_cached()) by secret text across
+  every server_rec checked in a single post_config pass, so a server with
+  hundreds of <VirtualHost>s that all inherit/set the same OIDCCryptoPassphrase
+  only pays for the ~210,000-iteration KDF once per distinct secret instead of
+  once per vhost -- avoiding a startup/graceful-restart delay that otherwise
+  scaled with vhost count
+- http: fix a -Wformat-overflow warning in oidc_http_form_encoded_data(): the
+  "no params" branch logged a provably-NULL "data" variable via "%s"; log the
+  literal "(null)" there instead, matching the "(null)" convention used
+  elsewhere in this file
+- cfg/util/cache: stretch OIDCCryptoPassphrase into the AES key used for the internal
+  "dir"/A256GCM JWE (state cookie, session cookie, cache value encryption) with
+  PBKDF2-HMAC-SHA256 (210,000 iterations, a fixed application-specific salt) instead
+  of a single SHA-256 pass, so an offline attacker who obtains an encrypted
+  cookie/cache value cannot brute-force a weak passphrase at raw-SHA256 speed; the
+  stretching happens once per server config (the base server and every merged
+  vhost, each carrying its own copy of the passphrase), so the per-request
+  encrypt/decrypt path pays no extra cost. This changes the effective key for a
+  given passphrase, so all sessions/state cookies/cache entries created before an
+  upgrade fail to decrypt afterwards (same as changing OIDCCryptoPassphrase
+  itself): plan for users to be logged out once
+- cfg/handle: add OIDCDiscoverIssuersAllowed, an OIDCRedirectURLsAllowed-style
+  list of regular expressions that bounds which issuer values dynamic OpenID
+  Connect Discovery (webfinger/URL-based, account-based, or direct issuer
+  selection via OIDCMetadataDir) is allowed to resolve to; checked against the
+  candidate host before any outbound webfinger/URL-based or account-based
+  discovery HTTP call is made, not only against the final resolved issuer, so a
+  disallowed host is never probed. Unset (default) preserves the previous,
+  unrestricted behavior
+- handle/discovery: bump the Discovery CSRF token from 8 to 16 random bytes
+  (64 to 128 bits of entropy)
+- doc: recommend prefixing OIDCCookie with "__Host-" so the browser enforces
+  Secure/no-Domain/Path=/ on the session cookie
+- state: use SHA-256 instead of SHA-1 to compute the browser-fingerprint hash
+  bound into the "state" value (X-Forwarded-For/User-Agent headers plus the
+  per-request nonce); in-flight authentication redirects started just before
+  an upgrade will fail state validation on return and require the user to
+  restart the login, same as any other state-timeout
+- util/cache: create metadata files (which can hold a dynamically registered
+  client_secret) and file-cache entries with owner-only (0600) permissions
+  instead of relying on the process umask via APR_OS_DEFAULT
+- handle/util: compare request-supplied secrets (the state-vs-browser-fingerprint
+  check, the refresh-token XSRF access_token check, and the Discovery CSRF cookie
+  check) using a new constant-time oidc_util_strcmp_const_time() instead of a
+  plain string compare, so a failing check cannot leak timing information about
+  how many leading bytes matched
+- http/oauth/refresh/userinfo/proto: stop writing access tokens, refresh tokens,
+  client secrets/assertions, authorization codes, PKCE code_verifiers and nonces
+  in full to the debug log; introduce oidc_util_mask_value() (keeps a short
+  prefix plus the length for log correlation) and redact well-known sensitive
+  parameters out of logged request bodies/URLs and the state-cookie debug dump
+- bump to 2.4.20dev
+
+07/02/2026
+- proto: no longer send an empty "request_uri" (or "request") parameter on the
+  authorization request when creating the request object fails
+- proto: fix the misleading "will be dropped" warning about an access token
+  returned from the token endpoint in hybrid flows: it overrides the value
+  obtained from the authorization response
+- test: improve unit test coverage: signed_jwks_uri verification, request object
+  (JAR) encryption, id_token aud values, OAuth RS metadata-URL/local-JWT/POST/
+  sub-request paths, jq claims-expression authorization, key-record encodings and
+  TLS client-cert setters, metrics shm-merge and Prometheus counter shapes,
+  composite and DPoP-bound userinfo requests, webfinger discovery failure paths
+  and client-secret expiry; no functional change
+
+07/01/2026
+- release 2.4.19.4
+
+06/22/2026
+- cfg: allow OIDCProviderUserInfoEndpoint to be set to an empty value to explicitly
+  disable calling the UserInfo Endpoint, even when one is advertised in the metadata
+  obtained from OIDCProviderMetadataURL; useful when the access token cannot be used
+  against the UserInfo Endpoint (e.g. with Microsoft Entra ID) and the required claims
+  are already present in the id_token; see #1390; thanks @drpuur
+
+06/15/2026
+- cfg: collect the OIDC* directive-name macros in a single cfg/directives.h and
+  flatten the config-accessor generator macros (drop the function-name token
+  paster, document the generated symbols, ship a ctags recipe to index them);
+  no functional change
+
+06/14/2026
+- json: introduce a JSON backend abstraction layer; move util/json.c to json.c
+  and rename oidc_util_json_* to oidc_json_*, with an opaque oidc_json_t type
+  and backend-independent OIDC_JSON_* constants, so that code outside json.c no
+  longer references libjansson directly (jose.c remains the cjose seam, which
+  uses the same backend value type); a preparatory step towards decoupling the
+  underlying JSON backend; no functional change
+
+06/13/2026
+- jose: stop exposing the cjose JOSE library through the public jose.h header,
+  as a preparatory step towards decoupling the underlying JOSE backend; code
+  outside jose.c now uses backend-independent OIDC_JOSE_* constants and accessor
+  functions (oidc_jose_version, oidc_jwk_to_public_json, oidc_jwk_default_jws_alg,
+  oidc_jwt_hdr_set_json) instead of cjose symbols, and jose.h no longer includes
+  <cjose/cjose.h> (the cjose key and signature objects are now opaque forward
+  declarations); no functional change
+
+06/12/2026
+- proto: when copying authorization request parameters into a request object
+  (copy_from_request / copy_and_remove_from_request), no longer interpret the
+  values of parameters that the OpenID Connect/OAuth 2.0 specifications define
+  as strings (e.g. client_id, scope, nonce, state) as JSON, so a numeric value
+  of such a parameter can no longer change type into a JSON integer; values of
+  other parameters (e.g. claims, max_age) are still decoded as JSON with a
+  fallback to string
+
+06/09/2026
+- cache: copy the shm cache value out while holding the global lock instead of
+  returning a pointer into the shared memory segment, so a concurrent set() in
+  another process cannot tear the value after the lock is released
+- info: set "Cache-Control: no-cache, no-store" (and "Pragma: no-cache") on the
+  OIDCInfoHook response so the access/refresh/id token and session claims it
+  may contain are not stored by the browser or an intermediary cache
+- util: parse Apache expressions with AP_EXPR_FLAG_RESTRICTED; the flags were
+  combined with bitwise-AND instead of OR, which left them at zero and dropped
+  the RESTRICTED flag, so expressions in directives that are valid in .htaccess
+  (OIDCUnAuthAction, OIDCUserInfoClaimsExpr, OIDCPathScope,
+  OIDCPathAuthRequestParams) were parsed unrestricted
+- cache: return failure from the cache mutex lock/unlock helpers when the
+  underlying APR mutex operation fails; they previously always returned TRUE,
+  so the callers' lock-failure guards never triggered and the code could
+  access the shared cache without holding the lock
+- state: fix an out-of-bounds read (and one-byte out-of-bounds write) in the
+  state-cookie parser; a state-prefixed Cookie token without a "=" scanned
+  past the end of the token buffer; stop the scan at the string terminator
+
+06/03/2026
+- proto: do not skip id_token signature validation for the "code" flow with
+  algorithm "none" when an id_token signing algorithm has been pinned via
+  OIDCIDTokenSignedResponseAlg; honor the pin and reject the unsigned token
+- oauth: warn when an introspection response omits the RFC 7662 "active"
+  member, since token validity then relies solely on the expiry claim
+- cache: always hash the memcache key so it satisfies memcached's key
+  constraints (length, no whitespace/control chars) regardless of the key
+  contents or whether OIDCCacheEncrypt is enabled
+- cache: reject shm cache values at ">=" the available entry size so the
+  NUL terminator always fits, removing reliance on struct alignment padding
+- cache: NUL-terminate the shm cache entry key explicitly after strncpy to
+  avoid an in-struct over-read when a key hits the maximum length
+- jose: enforce that the kid-selected key type matches the JWT/JWE algorithm
+  on the kid lookup path too, not just the no-kid path (defense in depth
+  against key/algorithm confusion; cjose already rejected the mismatch)
+- doc: correct the sample auth_openidc.conf wrt. JWE/JWS algorithms
+- config: remove the JWE/JWS algorithms from the config primitive help texts
+  as not to get out of sync: at startup the error message will contain what is
+  supported anyhow
+
+06/02/2026
+- test: use long symmetric key to work against cjose >= 0.6.2.6
+- bump to 2.4.19.4dev
+
+06/01/2026
+- ci: bump the GitHub Actions to Node 24 runtimes — actions/checkout
+  and actions/upload-artifact to v5, then upload-artifact to v7 and
+  codeql-action to v4 (v5/v4 still run on Node 20)
+- jose: cast away const at the OpenSSL call sites whose signatures
+  vary by version, so the build stays warning-clean across OpenSSL
+  1.x/3.x and LibreSSL
+- metrics: include unistd.h again, now guarded under #ifndef WIN32
+- code: const-qualify the remaining read-only provider parameters in
+  logout/userinfo/proto and oidc_proto_request_auth, finishing the
+  S995 cascade
+- test: portability fixes for old libcheck — parse the JWT and DPoP
+  proof headers instead of substring-matching cjose's version-specific
+  output, compare the userinfo last-refresh as a 64-bit apr_time_t
+  (old libcheck truncates int asserts), shim ck_assert_ptr_ne, and
+  redirect the registration-check error/failure messages to stderr
+- release 2.4.19.3
+
+05/31/2026
+- ci: split valgrind and distcheck into their own jobs; add a
+  gcc/clang build matrix; run the suite under ASan and UBSan
+  (excluding benign UB classes); surface code coverage on every build;
+  and give the coverage and valgrind jobs live redis+memcache service
+  containers so the real cache backends are exercised
+- jose: fix an out-of-bounds read when logging a malformed JWT payload
+- test: add a fuzz harness for the untrusted-input parsers; fail
+  make check on unregistered START_TEST bodies; generalize the mock
+  HTTP server to serve N scripted responses; add the ck_assert_jwt_parses
+  and table-assert helpers and convert the call sites; and reset the
+  cache mocks in the fixture so state does not leak under CK_FORK=no
+- test: split session.c and state.c into dedicated test_session.c /
+  test_state.c; cover the OAuth mixed-mode dispatch and fixups hook,
+  the handle/jwks.c and handle/response.c branches, the signed-JWT
+  userinfo pass-as path with RSA keys, and the redis (mock) + memcache
+  backends in test_cache.c (memcache run offline via injectable mocks)
+- code: continue the SonarCloud cleanup — finish const-qualifying the
+  read-only pointer parameters and the cfg/oauth/provider getter macros
+  (S995/S5350), drop an unused request_rec param (S1172), replace a
+  small switch with if statements (S1301), move #include directives to
+  the top of file (S954), un-nest ternaries (S3358), make narrowing
+  integer conversions explicit (S5276), and remove empty statements,
+  commented-out code and redundant casts (S1116/S125/S1905)
+
+05/30/2026
+- code: const-qualify more cascade-exposed read-only pointers in
+  handle/jose/http/metrics/oauth/cfg and proto/session (S995/S5350)
+
+05/29/2026
+- code: fix a memory leak in oidc_metadata_jwks_retrieve_and_cache
+- code: clamp json_int_t→int conversions on OP-supplied values to
+  avoid silent overflow, and split an assignment out of an && to clear
+  an S912 BLOCKER
+- code: large SonarCloud sweep — const-qualify read-only pointer
+  parameters across jose/http/metrics/session/oauth/proto/handle/util/
+  metadata/cfg and make local pointers point-to-const (S995/S5350),
+  remove genuinely-unused function parameters (S1172), one variable per
+  declaration (S1659), declare loop variables in minimal scope (S5955),
+  collapse 26 nested-if findings (S1066), remove 19 redundant
+  parenthesis groups (S1110), drop three const-drop casts (S859), hoist
+  html/js format strings to static const arrays, and clear assorted
+  small findings (S1121/S3358/S3457)
+- test: cover the webfinger response parser (proto/discovery.c), the
+  metadata jwks_get cache-hit and validation-failure branches, and the
+  oidc_provider_static_config / redirect-URL / remote-user /
+  cookie-domain branches in mod_auth_openidc.c
+
+05/27/2026
+- test: extend coverage across the tree — proto response handlers,
+  dpop, request-object removal and userinfo JWT; state.c fingerprint
+  and state-cookie cleanup; mod_auth_openidc.c top-level helpers;
+  the handle/authz, content, info, logout, refresh and discovery
+  branches; and the cfg/parse, cfg/cfg, cfg/oauth, cfg/provider,
+  cfg/dir and cfg/cache setters
+- code: run clang-format and add *.gcov to the ignore lists
+
+05/26/2026
+- test: close five coverage gaps identified from the `make
+  check-code-coverage` report; together they add 20 new unit tests
+  and one stub-fixture fix without touching production code:
+    - proto/userinfo.c: POST token-presentation, mandatory-sub
+      rejection and OIDC_NO_USERINFO_SUB skip, plus aggregated-claim
+      resolution via an inline alg=none JWT and the no-_claim_sources
+      short-circuit (5 tests in e2e_proto).
+    - proto/auth.c: client_secret_jwt assertion + private_key_jwt
+      with no keys, with the test/private.pem RSA key, and with an
+      explicit RS384 override; assertions decode the JWS header to
+      check alg/kid (4 tests in core).
+    - handle/request_uri.c: brand-new request_uri tcase covers all
+      three branches — missing parameter (400), cache miss (404),
+      and the cache-hit happy path that primes the content handler
+      and consumes the entry (3 tests).
+    - proto/discovery.c: account-based and URL-based webfinger entry
+      points driven against a known-closed loopback port via
+      oidc_test_http_free_port — covers the @-split / apr_uri_parse
+      stitching and the HTTP-failure return in the shared helper
+      (2 tests in core). TLS-mocked JSON-parsing branches are still
+      out of reach with the plaintext fixture.
+    - oauth.c: Basic-scheme bearer extraction (success + no-colon),
+      the OAuth-side redirect-URI dispatch (?jwks → OK, ?remove_at_cache
+      → 404), and oidc_oauth_metadata_provider_retrieve against the
+      loopback HTTP fixture for success and invalid-JSON-response
+      (6 tests). Required two fixture fixes in test/stub.c:
+      ap_getword_nulls was a no-op and ap_is_initial_req hard-coded
+      to 0 — both now match Apache semantics.
+- test: add a dispatch tcase to test_handle that drives
+  oidc_handle_redirect_uri_request directly through six routing
+  decisions (?jwks and ?dpop short-circuit to OK with r->user="",
+  ?info on a session without a remote_user yields 401, unknown args
+  fall through to the invalid-request 500, an empty args string
+  routes to oidc_javascript_implicit, and a POST with ?logout=
+  takes precedence over the POST authorization-response branch).
+  The function is declared extern in the test file because it
+  has no public header
+- code: split src/metadata.c into per-domain files under src/metadata/
+  (provider, conf, client, jwks, oauth, util) with shared constants and
+  helper macros in metadata/internal.h; the conf_parse_* helpers are
+  rewritten on top of new OIDC_METADATA_CONF_STR/INT/BOOL macros so each
+  parsed field becomes a single line. Public API in metadata.h is
+  unchanged. Adds unit-test coverage for oidc_metadata_conf_parse_* and
+  the oidc_metadata_client_register POST payload to lock in behavior
+  across the move
+- ci: enable SonarQube analysis with code coverage for real, add a
+  gcov reporting step (reports collected under gcov-reports/) and bump
+  to sonar-scanner 8.1.0
+- jose: avoid reading an uninitialized cjose_err when no compatible
+  JWE decryption key is tried
+
+05/25/2026
+- code: hardening in various places
+- strip_cookies: skip cookies that are only whitespace after the
+  leading-space strip; a header like "foo=1; ; bar=2" otherwise had the
+  empty middle token re-emitted verbatim, leaving a malformed segment
+  in the forwarded Cookie header
+- metrics: switch _oidc_metrics_thread_exit to a volatile apr_uint32_t
+  accessed via apr_atomic_read32/set32; the flush worker reads it from
+  a different thread than the cleanup / child-init writers, so a plain
+  apr_byte_t allowed LTO to hoist the load out of the polling loop and
+  strand the post-join cleanup that b66b54a0 added
+- util: guard oidc_util_rand_int with a mod==0 short-circuit (avoids
+  division by zero) and rejection-sample before reducing modulo so
+  v % mod is uniformly distributed; the only caller passes 100
+  (metrics jitter) so the prior bias was negligible, but the hazard
+  is closed for any future caller
+- userinfo: skip the DPoP-nonce retry path for non-DPoP token types;
+  oidc_proto_userinfo_request only allocates response_hdrs on the DPoP
+  branch, so a Bearer userinfo call against an OP that returned a JSON
+  body of {"error":"use_dpop_nonce"} would dereference NULL inside
+  apr_hash_get and crash the worker
+
+05/23/2026
+- test: large expansion of unit-test coverage
+- security: do not log refresh tokens at warn/error levels; the verbose
+  paths previously embedded the bearer-equivalent secret in messages
+  routed to the Apache error log where it could persist in operator
+  workflows and aggregation pipelines
+- security: also strip CR when sanitizing outgoing header values; the
+  previous LF-only filter still permitted CR-based header injection in
+  environments that treat lone CRs as line terminators
+- test: migrate the hand-rolled legacy test.c suite to per-module
+  Check-based binaries and add a loopback HTTP server fixture so the
+  http.c and proto/ tests can exercise the full libcurl path
+  end-to-end; expose previously-static http.c helpers via a new
+  http_int.h purely for unit-test access
+
+05/22/2026
+- security: guard the trailing-slash strip against an empty string to avoid an
+  out-of-bounds read (and conditional 1-byte out-of-bounds write of a NUL);
+  oidc_discovery_response_authenticate indexed issuer[-1] when an
+  unauthenticated request supplied an empty "iss" parameter; the same
+  [strlen-1] pattern is hardened in oidc_metadata_issuer_to_filename,
+  oidc_discovery_target_link_uri_match and oidc_response_set_request_user
+
+05/21/2026
+- config: fix intermittent coredumps on per-request initialization under heavy load
+  initialize the default pass_userinfo_as array and the cached A256GCM
+  "dir" JWT header prefix once during post-config rather than lazily from the
+  request path
+  
+05/20/2026
+- security: cap zlib-inflated JWE payload size at 10MB in
+  oidc_jose_zlib_uncompress to prevent decompression-bomb style memory
+  exhaustion via crafted compressed JWTs
+- security: restrict the session_management iframe's login_uri parameter to
+  the current request host (restrict_to_host=TRUE); previously, when
+  OIDCRedirectURLsAllowed was unset the URL host was not checked at all,
+  allowing an open redirect via window.top.location.replace
+- security: harden hostname suffix matching used for target_link_uri and cookie
+  domain checks; the previous strcasestr-based pattern accepted hosts that
+  share a suffix without a dot boundary (e.g. evil-example.com matching
+  example.com); replace with a proper subdomain check
+- security: HTML-escape the JSON session info embedded in the <pre> block of
+  the OIDCInfoHook HTML response; JSON does not escape '<'/'>' so a claim
+  containing </pre><script>...</script> rendered as live HTML
+- security: JavaScript-escape origin, client_id, session_state and
+  redirect_uri when embedding them in the RP session-management iframe;
+  previously only login_uri was escaped, so an OP-supplied session_state
+  containing a single quote could break out of the JS string literal
+- security: reject JWT alg "none" (and a missing alg header) in
+  oidc_proto_jwt_verify when no expected signing algorithm has been
+  configured; cjose already failed key lookup for "none" but reject earlier
+  to remove ambiguity and reduce alg-confusion surface
+- code: HTML-escape the meta-refresh URL in the OIDCUnAuthzAction "302"
+  branch of oidc_authz_24_unauthorized_user (companion to the same fix in
+  the OIDC_UNAUTZ_AUTHENTICATE branch)
+- code: guard against a NULL/empty path in oidc_session_management_iframe_rp;
+  apr_uri_parse's return code is now checked and the strstr-based origin
+  computation no longer dereferences a NULL result on OP metadata with no
+  path
+- code: validate format specifiers (only %% and exactly two %s) in
+  oidc_util_html_send_in_template before passing the template through
+  apr_psprintf so a stray %n in an admin-supplied template can't crash or
+  corrupt memory
+- code: detect RNG failure in oidc_util_rand_int; previously the return
+  code of _oidc_util_rand was ignored and stack-derived bits could be
+  returned on failure
+- code: use OpenSSL CRYPTO_memcmp for at_hash/c_hash verification in
+  oidc_proto_validate_hash to remove the timing side-channel on the
+  failure path
+- code: detect sscanf failures and reject odd-length input in
+  oidc_cfg_parse_hex so a typo in a hex-encoded OIDCCryptoPassphrase
+  doesn't silently weaken the derived key
+- code: reject URLs longer than OIDC_MAX_URL_LENGTH in
+  oidc_validate_redirect_url instead of silently truncating before the
+  chars/host checks
+- code: HTML-escape the on_load argument in oidc_util_html_send so a stray
+  quote can't break out of the onload="..." attribute into surrounding
+  markup
+- code: clean up oidc_util_base64_decode (pointer-vs-int NULL check,
+  error message typo) and document the signed-int return contract of
+  oidc_util_base64url_decode
+- code: document the NULL-NULL "not equal" semantics of _oidc_strcmp and
+  _oidc_strnatcasecmp as load-bearing security behavior so a future
+  cleanup doesn't relax it without auditing every caller
+- code: fix strchr/strrchr compiler warnings
+
+05/13/2026
+- code: re-factor functions to reduce cognitive complexity
+- security: fix 3 low-risk (insider-admin-based) security vulnerabilities
+- code: add more unit tests for util and proto functions
+
+04/24/2026
+- proto: add scope=openid to the authorization request when passing a Request Object
+  by reference (request_uri) as defined by spec; see #1385; thanks @gueuselambix and @hjmikkon
+
+04/18/2026
+- build: conditionally add --coverage to AM_LDFLAGS in Makefile.am
+
 03/06/2026
-- cast curl timeouts in options to long to avoid compiler warnings
+- code: cast curl timeouts in options to long to avoid compiler warnings
 - bump to 2.4.19.3dev
 
 02/23/2026
@@ -324,7 +1679,7 @@
 - address warnings from static code analysis tool SonarQube
   - code: use snprintf instead of sprintf
   - code: move _snprintf define to const.h
-- bump to 2.4.16.7dev
+  - bump to 2.4.16.7dev
 
 12/09/2024
 - release 2.4.16.6

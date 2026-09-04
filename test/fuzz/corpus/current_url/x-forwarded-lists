@@ -1,0 +1,5 @@
+/protected/?a=1
+Host: www.example.com
+X-Forwarded-Proto: https, http
+X-Forwarded-Host: a.example.com, b.example.com
+X-Forwarded-Port: 443, 80

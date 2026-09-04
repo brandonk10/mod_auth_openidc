@@ -92,7 +92,9 @@ static int findreplen(const char *rep, int nmat, const int *replen) {
 	while (*cp) {
 		if (*cp == '$' && isdigit(cp[1])) {
 			val = strtoul(&cp[1], &cp, 10);
-			if (val && val <= nmat + 1)
+			/* $1..$nmat are the captured subpatterns; replen/repstr hold exactly those, so
+			 * anything beyond nmat would read past the entries edit() filled in */
+			if (val && val <= nmat)
 				len += replen[val - 1];
 			else
 				fprintf(stderr, "repl %d out of range\n", val);
@@ -112,7 +114,9 @@ static void doreplace(char *out, const char *rep, int nmat, int *replen, const c
 	while (*cp) {
 		if (*cp == '$' && isdigit(cp[1])) {
 			val = strtoul(&cp[1], &cp, 10);
-			if (val && val <= nmat + 1) {
+			/* NB: the same bound as findreplen(), so that the number of bytes written here
+			 * matches the length it sized the output buffer for */
+			if (val && val <= nmat) {
 				strncpy(out, repstr[val - 1], replen[val - 1]);
 				out += replen[val - 1];
 			}
@@ -128,7 +132,10 @@ static char *edit(const char *str, int len, const char *rep, int nmat, const int
 	char *res, *cp;
 	int replen[OIDC_PCRE_MAXCAPTURE];
 	const char *repstr[OIDC_PCRE_MAXCAPTURE];
-	_oidc_memset(repstr, '\0', OIDC_PCRE_MAXCAPTURE);
+	/* NB: sizeof, not OIDC_PCRE_MAXCAPTURE: these are arrays of int/pointer, not of bytes, so a
+	 * count-sized memset would leave all but the first few entries holding stack garbage */
+	_oidc_memset(replen, 0, sizeof(replen));
+	_oidc_memset(repstr, '\0', sizeof(repstr));
 	if ((str == NULL) || (mvec == NULL))
 		return NULL;
 	nmat--;
@@ -178,17 +185,24 @@ char *pcre_subst(const pcre *ppat, const pcre_extra *extra, const char *str, int
 char *oidc_pcre_subst(apr_pool_t *pool, const struct oidc_pcre *pcre, const char *str, int len, const char *rep) {
 	char *rv = NULL;
 #ifdef HAVE_LIBPCRE2
-	PCRE2_UCHAR *output = (PCRE2_UCHAR *)malloc(sizeof(PCRE2_UCHAR) * OIDC_PCRE_MAXCAPTURE * 3);
-	PCRE2_SIZE outlen = OIDC_PCRE_MAXCAPTURE * 3;
+	PCRE2_SIZE outlen = OIDC_PCRE_SUBST_INITIAL_BUF_LEN;
+	PCRE2_UCHAR *output = apr_palloc(pool, outlen);
 	PCRE2_SPTR subject = (PCRE2_SPTR)str;
 	PCRE2_SIZE length = (PCRE2_SIZE)len;
 	PCRE2_SPTR replacement = (PCRE2_SPTR)rep;
-	if (pcre2_substitute(pcre->preg, subject, length, 0, PCRE2_SUBSTITUTE_GLOBAL, 0, 0, replacement,
-			     PCRE2_ZERO_TERMINATED, output, &outlen) > 0) {
-		if (outlen > 0)
-			rv = apr_pstrndup(pool, (const char *)output, outlen);
+	const uint32_t options = PCRE2_SUBSTITUTE_GLOBAL | PCRE2_SUBSTITUTE_OVERFLOW_LENGTH;
+	int rc = pcre2_substitute(pcre->preg, subject, length, 0, options, 0, 0, replacement, PCRE2_ZERO_TERMINATED,
+				  output, &outlen);
+	if (rc == PCRE2_ERROR_NOMEMORY) {
+		/* PCRE2_SUBSTITUTE_OVERFLOW_LENGTH left the length the result needs (terminator included)
+		 * in outlen, so the retry is sized exactly and cannot come up short in turn; the buffer
+		 * comes out of the pool, so the first, too-small one needs no separate free */
+		output = apr_palloc(pool, outlen);
+		rc = pcre2_substitute(pcre->preg, subject, length, 0, options, 0, 0, replacement, PCRE2_ZERO_TERMINATED,
+				      output, &outlen);
 	}
-	free(output);
+	if ((rc > 0) && (outlen > 0))
+		rv = apr_pstrndup(pool, (const char *)output, outlen);
 #else
 	char *substituted = NULL;
 	substituted = pcre_subst(pcre->preg, 0, str, len, 0, 0, rep);
@@ -198,27 +212,38 @@ char *oidc_pcre_subst(apr_pool_t *pool, const struct oidc_pcre *pcre, const char
 	return rv;
 }
 
+/* Compile before allocating pool state so repeated invalid patterns do not accumulate allocations. */
 struct oidc_pcre *oidc_pcre_compile(apr_pool_t *pool, const char *regexp, char **error_str) {
-	struct oidc_pcre *pcre = NULL;
-	if (regexp == NULL)
-		return NULL;
-	pcre = apr_pcalloc(pool, sizeof(struct oidc_pcre));
 #ifdef HAVE_LIBPCRE2
+	pcre2_code *preg = NULL;
 	int errorcode;
 	PCRE2_SIZE erroroffset;
-	pcre->preg =
-	    pcre2_compile((PCRE2_SPTR)regexp, (PCRE2_SIZE)_oidc_strlen(regexp), 0, &errorcode, &erroroffset, NULL);
 #else
+	pcre *preg = NULL;
 	const char *errorptr = NULL;
 	int erroffset;
-	pcre->preg = pcre_compile(regexp, 0, &errorptr, &erroffset, NULL);
+#endif
+	struct oidc_pcre *rv = NULL;
+
+	if (regexp == NULL)
+		return NULL;
+
+#ifdef HAVE_LIBPCRE2
+	preg = pcre2_compile((PCRE2_SPTR)regexp, _oidc_strlen(regexp), 0, &errorcode, &erroroffset, NULL);
+#else
+	preg = pcre_compile(regexp, 0, &errorptr, &erroffset, NULL);
 #endif
 
-	if (pcre->preg == NULL) {
-		*error_str = apr_psprintf(pool, "pattern [%s] is not a valid regular expression", regexp);
-		pcre = NULL;
+	if (preg == NULL) {
+		if (error_str != NULL)
+			*error_str = apr_psprintf(pool, "pattern [%s] is not a valid regular expression", regexp);
+		return NULL;
 	}
-	return pcre;
+
+	rv = apr_pcalloc(pool, sizeof(struct oidc_pcre));
+	rv->preg = preg;
+
+	return rv;
 }
 
 void oidc_pcre_free(struct oidc_pcre *pcre) {
@@ -287,14 +312,10 @@ int oidc_pcre_exec(apr_pool_t *pool, struct oidc_pcre *pcre, const char *input, 
 #ifdef HAVE_LIBPCRE2
 	pcre->match_data = pcre2_match_data_create_from_pattern(pcre->preg, NULL);
 	if ((rc = pcre2_match(pcre->preg, (PCRE2_SPTR)input, (PCRE2_SIZE)len, 0, 0, pcre->match_data, NULL)) < 0) {
-		switch (rc) {
-		case PCRE2_ERROR_NOMATCH:
+		if (rc == PCRE2_ERROR_NOMATCH)
 			*error_str = apr_pstrdup(pool, "string did not match the pattern");
-			break;
-		default:
+		else
 			*error_str = apr_psprintf(pool, "unknown error: %d", rc);
-			break;
-		}
 	}
 #else
 	if ((rc = pcre_exec(pcre->preg, NULL, input, len, 0, 0, pcre->subStr, OIDC_UTIL_REGEXP_MATCH_SIZE)) < 0) {
@@ -330,7 +351,7 @@ int oidc_pcre_exec(apr_pool_t *pool, struct oidc_pcre *pcre, const char *input, 
 
 #ifndef HAVE_LIBPCRE2
 #ifdef DEBUG_BUILD
-int main() {
+int main(void) {
 	char *pat = "quick\\s(\\w+)\\s(fox)";
 	char *rep = "$1ish $2";
 	char *str = "The quick brown foxy";

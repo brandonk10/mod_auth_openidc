@@ -1,0 +1,650 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/***************************************************************************
+ * Copyright (C) 2017-2026 ZmartZone Holding BV
+ * All rights reserved.
+ *
+ * @Author: Hans Zandbelt - hans.zandbelt@openidc.com
+ *
+ **************************************************************************/
+
+#include "check_util.h"
+#include "metrics.h"
+#include "mod_auth_openidc.h"
+#include "util.h"
+#include "util/request_state.h"
+#include "util/util.h"
+
+/*
+ * Tests for oidc_metrics_is_valid_classname — pure validation against the
+ * static class-name table; no subsystem init required.
+ */
+
+START_TEST(test_metrics_type_name2s) {
+	apr_pool_t *pool = oidc_test_pool_get();
+	/* without a name the OIDCMetricsData lookup key is just the counter's class */
+	ck_assert_str_eq(_oidc_metrics_type_name2s(pool, OM_AUTHTYPE_MOD_AUTH_OPENIDC, NULL), "authtype");
+	/* with a name (the claim-counter case) it is class.metric.name */
+	ck_assert_str_eq(_oidc_metrics_type_name2s(pool, OM_AUTHTYPE_MOD_AUTH_OPENIDC, "sub"),
+			 "authtype.mod_auth_openidc.sub");
+}
+END_TEST
+
+START_TEST(test_metrics_is_valid_classname_known) {
+	apr_pool_t *pool = oidc_test_pool_get();
+	char *valid_names = NULL;
+	/* class names come from the static OM_CLASS_* table; "provider" covers both timings and counters */
+	ck_assert_int_eq(oidc_metrics_is_valid_classname(pool, "provider", &valid_names), TRUE);
+	ck_assert_ptr_nonnull(valid_names);
+	valid_names = NULL;
+	ck_assert_int_eq(oidc_metrics_is_valid_classname(pool, "session", &valid_names), TRUE);
+	valid_names = NULL;
+	ck_assert_int_eq(oidc_metrics_is_valid_classname(pool, "authtype", &valid_names), TRUE);
+	valid_names = NULL;
+	ck_assert_int_eq(oidc_metrics_is_valid_classname(pool, "authn", &valid_names), TRUE);
+}
+END_TEST
+
+START_TEST(test_metrics_is_valid_classname_claim_wildcard) {
+	apr_pool_t *pool = oidc_test_pool_get();
+	char *valid_names = NULL;
+	/* the "claim" namespace is matched as a substring rather than a hash hit */
+	ck_assert_int_eq(oidc_metrics_is_valid_classname(pool, "claim.id_token.email", &valid_names), TRUE);
+	valid_names = NULL;
+	ck_assert_int_eq(oidc_metrics_is_valid_classname(pool, "claim.userinfo.sub", &valid_names), TRUE);
+}
+END_TEST
+
+START_TEST(test_metrics_is_valid_classname_unknown) {
+	apr_pool_t *pool = oidc_test_pool_get();
+	char *valid_names = NULL;
+	ck_assert_int_eq(oidc_metrics_is_valid_classname(pool, "totally_bogus", &valid_names), FALSE);
+	/* on failure the helper still populates the human-readable list of allowed classnames */
+	ck_assert_ptr_nonnull(valid_names);
+	ck_assert_msg(_oidc_strstr(valid_names, "session") != NULL, "valid_names list should mention 'session'");
+}
+END_TEST
+
+/* the timings enum and the metrics.c info table are maintained by hand: pin the
+ * index correspondence for the entries added for the provider JWKs/PAR calls */
+START_TEST(test_metrics_timing_table_order) {
+	ck_assert_str_eq(_oidc_metrics_timings_info[OM_PROVIDER_METADATA].metric_name, "metadata");
+	ck_assert_str_eq(_oidc_metrics_timings_info[OM_PROVIDER_USERINFO].metric_name, "userinfo");
+	ck_assert_str_eq(_oidc_metrics_timings_info[OM_PROVIDER_JWKS].metric_name, "jwks");
+	ck_assert_str_eq(_oidc_metrics_timings_info[OM_PROVIDER_PAR].metric_name, "par");
+	ck_assert_str_eq(_oidc_metrics_timings_info[OM_CACHE_READ].metric_name, "read");
+	ck_assert_str_eq(_oidc_metrics_timings_info[OM_CACHE_WRITE].metric_name, "write");
+}
+END_TEST
+
+START_TEST(test_metrics_counter_names_unique) {
+	/* the exported class.metric name must be unique per counter or two series collide in the output */
+	int i, j;
+	for (i = 0; i < OM_NUMBER_OF_COUNTERS; i++)
+		for (j = i + 1; j < OM_NUMBER_OF_COUNTERS; j++)
+			ck_assert_msg((_oidc_strcmp(_oidc_metrics_counters_info[i].class_name,
+						    _oidc_metrics_counters_info[j].class_name) != 0) ||
+					  (_oidc_strcmp(_oidc_metrics_counters_info[i].metric_name,
+							_oidc_metrics_counters_info[j].metric_name) != 0),
+				      "counters %d and %d both export \"%s.%s\"", i, j,
+				      _oidc_metrics_counters_info[i].class_name,
+				      _oidc_metrics_counters_info[i].metric_name);
+}
+END_TEST
+
+/* Each metrics lifecycle test owns setup and teardown of the process-wide subsystem. */
+
+/* enable metrics on the cfg by registering one counter and one timing class */
+static void enable_metrics_hook_data(request_rec *r) {
+	cmd_parms *cmd = oidc_test_cmd_get("OIDCMetricsData");
+	ck_assert_ptr_null(oidc_cmd_metrics_hook_data_set(cmd, NULL, "session"));
+	cmd = oidc_test_cmd_get("OIDCMetricsData");
+	ck_assert_ptr_null(oidc_cmd_metrics_hook_data_set(cmd, NULL, "provider"));
+}
+
+static void metrics_subsystem_setup(request_rec *r) {
+	enable_metrics_hook_data(r);
+	ck_assert_int_eq(oidc_metrics_post_config(r->server->process->pconf, r->server), TRUE);
+	ck_assert_int_eq(oidc_metrics_child_init(r->server->process->pconf, r->server), APR_SUCCESS);
+}
+
+static void metrics_subsystem_teardown(request_rec *r) {
+	ck_assert_int_eq(oidc_metrics_cleanup(r->server), APR_SUCCESS);
+}
+
+START_TEST(test_metrics_handle_request_no_format_default_prometheus) {
+	request_rec *r = oidc_test_request_get();
+	metrics_subsystem_setup(r);
+
+	r->args = "";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	metrics_subsystem_teardown(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_format_json) {
+	request_rec *r = oidc_test_request_get();
+	metrics_subsystem_setup(r);
+
+	r->args = "format=json";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	metrics_subsystem_teardown(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_format_internal) {
+	request_rec *r = oidc_test_request_get();
+	metrics_subsystem_setup(r);
+
+	/* the "internal" handler returns NOT_FOUND when the shm has nothing in it
+	 * (we haven't waited long enough for the background flush thread to fire) */
+	r->args = "format=internal";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, HTTP_NOT_FOUND);
+
+	metrics_subsystem_teardown(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_format_status) {
+	request_rec *r = oidc_test_request_get();
+	metrics_subsystem_setup(r);
+
+	r->args = "format=status";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	metrics_subsystem_teardown(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_format_unknown) {
+	request_rec *r = oidc_test_request_get();
+	metrics_subsystem_setup(r);
+
+	r->args = "format=totally_bogus";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, HTTP_NOT_FOUND);
+
+	metrics_subsystem_teardown(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_with_samples) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	metrics_subsystem_setup(r);
+
+	/* push one counter sample for each AUTHN_REQUEST counter class via the macro
+	 * and one timing sample for the PROVIDER_TOKEN class — these exercise the
+	 * counter_inc / timing_add storage paths that handle_request later reads */
+	OIDC_METRICS_COUNTER_INC(r, c, OM_AUTHN_REQUEST_ERROR_URL);
+	OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
+
+	OIDC_METRICS_TIMING_START(r, c);
+	apr_sleep(apr_time_from_msec(1));
+	OIDC_METRICS_TIMING_ADD(r, c, OM_PROVIDER_TOKEN);
+
+	r->args = "format=json&reset=true";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	metrics_subsystem_teardown(r);
+}
+END_TEST
+
+/* Force a background flush so formatter tests exercise populated shared-memory data. */
+
+static void e2e_force_metrics_flush(request_rec *r, oidc_cfg_t *c) {
+	OIDC_METRICS_COUNTER_INC(r, c, OM_AUTHN_REQUEST_ERROR_URL);
+	OIDC_METRICS_TIMING_START(r, c);
+	apr_sleep(apr_time_from_msec(1));
+	OIDC_METRICS_TIMING_ADD(r, c, OM_PROVIDER_TOKEN);
+	/* the thread first sleeps up to 100ms of randomized jitter, then one flush tick of
+	 * OIDC_METRICS_CACHE_STORAGE_INTERVAL (=100ms here); 300ms covers both with slack for CI */
+	apr_sleep(apr_time_from_msec(300));
+}
+
+static void e2e_metrics_setup_flushed(request_rec *r) {
+	/* shrink the flush interval before post_config because the thread reads the env once */
+	setenv("OIDC_METRICS_CACHE_STORAGE_INTERVAL", "100", 1);
+	metrics_subsystem_setup(r);
+}
+
+static void e2e_metrics_teardown_flushed(request_rec *r) {
+	metrics_subsystem_teardown(r);
+	unsetenv("OIDC_METRICS_CACHE_STORAGE_INTERVAL");
+}
+
+/* defined below: poll the JSON formatter until the asynchronously-flushed data appears, so a value
+ * assertion need not race the background flush interval on a loaded builder */
+static const char *metrics_json_wait_for(request_rec *r, const char *needle, int max_ms);
+
+START_TEST(test_metrics_handle_request_flushed_prometheus) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	e2e_force_metrics_flush(r, c);
+
+	r->args = "format=prometheus";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_flushed_json) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	e2e_force_metrics_flush(r, c);
+
+	r->args = "format=json";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_flushed_internal) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	e2e_force_metrics_flush(r, c);
+
+	/* now that the shm has real JSON, the "internal" handler returns it as-is */
+	r->args = "format=internal";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_flushed_status) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	e2e_force_metrics_flush(r, c);
+
+	r->args = "format=status";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_flushed_status_counter_selector) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	e2e_force_metrics_flush(r, c);
+
+	/* select the AUTHN_REQUEST_ERROR_URL counter we incremented in the flush helper:
+	 * format=status&server_name=<host>&counter=authn.request.error.url => "OK: 1\n"
+	 * (oidc_metrics_status_find_counter + oidc_metrics_status_select_value) */
+	r->args = "format=status&server_name=www.example.com&counter=authn.request.error.url";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_flushed_status_counter_with_value) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	/* push a value-indexed counter (provider.http.response.code) with value "200" then flush */
+	OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
+	apr_sleep(apr_time_from_msec(300));
+
+	/* counter=provider.http.response.code&value=200 selects the per-value sub-counter
+	 * via oidc_metrics_status_select_value's object/value branch */
+	r->args = "format=status&server_name=www.example.com&counter=provider.http.response.code&value=200";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+/* Reset a flushed value-indexed counter to exercise recursive cleanup of nested metric objects. */
+START_TEST(test_metrics_handle_request_flushed_reset_nested_counter) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
+	/* wait for the async flush to land the counter in shared memory instead of a fixed sleep a
+	 * loaded builder can outrun; only then can the reset below zero an actually-present counter */
+	ck_assert_ptr_nonnull(_oidc_strstr(metrics_json_wait_for(r, "\"200\"", 5000), "\"200\""));
+
+	r->args = "format=json&reset=true";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	/* the value-indexed sub-counter must have been zeroed, not left at its pre-reset value */
+	r->args = "format=status&server_name=www.example.com&counter=provider.http.response.code&value=200";
+	rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+	const char *body = oidc_request_state_get(r, "sent_body");
+	ck_assert_ptr_nonnull(body);
+	ck_assert_msg(_oidc_strstr(body, "OK: 0") != NULL, "expected the reset counter to read back as 0, got: %s",
+		      body);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+/* Increment twice before flushing to exercise the existing-counter branch. */
+START_TEST(test_metrics_handle_request_flushed_counter_inc_twice_before_flush) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
+	OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
+	/* wait for both increments to be flushed (they merge into one shm entry in a single store)
+	 * rather than racing a fixed sleep on a loaded builder */
+	ck_assert_ptr_nonnull(_oidc_strstr(metrics_json_wait_for(r, "\"200\"", 5000), "\"200\""));
+
+	r->args = "format=status&server_name=www.example.com&counter=provider.http.response.code&value=200";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+	const char *body = oidc_request_state_get(r, "sent_body");
+	ck_assert_ptr_nonnull(body);
+	ck_assert_msg(_oidc_strstr(body, "OK: 2") != NULL,
+		      "expected the twice-incremented counter to read back as 2, got: %s", body);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+/* poll the JSON formatter (non-destructively: reset=false) until the
+ * asynchronously-flushed data contains the needle (instrumented/valgrind runs
+ * can outlast a single fixed sleep) */
+static const char *metrics_json_wait_for(request_rec *r, const char *needle, int max_ms) {
+	const char *body = NULL;
+	int waited = 0;
+	while (waited <= max_ms) {
+		r->args = "format=json&reset=false";
+		ck_assert_int_eq(oidc_metrics_handle_request(r), OK);
+		body = oidc_request_state_get(r, "sent_body");
+		if ((body != NULL) && (_oidc_strstr(body, needle) != NULL))
+			return body;
+		apr_sleep(apr_time_from_msec(100));
+		waited += 100;
+	}
+	return body;
+}
+
+/* two flush rounds for the same metrics: the second round merges into the
+ * existing shm entries via oidc_metrics_counter_update / timings_update, and
+ * the prometheus formatter renders the plain, value-keyed and name+value
+ * counter shapes */
+START_TEST(test_metrics_flushed_twice_updates_entries) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+
+	/* the fixture only enables the session+provider classes; the plain
+	 * counter below lives in the authn class and the name+value one is a
+	 * per-claim metric that must be enabled by its full name */
+	cmd_parms *cmd = oidc_test_cmd_get("OIDCMetricsData");
+	ck_assert_ptr_null(oidc_cmd_metrics_hook_data_set(cmd, NULL, "authn"));
+	cmd = oidc_test_cmd_get("OIDCMetricsData");
+	ck_assert_ptr_null(oidc_cmd_metrics_hook_data_set(cmd, NULL, "claim.id_token.email"));
+
+	/* round 1: create the global entries */
+	{
+		OIDC_METRICS_COUNTER_INC(r, c, OM_AUTHN_REQUEST_ERROR_URL);
+		OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
+		OIDC_METRICS_COUNTER_INC_NAME_VALUE(r, c, OM_CLAIM_ID_TOKEN, "email", "alice@example.com");
+		OIDC_METRICS_TIMING_START(r, c);
+		apr_sleep(apr_time_from_msec(1));
+		OIDC_METRICS_TIMING_ADD(r, c, OM_PROVIDER_TOKEN);
+	}
+	ck_assert_ptr_nonnull(_oidc_strstr(metrics_json_wait_for(r, "\"200\"", 5000), "\"200\""));
+
+	/* round 2: the same metrics again plus a new keyed value; this merges
+	 * into the existing entries (oidc_metrics_timings_update and
+	 * oidc_metrics_counter_update incl. its new-key branch) */
+	{
+		OIDC_METRICS_COUNTER_INC(r, c, OM_AUTHN_REQUEST_ERROR_URL);
+		OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "200");
+		OIDC_METRICS_COUNTER_INC_VALUE(r, c, OM_PROVIDER_HTTP_RESPONSE_CODE, "404");
+		OIDC_METRICS_COUNTER_INC_NAME_VALUE(r, c, OM_CLAIM_ID_TOKEN, "email", "alice@example.com");
+		OIDC_METRICS_TIMING_START(r, c);
+		apr_sleep(apr_time_from_msec(1));
+		OIDC_METRICS_TIMING_ADD(r, c, OM_PROVIDER_TOKEN);
+	}
+	const char *body = metrics_json_wait_for(r, "\"404\"", 5000);
+	ck_assert_ptr_nonnull(body);
+	ck_assert_ptr_nonnull(_oidc_strstr(body, "\"404\""));
+
+	/* the prometheus formatter must render the counter lines incl. the
+	 * plain, value-labeled and name+value-labeled shapes; the twice-flushed
+	 * "200" counter must show the merged value of 2 */
+	r->args = "format=prometheus&reset=false";
+	ck_assert_int_eq(oidc_metrics_handle_request(r), OK);
+	body = oidc_request_state_get(r, "sent_body");
+	ck_assert_ptr_nonnull(body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_authn_request_error_url") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "value=\"200\"} 2") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "value=\"404\"} 1") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "name=\"email\"") != NULL, "BODY=[%s]", body);
+
+	/* the status formatter with a name+value selector digs into the nested
+	 * name -> value counter object */
+	r->args = "format=status&server_name=www.example.com&counter=claim.id_token"
+		  "&name=email&value=alice%40example.com";
+	ck_assert_int_eq(oidc_metrics_handle_request(r), OK);
+	body = oidc_request_state_get(r, "sent_body");
+	ck_assert_ptr_nonnull(body);
+	ck_assert_msg(_oidc_strstr(body, "OK: 2") != NULL, "BODY=[%s]", body);
+
+	/* a name that does not exist under the counter yields the bare OK */
+	r->args = "format=status&server_name=www.example.com&counter=claim.id_token"
+		  "&name=missing&value=whatever";
+	ck_assert_int_eq(oidc_metrics_handle_request(r), OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+/* the counters and timers added for the instrumentation gaps flush and render */
+START_TEST(test_metrics_flushed_gap_counters) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+
+	cmd_parms *cmd = oidc_test_cmd_get("OIDCMetricsData");
+	ck_assert_ptr_null(oidc_cmd_metrics_hook_data_set(cmd, NULL, "logout"));
+	cmd = oidc_test_cmd_get("OIDCMetricsData");
+	ck_assert_ptr_null(oidc_cmd_metrics_hook_data_set(cmd, NULL, "cache"));
+
+	OIDC_METRICS_COUNTER_INC(r, c, OM_PROVIDER_JWKS_ERROR);
+	OIDC_METRICS_COUNTER_INC(r, c, OM_PROVIDER_PAR_ERROR);
+	OIDC_METRICS_COUNTER_INC(r, c, OM_PROVIDER_REGISTRATION_ERROR);
+	OIDC_METRICS_COUNTER_INC(r, c, OM_PROVIDER_REVOCATION_ERROR);
+	OIDC_METRICS_COUNTER_INC(r, c, OM_PROVIDER_DPOP_RETRY);
+	OIDC_METRICS_COUNTER_INC(r, c, OM_SESSION_FALLBACK_COOKIE);
+	OIDC_METRICS_COUNTER_INC(r, c, OM_CACHE_RETRY);
+	OIDC_METRICS_COUNTER_INC(r, c, OM_LOGOUT_BACKCHANNEL);
+	OIDC_METRICS_COUNTER_INC(r, c, OM_LOGOUT_BACKCHANNEL_ERROR);
+	oidc_metrics_timing_add(r, OM_PROVIDER_JWKS, apr_time_from_msec(2));
+	oidc_metrics_timing_add(r, OM_PROVIDER_PAR, apr_time_from_msec(2));
+
+	const char *body = metrics_json_wait_for(r, "backchannel", 5000);
+	ck_assert_ptr_nonnull(body);
+
+	r->args = "format=prometheus&reset=false";
+	ck_assert_int_eq(oidc_metrics_handle_request(r), OK);
+	body = oidc_request_state_get(r, "sent_body");
+	ck_assert_ptr_nonnull(body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_provider_jwks_error") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_provider_par_error") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_provider_registration_error") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_provider_revocation_error") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_provider_dpop_retry") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_session_fallback_cookie") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_cache_cache_retry") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_logout_backchannel") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_provider_jwks_bucket") != NULL, "BODY=[%s]", body);
+	ck_assert_msg(_oidc_strstr(body, "oidc_provider_par_bucket") != NULL, "BODY=[%s]", body);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+/* an out-of-bounds OIDC_METRICS_CACHE_JSON_MAX falls back to the default shm size */
+START_TEST(test_metrics_shm_size_env_out_of_bounds) {
+	request_rec *r = oidc_test_request_get();
+	setenv("OIDC_METRICS_CACHE_JSON_MAX", "0", 1);
+	metrics_subsystem_setup(r);
+	r->args = "format=status";
+	ck_assert_int_eq(oidc_metrics_handle_request(r), OK);
+	metrics_subsystem_teardown(r);
+	unsetenv("OIDC_METRICS_CACHE_JSON_MAX");
+}
+END_TEST
+
+/* a negative elapsed time is discarded; a sum overflow resets the timing entry */
+START_TEST(test_metrics_timing_negative_and_overflow) {
+	request_rec *r = oidc_test_request_get();
+	metrics_subsystem_setup(r);
+
+	oidc_metrics_timing_add(r, OM_PROVIDER_TOKEN, -5);
+
+	/* two huge samples: the second would overflow the jansson integer range and
+	 * resets the entry instead */
+	apr_time_t huge = APR_INT64_MAX / 2 + 10;
+	oidc_metrics_timing_add(r, OM_PROVIDER_TOKEN, huge);
+	oidc_metrics_timing_add(r, OM_PROVIDER_TOKEN, huge);
+
+	metrics_subsystem_teardown(r);
+}
+END_TEST
+
+/* staggered flush rounds: a counters-only round followed by a timings-only round, so
+ * each flush finds the other family absent in the shm JSON; a status counter query
+ * against the timings-only server section reports the bare OK */
+START_TEST(test_metrics_flushed_staggered_families) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+
+	/* round 1: counters only */
+	OIDC_METRICS_COUNTER_INC(r, c, OM_PROVIDER_CONNECT_ERROR);
+	ck_assert_ptr_nonnull(metrics_json_wait_for(r, "connect", 5000));
+
+	/* round 2: timings only */
+	OIDC_METRICS_TIMING_START(r, c);
+	apr_sleep(apr_time_from_msec(1));
+	OIDC_METRICS_TIMING_ADD(r, c, OM_PROVIDER_TOKEN);
+	ck_assert_ptr_nonnull(metrics_json_wait_for(r, "token", 5000));
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_flushed_status_unknown_counter) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	e2e_force_metrics_flush(r, c);
+
+	/* a counter name that does not exist in the shm JSON: the find returns NULL,
+	 * the handler returns the bare "OK\n" message (still rc=OK) */
+	r->args = "format=status&server_name=www.example.com&counter=totally.bogus.counter";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+START_TEST(test_metrics_handle_request_flushed_status_unknown_server) {
+	request_rec *r = oidc_test_request_get();
+	oidc_cfg_t *c = oidc_test_cfg_get();
+	e2e_metrics_setup_flushed(r);
+	e2e_force_metrics_flush(r, c);
+
+	/* server_name not present in the JSON: short-circuits via j_server==NULL */
+	r->args = "format=status&server_name=other.host.example&counter=authn.request.error.url";
+	int rc = oidc_metrics_handle_request(r);
+	ck_assert_int_eq(rc, OK);
+
+	e2e_metrics_teardown_flushed(r);
+}
+END_TEST
+
+int main(void) {
+	TCase *classname = tcase_create("classname");
+	tcase_add_checked_fixture(classname, oidc_test_setup, oidc_test_teardown);
+	tcase_add_test(classname, test_metrics_type_name2s);
+	tcase_add_test(classname, test_metrics_is_valid_classname_known);
+	tcase_add_test(classname, test_metrics_is_valid_classname_claim_wildcard);
+	tcase_add_test(classname, test_metrics_is_valid_classname_unknown);
+	tcase_add_test(classname, test_metrics_timing_table_order);
+	tcase_add_test(classname, test_metrics_counter_names_unique);
+
+	TCase *lifecycle = tcase_create("lifecycle");
+	tcase_add_checked_fixture(lifecycle, oidc_test_setup, oidc_test_teardown);
+	tcase_set_timeout(lifecycle, 30);
+	tcase_add_test(lifecycle, test_metrics_handle_request_no_format_default_prometheus);
+	tcase_add_test(lifecycle, test_metrics_handle_request_format_json);
+	tcase_add_test(lifecycle, test_metrics_handle_request_format_internal);
+	tcase_add_test(lifecycle, test_metrics_handle_request_format_status);
+	tcase_add_test(lifecycle, test_metrics_handle_request_format_unknown);
+	tcase_add_test(lifecycle, test_metrics_handle_request_with_samples);
+
+	TCase *flushed = tcase_create("flushed");
+	tcase_add_checked_fixture(flushed, oidc_test_setup, oidc_test_teardown);
+	tcase_set_timeout(flushed, 60);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_prometheus);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_json);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_internal);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_status);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_status_counter_selector);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_status_counter_with_value);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_reset_nested_counter);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_counter_inc_twice_before_flush);
+	tcase_add_test(flushed, test_metrics_flushed_twice_updates_entries);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_status_unknown_counter);
+	tcase_add_test(flushed, test_metrics_handle_request_flushed_status_unknown_server);
+	tcase_add_test(flushed, test_metrics_flushed_gap_counters);
+	tcase_add_test(flushed, test_metrics_shm_size_env_out_of_bounds);
+	tcase_add_test(flushed, test_metrics_timing_negative_and_overflow);
+	tcase_add_test(flushed, test_metrics_flushed_staggered_families);
+
+	Suite *s = suite_create("metrics");
+	suite_add_tcase(s, classname);
+	suite_add_tcase(s, lifecycle);
+	suite_add_tcase(s, flushed);
+
+	return oidc_test_suite_run(s);
+}

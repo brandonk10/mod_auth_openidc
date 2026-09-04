@@ -1,0 +1,19 @@
+# Cookie header tokens for fuzz_cookie: the session cookie name, its chunk
+# count and chunk names, the state cookie prefix, a compact-JWE header the
+# state sweep decrypts, and the separators the tokenizer splits on.
+"mod_auth_openidc_session="
+"mod_auth_openidc_session_chunks="
+"mod_auth_openidc_session_0="
+"mod_auth_openidc_session_1="
+"mod_auth_openidc_session_99="
+"mod_auth_openidc_state_"
+"eyJhbGciOiAiZGlyIiwgImVuYyI6ICJBMjU2R0NNIn0.."
+"; "
+";"
+"="
+"0"
+"1"
+"2"
+"99"
+"100"
+"-1"

@@ -44,19 +44,23 @@
 #include "proto/proto.h"
 #include "util/util.h"
 
+#include <openssl/crypto.h>
+
 /*
  * if a nonce was passed in the authorization request (and stored in the browser state),
  * check that it matches the nonce value in the id_token payload
  */
 // non-static for test.c
-apr_byte_t oidc_proto_idtoken_validate_nonce(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider,
-					     const char *nonce, oidc_jwt_t *jwt) {
+apr_byte_t oidc_proto_idtoken_validate_nonce(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
+					     const char *nonce, const oidc_jwt_t *jwt) {
 
 	oidc_jose_error_t err;
 
 	/* see if we have this nonce cached already */
 	char *replay = NULL;
-	oidc_cache_get_nonce(r, nonce, &replay);
+	if (oidc_cache_get_nonce(r, nonce, &replay) == FALSE)
+		oidc_warn(r, "cache lookup for nonce replay detection failed; a backend error is treated as "
+			     "\"not seen\", so replay protection is not enforced for this request");
 	if (replay != NULL) {
 		oidc_error(r,
 			   "the nonce value (%s) passed in the browser state was found in the cache already; possible "
@@ -88,7 +92,9 @@ apr_byte_t oidc_proto_idtoken_validate_nonce(request_rec *r, oidc_cfg_t *cfg, oi
 	apr_time_t nonce_cache_duration = apr_time_from_sec(oidc_cfg_provider_idtoken_iat_slack_get(provider) * 2 + 10);
 
 	/* store it in the cache for the calculated duration */
-	oidc_cache_set_nonce(r, nonce, nonce, apr_time_now() + nonce_cache_duration);
+	if (oidc_cache_set_nonce(r, nonce, nonce, apr_time_now() + nonce_cache_duration) == FALSE)
+		oidc_warn(r, "failed to store nonce in the cache; a subsequent replay of this id_token may go "
+			     "undetected");
 
 	oidc_debug(r, "nonce \"%s\" validated successfully and is now cached for %" APR_TIME_T_FMT " seconds", nonce,
 		   apr_time_sec(nonce_cache_duration));
@@ -99,135 +105,136 @@ apr_byte_t oidc_proto_idtoken_validate_nonce(request_rec *r, oidc_cfg_t *cfg, oi
 #define OIDC_PROTO_IDTOKEN_AUD_CLIENT_ID_SPECIAL_VALUE "@"
 
 /*
- * validate the "aud" and "azp" claims in the id_token payload
+ * validate that the "azp" claim, when present, matches the configured client_id
  */
-apr_byte_t oidc_proto_idtoken_validate_aud_and_azp(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider,
-						   oidc_jwt_payload_t *id_token_payload) {
-
-	char *azp = NULL;
-	const char *s_aud = NULL;
-	const apr_array_header_t *arr = NULL;
-	int i = 0;
-
-	oidc_jose_get_string(r->pool, id_token_payload->value.json, OIDC_CLAIM_AZP, FALSE, &azp, NULL);
-
+static apr_byte_t oidc_proto_idtoken_validate_azp(request_rec *r, const oidc_provider_t *provider, const char *azp) {
 	/*
 	 * the "azp" claim is only needed when the id_token has a single audience value and that audience
 	 * is different than the authorized party; it MAY be included even when the authorized party is
 	 * the same as the sole audience.
 	 */
-	if ((azp != NULL) && (_oidc_strcmp(azp, oidc_cfg_provider_client_id_get(provider)) != 0)) {
-		oidc_error(r,
-			   "the \"%s\" claim (%s) is present in the id_token, but is not equal to the configured "
-			   "client_id (%s)",
-			   OIDC_CLAIM_AZP, azp, oidc_cfg_provider_client_id_get(provider));
+	if ((azp == NULL) || (_oidc_strcmp(azp, oidc_cfg_provider_client_id_get(provider)) == 0))
+		return TRUE;
+	oidc_error(r,
+		   "the \"%s\" claim (%s) is present in the id_token, but is not equal to the configured "
+		   "client_id (%s)",
+		   OIDC_CLAIM_AZP, azp, oidc_cfg_provider_client_id_get(provider));
+	return FALSE;
+}
+
+/*
+ * resolve the special "@" audience value to the configured client_id (passthrough otherwise)
+ */
+static const char *oidc_proto_idtoken_aud_resolve(const oidc_provider_t *provider, const char *s_aud) {
+	if (_oidc_strcmp(s_aud, OIDC_PROTO_IDTOKEN_AUD_CLIENT_ID_SPECIAL_VALUE) == 0)
+		return oidc_cfg_provider_client_id_get(provider);
+	return s_aud;
+}
+
+/*
+ * validate a single-valued "aud" claim against either the client_id or the configured aud-values list
+ */
+static apr_byte_t oidc_proto_idtoken_validate_aud_string(request_rec *r, const oidc_provider_t *provider,
+							 const apr_array_header_t *arr, const char *aud_value) {
+
+	if (arr == NULL) {
+		/* a single-valued audience must be equal to our client_id */
+		if (_oidc_strcmp(aud_value, oidc_cfg_provider_client_id_get(provider)) == 0)
+			return TRUE;
+		oidc_error(r, "the configured client_id (%s) did not match the \"%s\" claim value (%s) in the id_token",
+			   oidc_cfg_provider_client_id_get(provider), OIDC_CLAIM_AUD, aud_value);
 		return FALSE;
 	}
 
-	/* get the "aud" value from the JSON payload */
-	json_t *aud = json_object_get(id_token_payload->value.json, OIDC_CLAIM_AUD);
-	if (aud != NULL) {
+	for (int i = 0; i < arr->nelts; i++) {
+		const char *s_aud = oidc_proto_idtoken_aud_resolve(provider, APR_ARRAY_IDX(arr, i, const char *));
+		if (_oidc_strcmp(aud_value, s_aud) == 0)
+			return TRUE;
+	}
 
-		arr = oidc_proto_profile_id_token_aud_values_get(r->pool, provider);
+	oidc_error(r, "none of our configured audience values could be found in \"%s\" claim", OIDC_CLAIM_AUD);
+	return FALSE;
+}
 
-		/* check if it is a single-value */
-		if (json_is_string(aud)) {
+/*
+ * validate a multi-valued "aud" claim against either the client_id or the configured aud-values list
+ */
+static apr_byte_t oidc_proto_idtoken_validate_aud_array(request_rec *r, const oidc_provider_t *provider,
+							const apr_array_header_t *arr, const oidc_json_t *aud,
+							const char *azp) {
+	const char *s_aud = NULL;
 
-			if (arr == NULL) {
+	if (arr == NULL) {
+		if ((oidc_json_array_size(aud) > 1) && (azp == NULL))
+			oidc_warn(r,
+				  "the \"%s\" claim value in the id_token is an array with more than 1 element, but "
+				  "\"%s\" claim is not present (a SHOULD in the spec...)",
+				  OIDC_CLAIM_AUD, OIDC_CLAIM_AZP);
 
-				/* a single-valued audience must be equal to our client_id */
-				if (_oidc_strcmp(json_string_value(aud), oidc_cfg_provider_client_id_get(provider)) !=
-				    0) {
-					oidc_error(r,
-						   "the configured client_id (%s) did not match the \"%s\" claim value "
-						   "(%s) in "
-						   "the id_token",
-						   oidc_cfg_provider_client_id_get(provider), OIDC_CLAIM_AUD,
-						   json_string_value(aud));
-					return FALSE;
-				}
-
-			} else {
-
-				for (i = 0; i < arr->nelts; i++) {
-					s_aud = APR_ARRAY_IDX(arr, i, const char *);
-					if (_oidc_strcmp(s_aud, OIDC_PROTO_IDTOKEN_AUD_CLIENT_ID_SPECIAL_VALUE) == 0)
-						s_aud = oidc_cfg_provider_client_id_get(provider);
-					if (_oidc_strcmp(json_string_value(aud), s_aud) == 0)
-						break;
-				}
-
-				if (i == arr->nelts) {
-					oidc_error(
-					    r, "none of our configured audience values could be found in \"%s\" claim",
-					    OIDC_CLAIM_AUD);
-					return FALSE;
-				}
-			}
-
-			/* check if this is a multi-valued audience */
-		} else if (json_is_array(aud)) {
-
-			if (arr == NULL) {
-
-				if ((json_array_size(aud) > 1) && (azp == NULL)) {
-					oidc_warn(r,
-						  "the \"%s\" claim value in the id_token is an array with more than 1 "
-						  "element, but \"%s\" claim is not present (a SHOULD in the spec...)",
-						  OIDC_CLAIM_AUD, OIDC_CLAIM_AZP);
-				}
-
-				if (oidc_util_json_array_has_value(r, aud, oidc_cfg_provider_client_id_get(provider)) ==
-				    FALSE) {
-					oidc_error(
-					    r,
-					    "our configured client_id (%s) could not be found in the array of values "
-					    "for \"%s\" claim",
-					    oidc_cfg_provider_client_id_get(provider), OIDC_CLAIM_AUD);
-					return FALSE;
-				}
-
-			} else {
-
-				/* handle explicit and exhaustive configuration of acceptable audience values */
-
-				for (i = 0; i < arr->nelts; i++) {
-					s_aud = APR_ARRAY_IDX(arr, i, const char *);
-					if (_oidc_strcmp(s_aud, OIDC_PROTO_IDTOKEN_AUD_CLIENT_ID_SPECIAL_VALUE) == 0)
-						s_aud = oidc_cfg_provider_client_id_get(provider);
-					if (oidc_util_json_array_has_value(r, aud, s_aud) == FALSE) {
-						oidc_error(r,
-							   "our configured audience value (%s) could not be found in "
-							   "the array of values "
-							   "for \"%s\" claim",
-							   APR_ARRAY_IDX(arr, i, const char *), OIDC_CLAIM_AUD);
-						return FALSE;
-					}
-				}
-
-				if (json_array_size(aud) > arr->nelts) {
-					oidc_error(
-					    r,
-					    "our configured audience values are all present in the array of values "
-					    "for \"%s\" claim, but there are other unknown/untrusted values included "
-					    "as well",
-					    OIDC_CLAIM_AUD);
-					return FALSE;
-				}
-			}
-
-		} else {
-			oidc_error(r, "id_token JSON payload \"%s\" claim is not a string nor an array",
-				   OIDC_CLAIM_AUD);
+		if (oidc_json_array_has_value(r, aud, oidc_cfg_provider_client_id_get(provider)) == FALSE) {
+			oidc_error(r,
+				   "our configured client_id (%s) could not be found in the array of values for \"%s\" "
+				   "claim",
+				   oidc_cfg_provider_client_id_get(provider), OIDC_CLAIM_AUD);
 			return FALSE;
 		}
+		return TRUE;
+	}
 
-	} else {
-		oidc_error(r, "id_token JSON payload did not contain an \"%s\" claim", OIDC_CLAIM_AUD);
+	/* handle explicit and exhaustive configuration of acceptable audience values */
+	for (int i = 0; i < arr->nelts; i++) {
+		s_aud = oidc_proto_idtoken_aud_resolve(provider, APR_ARRAY_IDX(arr, i, const char *));
+		if (oidc_json_array_has_value(r, aud, s_aud) == FALSE) {
+			oidc_error(r,
+				   "our configured audience value (%s) could not be found in the array of values for "
+				   "\"%s\" claim",
+				   APR_ARRAY_IDX(arr, i, const char *), OIDC_CLAIM_AUD);
+			return FALSE;
+		}
+	}
+
+	if (oidc_json_array_size(aud) > (size_t)arr->nelts) {
+		oidc_error(r,
+			   "our configured audience values are all present in the array of values for \"%s\" claim, "
+			   "but there are other unknown/untrusted values included as well",
+			   OIDC_CLAIM_AUD);
 		return FALSE;
 	}
 
 	return TRUE;
+}
+
+/*
+ * validate the "aud" and "azp" claims in the id_token payload
+ */
+apr_byte_t oidc_proto_idtoken_validate_aud_and_azp(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
+						   const oidc_jwt_payload_t *id_token_payload) {
+	char *azp = NULL;
+	const oidc_json_t *aud = NULL;
+	const apr_array_header_t *arr = NULL;
+
+	oidc_jose_get_string(r->pool, id_token_payload->value.json, OIDC_CLAIM_AZP, FALSE, &azp, NULL);
+
+	if (oidc_proto_idtoken_validate_azp(r, provider, azp) == FALSE)
+		return FALSE;
+
+	/* get the "aud" value from the JSON payload */
+	aud = oidc_json_object_get(id_token_payload->value.json, OIDC_CLAIM_AUD);
+	if (aud == NULL) {
+		oidc_error(r, "id_token JSON payload did not contain an \"%s\" claim", OIDC_CLAIM_AUD);
+		return FALSE;
+	}
+
+	arr = oidc_proto_profile_id_token_aud_values_get(r->pool, provider);
+
+	if (oidc_json_is_string(aud))
+		return oidc_proto_idtoken_validate_aud_string(r, provider, arr, oidc_json_string_value(aud));
+
+	if (oidc_json_is_array(aud))
+		return oidc_proto_idtoken_validate_aud_array(r, provider, arr, aud, azp);
+
+	oidc_error(r, "id_token JSON payload \"%s\" claim is not a string nor an array", OIDC_CLAIM_AUD);
+	return FALSE;
 }
 
 /*
@@ -250,16 +257,19 @@ static apr_byte_t oidc_proto_validate_hash(request_rec *r, const char *alg, cons
 
 	/* calculate the base64url-encoded value of the hash */
 	char *decoded = NULL;
-	unsigned int decoded_len = oidc_util_base64url_decode(r->pool, &decoded, hash);
+	int decoded_len = oidc_util_base64url_decode(r->pool, &decoded, hash);
 	if (decoded_len <= 0) {
 		oidc_error(r, "oidc_base64url_decode returned an error");
 		return FALSE;
 	}
 
-	oidc_debug(r, "hash_len=%d, decoded_len=%d, calc_len=%d", hash_len, decoded_len, calc_len);
+	oidc_debug(r, "hash_len=%u, decoded_len=%d, calc_len=%u", hash_len, decoded_len, calc_len);
 
-	/* compare the calculated hash against the provided hash */
-	if ((decoded_len != hash_len) || (calc_len < hash_len) || (memcmp(decoded, calc, hash_len) != 0)) {
+	/* compare the calculated hash against the provided hash; use a
+	 * constant-time compare so the failure path can't leak information
+	 * about how many leading bytes matched */
+	if (((unsigned int)decoded_len != hash_len) || (calc_len < hash_len) ||
+	    (CRYPTO_memcmp(decoded, calc, hash_len) != 0)) {
 		oidc_error(r, "provided \"%s\" hash value (%s) does not match the calculated value", type, hash);
 		return FALSE;
 	}
@@ -273,7 +283,7 @@ static apr_byte_t oidc_proto_validate_hash(request_rec *r, const char *alg, cons
 /*
  * check a hash value in the id_token against the corresponding hash calculated over a provided value
  */
-static apr_byte_t oidc_proto_validate_hash_value(request_rec *r, oidc_provider_t *provider, oidc_jwt_t *jwt,
+static apr_byte_t oidc_proto_validate_hash_value(request_rec *r, oidc_provider_t *provider, const oidc_jwt_t *jwt,
 						 const char *response_type, const char *value, const char *key,
 						 apr_array_header_t *required_for_flows) {
 
@@ -289,8 +299,7 @@ static apr_byte_t oidc_proto_validate_hash_value(request_rec *r, oidc_provider_t
 	if (hash == NULL) {
 
 		/* no hash..., now see if the flow required it */
-		int i;
-		for (i = 0; i < required_for_flows->nelts; i++) {
+		for (int i = 0; i < required_for_flows->nelts; i++) {
 			if (oidc_util_spaced_string_equals(r->pool, response_type,
 							   APR_ARRAY_IDX(required_for_flows, i, const char *))) {
 				oidc_warn(r, "flow is \"%s\", but no %s found in id_token", response_type, key);
@@ -311,7 +320,7 @@ static apr_byte_t oidc_proto_validate_hash_value(request_rec *r, oidc_provider_t
 /*
  * check the at_hash value in the id_token against the access_token
  */
-apr_byte_t oidc_proto_idtoken_validate_access_token(request_rec *r, oidc_provider_t *provider, oidc_jwt_t *jwt,
+apr_byte_t oidc_proto_idtoken_validate_access_token(request_rec *r, oidc_provider_t *provider, const oidc_jwt_t *jwt,
 						    const char *response_type, const char *access_token) {
 	apr_array_header_t *required_for_flows = apr_array_make(r->pool, 2, sizeof(const char *));
 	APR_ARRAY_PUSH(required_for_flows, const char *) = OIDC_PROTO_RESPONSE_TYPE_IDTOKEN_TOKEN;
@@ -327,7 +336,7 @@ apr_byte_t oidc_proto_idtoken_validate_access_token(request_rec *r, oidc_provide
 /*
  * check the c_hash value in the id_token against the code
  */
-apr_byte_t oidc_proto_idtoken_validate_code(request_rec *r, oidc_provider_t *provider, oidc_jwt_t *jwt,
+apr_byte_t oidc_proto_idtoken_validate_code(request_rec *r, oidc_provider_t *provider, const oidc_jwt_t *jwt,
 					    const char *response_type, const char *code) {
 	apr_array_header_t *required_for_flows = apr_array_make(r->pool, 2, sizeof(const char *));
 	APR_ARRAY_PUSH(required_for_flows, const char *) = OIDC_PROTO_RESPONSE_TYPE_CODE_IDTOKEN;
@@ -343,20 +352,15 @@ apr_byte_t oidc_proto_idtoken_validate_code(request_rec *r, oidc_provider_t *pro
 /*
  * check whether the provided JWT is a valid id_token for the specified "provider"
  */
-static apr_byte_t oidc_proto_validate_idtoken(request_rec *r, oidc_provider_t *provider, oidc_jwt_t *jwt,
-					      const char *nonce) {
-
-	oidc_cfg_t *cfg = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+static apr_byte_t oidc_proto_validate_idtoken(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
+					      oidc_jwt_t *jwt, const char *nonce) {
 
 	oidc_debug(r, "enter, jwt.header=\"%s\", jwt.payload=\"%s\", nonce=\"%s\"", jwt->header.value.str,
 		   jwt->payload.value.str, nonce);
 
-	/* if a nonce is not passed, we're doing a ("code") flow where the nonce is optional */
-	if (nonce != NULL) {
-		/* if present, verify the nonce */
-		if (oidc_proto_idtoken_validate_nonce(r, cfg, provider, nonce, jwt) == FALSE)
-			return FALSE;
-	}
+	/* if a nonce is passed, verify it; otherwise we're doing a ("code") flow where the nonce is optional */
+	if ((nonce != NULL) && (oidc_proto_idtoken_validate_nonce(r, cfg, provider, nonce, jwt) == FALSE))
+		return FALSE;
 
 	/* validate the ID Token JWT, requiring iss match, and valid exp + iat */
 	if (oidc_proto_jwt_validate(
@@ -381,8 +385,9 @@ static apr_byte_t oidc_proto_validate_idtoken(request_rec *r, oidc_provider_t *p
 /*
  * check whether the provided string is a valid id_token and return its parsed contents
  */
-apr_byte_t oidc_proto_idtoken_parse(request_rec *r, oidc_cfg_t *cfg, oidc_provider_t *provider, const char *id_token,
-				    const char *nonce, oidc_jwt_t **jwt, apr_byte_t is_code_flow) {
+apr_byte_t oidc_proto_idtoken_parse(request_rec *r, oidc_cfg_t *cfg, const oidc_provider_t *provider,
+				    const char *id_token, const char *nonce, oidc_jwt_t **jwt,
+				    apr_byte_t is_code_flow) {
 
 	char *alg = NULL;
 	oidc_debug(r, "enter: id_token header=%s", oidc_proto_jwt_header_peek(r, id_token, &alg, NULL, NULL));
@@ -404,6 +409,7 @@ apr_byte_t oidc_proto_idtoken_parse(request_rec *r, oidc_cfg_t *cfg, oidc_provid
 		oidc_error(r, "oidc_jwt_parse failed: %s", oidc_jose_e2s(r->pool, err));
 		oidc_jwt_destroy(*jwt);
 		*jwt = NULL;
+		oidc_jwk_destroy(jwk);
 		return FALSE;
 	}
 
@@ -411,8 +417,16 @@ apr_byte_t oidc_proto_idtoken_parse(request_rec *r, oidc_cfg_t *cfg, oidc_provid
 	oidc_debug(r, "successfully parsed (and possibly decrypted) JWT with header=%s, and payload=%s",
 		   (*jwt)->header.value.str, (*jwt)->payload.value.str);
 
-	// make signature validation exception for 'code' flow and the algorithm NONE
-	if (is_code_flow == FALSE || _oidc_strcmp((*jwt)->header.alg, "none") != 0) {
+	// make a signature-validation exception for the 'code' flow with algorithm "none": the id_token is
+	// then obtained over the TLS-protected back-channel, which OpenID Connect Core 1.0 section 3.1.3.7
+	// item 6 allows to stand in for validating the signature. A *different* algorithm pinned through
+	// OIDCIDTokenSignedResponseAlg (or the client metadata) overrides that exception: honor the pin and
+	// reject the unsigned token. A pin of "none" is not such an override - it is the operator, or the
+	// OP's own client registration, stating that this OP issues unsigned id_tokens - so it takes the
+	// exception too, rather than demanding a signature that by definition cannot verify
+	const char *pinned_alg = oidc_cfg_provider_id_token_signed_response_alg_get(provider);
+	if ((is_code_flow == FALSE) || (_oidc_strcmp((*jwt)->header.alg, "none") != 0) ||
+	    ((pinned_alg != NULL) && (_oidc_strcmp(pinned_alg, "none") != 0))) {
 
 		jwk = NULL;
 		if (oidc_util_key_symmetric_create(r, oidc_cfg_provider_client_secret_get(provider), 0, NULL, TRUE,
@@ -438,7 +452,7 @@ apr_byte_t oidc_proto_idtoken_parse(request_rec *r, oidc_cfg_t *cfg, oidc_provid
 	}
 
 	/* this is where the meat is */
-	if (oidc_proto_validate_idtoken(r, provider, *jwt, nonce) == FALSE) {
+	if (oidc_proto_validate_idtoken(r, cfg, provider, *jwt, nonce) == FALSE) {
 		oidc_error(r, "id_token payload could not be validated, aborting");
 		oidc_jwt_destroy(*jwt);
 		*jwt = NULL;
@@ -447,9 +461,10 @@ apr_byte_t oidc_proto_idtoken_parse(request_rec *r, oidc_cfg_t *cfg, oidc_provid
 
 	/* log our results */
 
-	apr_rfc822_date(buf, apr_time_from_sec((*jwt)->payload.exp));
-	oidc_debug(r, "valid id_token for user \"%s\" expires: [%s], in %ld secs from now)", (*jwt)->payload.sub, buf,
-		   (long)((*jwt)->payload.exp - apr_time_sec(apr_time_now())));
+	apr_time_t expires = oidc_util_apr_time_from_sec((*jwt)->payload.exp);
+	apr_rfc822_date(buf, expires);
+	oidc_debug(r, "valid id_token for user \"%s\" expires: [%s], in %" APR_TIME_T_FMT " secs from now)",
+		   (*jwt)->payload.sub, buf, apr_time_sec(expires) - apr_time_sec(apr_time_now()));
 
 	/* since we've made it so far, we may as well say it is a valid id_token */
 	return TRUE;

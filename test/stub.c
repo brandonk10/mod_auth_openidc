@@ -1,3 +1,4 @@
+#include "util/request_state.h"
 #include <apr_global_mutex.h>
 #include <apr_lib.h>
 #include <apr_strings.h>
@@ -11,6 +12,22 @@
 
 // clang-format on
 
+/* NB: deliberately not "util.h": including it here pulls in <http_request.h>, whose AP_DECLARE_HOOK
+ * declarations collide with the hand-rolled ap_hook_* shims below. These mirror the declarations in
+ * util.h instead; the two must stay in step. */
+typedef int (*oidc_test_hook_post_config_fn)(apr_pool_t *pool, apr_pool_t *p1, apr_pool_t *p2, server_rec *s);
+typedef void (*oidc_test_hook_child_init_fn)(apr_pool_t *p, server_rec *s);
+typedef void (*oidc_test_hook_insert_filter_fn)(request_rec *r);
+typedef apr_status_t (*oidc_test_input_filter_fn)(ap_filter_t *f, apr_bucket_brigade *b, ap_input_mode_t mode,
+						  apr_read_type_e block, apr_off_t nbytes);
+
+static oidc_test_hook_insert_filter_fn _oidc_test_hook_insert_filter = NULL;
+static oidc_test_input_filter_fn _oidc_test_input_filter = NULL;
+static const char *_oidc_test_added_input_filter = NULL;
+static const char *_oidc_test_brigade_body = NULL;
+static apr_status_t _oidc_test_brigade_rc = APR_SUCCESS;
+static const char *_oidc_test_exec_line_output = NULL;
+
 #define ap_HOOK_check_user_id_t void
 
 AP_DECLARE(void)
@@ -19,9 +36,18 @@ ap_hook_check_authn(ap_HOOK_check_user_id_t *pf, const char *const *aszPre, cons
 	// comment explaining why the method is empty
 }
 
+/* the first authz provider the module registers, so its parse_require_line can be driven */
+static const void *_oidc_test_authz_provider = NULL;
+
+const void *oidc_test_authz_provider_get(void) {
+	return _oidc_test_authz_provider;
+}
+
 AP_DECLARE(apr_status_t)
 ap_register_auth_provider(apr_pool_t *pool, const char *provider_group, const char *provider_name,
 			  const char *provider_version, const void *provider, int type) {
+	if (_oidc_test_authz_provider == NULL)
+		_oidc_test_authz_provider = provider;
 	return 0;
 }
 
@@ -29,8 +55,17 @@ AP_DECLARE(apr_status_t) ap_unixd_set_global_mutex_perms(apr_global_mutex_t *gmu
 	return 0;
 }
 
+/* the AuthType reported to the module; default openid-connect, overridable per
+ * test via oidc_test_set_auth_type() so the OAuth / mixed dispatch paths can be
+ * exercised */
+static const char *stub_auth_type = "openid-connect";
+
+void oidc_test_set_auth_type(const char *auth_type) {
+	stub_auth_type = (auth_type != NULL) ? auth_type : "openid-connect";
+}
+
 AP_DECLARE(const char *) ap_auth_type(request_rec *r) {
-	return "openid-connect";
+	return stub_auth_type;
 }
 
 AP_DECLARE(const char *) ap_auth_name(request_rec *r) {
@@ -38,7 +73,18 @@ AP_DECLARE(const char *) ap_auth_name(request_rec *r) {
 }
 
 AP_DECLARE(long) ap_get_client_block(request_rec *r, char *buffer, apr_size_t bufsiz) {
-	return 0;
+	/* tests stash the POST body in r->args (and r->remaining tracks bytes left); copy
+	 * from there into the caller's buffer so oidc_util_read can drive the form parser */
+	if (r->args == NULL || r->remaining == 0)
+		return 0;
+	/* r->remaining is signed (apr_off_t) and is only ever positive here, but compare and
+	 * assign in one type so the narrowing is explicit rather than a signedness surprise */
+	apr_size_t remaining = (apr_size_t)r->remaining;
+	apr_size_t off = strlen(r->args) - remaining;
+	apr_size_t n = (bufsiz < remaining) ? bufsiz : remaining;
+	memcpy(buffer, r->args + off, n);
+	r->remaining -= n;
+	return (long)n;
 }
 
 AP_DECLARE(char *) ap_getword(apr_pool_t *atrans, const char **line, char stop) {
@@ -50,7 +96,7 @@ AP_DECLARE(char *) ap_getword(apr_pool_t *atrans, const char **line, char stop) 
 		++pos;
 	}
 
-	len = pos - *line;
+	len = (int)(pos - *line);
 	res = apr_pstrmemdup(atrans, *line, len);
 
 	if (stop) {
@@ -105,7 +151,7 @@ AP_DECLARE(char *) ap_getword_conf(apr_pool_t *p, const char **line) {
 				++strend;
 			}
 		}
-		res = substring_conf(p, str + 1, strend - str - 1, quote);
+		res = substring_conf(p, str + 1, (int)(strend - str - 1), quote);
 
 		if (*strend == quote)
 			++strend;
@@ -114,7 +160,7 @@ AP_DECLARE(char *) ap_getword_conf(apr_pool_t *p, const char **line) {
 		while (*strend && !apr_isspace(*strend))
 			++strend;
 
-		res = substring_conf(p, str, strend - str, 0);
+		res = substring_conf(p, str, (int)(strend - str), 0);
 	}
 
 	while (apr_isspace(*strend))
@@ -124,7 +170,16 @@ AP_DECLARE(char *) ap_getword_conf(apr_pool_t *p, const char **line) {
 }
 
 AP_DECLARE(char *) ap_getword_nulls(apr_pool_t *p, const char **line, char stop) {
-	return "";
+	/* match Apache semantics: return the word before `stop`, advance *line past
+	 * the separator (or to '\0' if `stop` is not present). The previous stub
+	 * silently returned "" and left *line untouched, which masked any callers
+	 * that relied on the advance — e.g. oidc_oauth_token_from_basic. */
+	const char *pos = *line;
+	while (*pos && (*pos != stop))
+		++pos;
+	char *res = apr_pstrmemdup(p, *line, pos - *line);
+	*line = (*pos == stop) ? pos + 1 : pos;
+	return res;
 }
 
 AP_DECLARE(char *) ap_getword_white(apr_pool_t *atrans, const char **line) {
@@ -136,7 +191,7 @@ AP_DECLARE(char *) ap_getword_white(apr_pool_t *atrans, const char **line) {
 		++pos;
 	}
 
-	len = pos - *line;
+	len = (int)(pos - *line);
 	res = apr_pstrmemdup(atrans, *line, len);
 
 	while (apr_isspace(*pos)) {
@@ -164,19 +219,34 @@ ap_hook_fixups(int (*handler)(request_rec *r), const char *const *aszPre, const 
 AP_DECLARE(void)
 ap_hook_insert_filter(void (*insert_filter)(request_rec *r), const char *const *aszPre, const char *const *aszSucc,
 		      int nOrder) {
-	// comment explaining why the method is empty
+	_oidc_test_hook_insert_filter = insert_filter;
+}
+
+/*
+ * the hooks the module registers are recorded rather than discarded, so a test can drive the
+ * server-lifetime entry points (post_config, child_init) the way httpd would; see test_config.c
+ */
+static oidc_test_hook_post_config_fn _oidc_test_hook_post_config = NULL;
+static oidc_test_hook_child_init_fn _oidc_test_hook_child_init = NULL;
+
+oidc_test_hook_post_config_fn oidc_test_hook_post_config_get(void) {
+	return _oidc_test_hook_post_config;
+}
+
+oidc_test_hook_child_init_fn oidc_test_hook_child_init_get(void) {
+	return _oidc_test_hook_child_init;
 }
 
 AP_DECLARE(void)
 ap_hook_post_config(int (*post_config)(apr_pool_t *pool, apr_pool_t *p1, apr_pool_t *p2, server_rec *s),
 		    const char *const *aszPre, const char *const *aszSucc, int nOrder) {
-	// comment explaining why the method is empty
+	_oidc_test_hook_post_config = post_config;
 }
 
 AP_DECLARE(void)
 ap_hook_child_init(void (*child_init)(apr_pool_t *p, server_rec *s), const char *const *aszPre,
 		   const char *const *aszSucc, int nOrder) {
-	// comment explaining why the method is empty
+	_oidc_test_hook_child_init = child_init;
 }
 
 AP_DECLARE(void)
@@ -185,7 +255,8 @@ ap_hook_handler(int (*handler)(request_rec *r), const char *const *aszPre, const
 }
 
 AP_DECLARE(int) ap_is_initial_req(request_rec *r) {
-	return 0;
+	/* Match Apache: an initial request has neither main nor prev. */
+	return (r->main == NULL) && (r->prev == NULL);
 }
 
 AP_DECLARE(ap_expr_info_t *)
@@ -196,7 +267,9 @@ ap_expr_parse_cmd_mi(const cmd_parms *cmd, const char *expr, unsigned int flags,
 		return NULL;
 	}
 	ap_expr_info_t *rv = apr_pcalloc(cmd->pool, sizeof(ap_expr_info_t));
-	rv->filename = "stub.c";
+	/* echo the expression through ap_expr_str_exec below so string-valued
+	 * expression directives behave like literal strings in the tests */
+	rv->filename = apr_pstrdup(cmd->pool, expr);
 	rv->root_node = NULL;
 	return rv;
 }
@@ -207,8 +280,13 @@ AP_DECLARE(const char *) ap_expr_str_exec(request_rec *r, const ap_expr_info_t *
 	return expr->filename;
 }
 
+/* Return the primed first command-output line; an unprimed command fails with NULL. */
 AP_DECLARE(char *) ap_get_exec_line(apr_pool_t *p, const char *cmd, const char *const *argv) {
-	return NULL;
+	return (_oidc_test_exec_line_output == NULL) ? NULL : apr_pstrdup(p, _oidc_test_exec_line_output);
+}
+
+void oidc_test_exec_line_prime(const char *output) {
+	_oidc_test_exec_line_output = output;
 }
 
 AP_DECLARE(void)
@@ -241,7 +319,17 @@ AP_DECLARE(void) ap_note_auth_failure(request_rec *r) {
 	// comment explaining why the method is empty
 }
 
+/* capture the response body passed down the output filter chain in the request
+ * state under "sent_body" so tests can assert on generated content; the test
+ * fixture wires request->output_filters->r for this (see test/util.c) */
+extern void oidc_request_state_set(request_rec *r, const char *key, const char *value);
+
 AP_DECLARE(apr_status_t) ap_pass_brigade(ap_filter_t *filter, apr_bucket_brigade *bucket) {
+	char *buf = NULL;
+	apr_size_t len = 0;
+	if ((filter != NULL) && (filter->r != NULL) &&
+	    (apr_brigade_pflatten(bucket, &buf, &len, filter->r->pool) == APR_SUCCESS) && (len > 0))
+		oidc_request_state_set(filter->r, "sent_body", apr_pstrmemdup(filter->r->pool, buf, len));
 	return APR_SUCCESS;
 }
 
@@ -292,23 +380,58 @@ AP_DECLARE(const char *) ap_get_server_name(request_rec *r) {
 }
 
 AP_DECLARE(char *) ap_server_root_relative(apr_pool_t *p, const char *file) {
-	return "";
+	/* Apache's real implementation prepends ServerRoot to relative paths; in tests
+	 * we treat the path as already-absolute (or relative-to-cwd) and return it verbatim */
+	if (file == NULL)
+		return NULL;
+	return apr_pstrdup(p, file);
 }
 
 AP_DECLARE(ap_filter_t *) ap_add_input_filter(const char *name, void *ctx, request_rec *r, conn_rec *c) {
+	_oidc_test_added_input_filter = name;
 	return NULL;
+}
+
+const char *oidc_test_added_input_filter_get(void) {
+	return _oidc_test_added_input_filter;
+}
+
+void oidc_test_added_input_filter_reset(void) {
+	_oidc_test_added_input_filter = NULL;
 }
 
 AP_DECLARE(apr_status_t)
 ap_get_brigade(ap_filter_t *filter, apr_bucket_brigade *bucket, ap_input_mode_t mode, apr_read_type_e block,
 	       apr_off_t readbytes) {
-	return APR_SUCCESS;
+	/* Return the primed request body followed by EOS; unprimed calls return an empty brigade. */
+	if (_oidc_test_brigade_body != NULL) {
+		apr_bucket_alloc_t *ba = bucket->bucket_alloc;
+		APR_BRIGADE_INSERT_TAIL(
+		    bucket, apr_bucket_heap_create(_oidc_test_brigade_body, strlen(_oidc_test_brigade_body), NULL, ba));
+		APR_BRIGADE_INSERT_TAIL(bucket, apr_bucket_eos_create(ba));
+		_oidc_test_brigade_body = NULL;
+	}
+	return _oidc_test_brigade_rc;
+}
+
+void oidc_test_brigade_prime(const char *body, apr_status_t rc) {
+	_oidc_test_brigade_body = body;
+	_oidc_test_brigade_rc = rc;
 }
 
 AP_DECLARE(ap_filter_rec_t *)
 ap_register_input_filter(const char *name, ap_in_filter_func filter_func, ap_init_filter_func filter_init,
 			 ap_filter_type ftype) {
+	_oidc_test_input_filter = filter_func;
 	return NULL;
+}
+
+oidc_test_input_filter_fn oidc_test_input_filter_get(void) {
+	return _oidc_test_input_filter;
+}
+
+oidc_test_hook_insert_filter_fn oidc_test_hook_insert_filter_get(void) {
+	return _oidc_test_hook_insert_filter;
 }
 
 AP_DECLARE(char *) ap_make_dirstr_parent(apr_pool_t *p, const char *s) {

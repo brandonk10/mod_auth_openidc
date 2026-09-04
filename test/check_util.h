@@ -43,7 +43,9 @@
 #ifndef _MOD_AUTH_OPENIDC_TEST_CHECK_UTIL_H_
 #define _MOD_AUTH_OPENIDC_TEST_CHECK_UTIL_H_
 
+#include <apr_tables.h>
 #include <check.h>
+#include <string.h>
 
 #ifndef _ck_assert_ptr_null
 #define _ck_assert_ptr_null(X, OP)                                                                                     \
@@ -65,7 +67,70 @@
 			      (unsigned long)(uintptr_t)_ck_x, #Y, (unsigned long)(uintptr_t)_ck_y);                   \
 	} while (0)
 #define ck_assert_ptr_eq(X, Y) _ck_assert_ptr(X, ==, Y)
+#define ck_assert_ptr_ne(X, Y) _ck_assert_ptr(X, !=, Y)
 #endif
+
+/* check < 0.9.10 has the _ck_assert_int internal (used by ck_assert_int_eq/ne) but not yet the
+ * lt/le/gt/ge wrappers, so guard on a wrapper name rather than the internal one */
+#ifndef ck_assert_int_lt
+#define _ck_assert_int_cmp(X, OP, Y)                                                                                   \
+	do {                                                                                                           \
+		long _ck_x = (X);                                                                                      \
+		long _ck_y = (Y);                                                                                      \
+		ck_assert_msg(_ck_x OP _ck_y, "Assertion '%s' failed: %s == %ld, %s == %ld", #X " " #OP " " #Y, #X,    \
+			      _ck_x, #Y, _ck_y);                                                                       \
+	} while (0)
+#define ck_assert_int_lt(X, Y) _ck_assert_int_cmp(X, <, Y)
+#define ck_assert_int_le(X, Y) _ck_assert_int_cmp(X, <=, Y)
+#define ck_assert_int_gt(X, Y) _ck_assert_int_cmp(X, >, Y)
+#define ck_assert_int_ge(X, Y) _ck_assert_int_cmp(X, >=, Y)
+#endif
+
+/* check < 0.10.0 (e.g. CentOS 7's 0.9.9) has none of the unsigned assert variants -- neither
+ * eq/ne nor the lt/le/gt/ge wrappers -- so guard on the eq wrapper and provide the set. uintmax_t
+ * so the 64-bit siphash values in test_cache do not truncate on an ILP32 host */
+#ifndef ck_assert_uint_eq
+#define _ck_assert_uint_cmp(X, OP, Y)                                                                                  \
+	do {                                                                                                           \
+		uintmax_t _ck_x = (X);                                                                                 \
+		uintmax_t _ck_y = (Y);                                                                                 \
+		ck_assert_msg(_ck_x OP _ck_y, "Assertion '%s' failed: %s == %ju, %s == %ju", #X " " #OP " " #Y, #X,    \
+			      _ck_x, #Y, _ck_y);                                                                       \
+	} while (0)
+#define ck_assert_uint_eq(X, Y) _ck_assert_uint_cmp(X, ==, Y)
+#define ck_assert_uint_ne(X, Y) _ck_assert_uint_cmp(X, !=, Y)
+#define ck_assert_uint_lt(X, Y) _ck_assert_uint_cmp(X, <, Y)
+#define ck_assert_uint_le(X, Y) _ck_assert_uint_cmp(X, <=, Y)
+#define ck_assert_uint_gt(X, Y) _ck_assert_uint_cmp(X, >, Y)
+#define ck_assert_uint_ge(X, Y) _ck_assert_uint_cmp(X, >=, Y)
+#endif
+
+#ifndef _ck_assert_mem
+#define ck_assert_mem_eq(X, Y, L) ck_assert_msg(memcmp((X), (Y), (L)) == 0, "Assertion '%s' failed", #X " == " #Y)
+#endif
+
+/* apr_table assertions that report a missing key instead of dereferencing NULL. */
+
+/* assert that table entry KEY is present and equals EXPECTED */
+#define ck_assert_table_str(tbl, key, expected)                                                                        \
+	do {                                                                                                           \
+		const char *_ck_tv = apr_table_get((tbl), (key));                                                      \
+		ck_assert_msg(_ck_tv != NULL, "table entry '%s' is missing", (key));                                   \
+		ck_assert_str_eq(_ck_tv, (expected));                                                                  \
+	} while (0)
+
+/* assert that table entry KEY is absent */
+#define ck_assert_table_unset(tbl, key) ck_assert_ptr_null(apr_table_get((tbl), (key)))
+
+/*
+ * assert that oidc_jwt_parse() of S succeeds, reporting the jose error string
+ * on failure (the bare ck_assert_int_eq(oidc_jwt_parse(...), TRUE) only says
+ * "!= TRUE", not why). COMPRESS is FALSE, matching every call site. The
+ * including TU must pull in jose.h (oidc_jwt_parse / oidc_jose_e2s).
+ */
+#define ck_assert_jwt_parses(pool, s, jwt, keys, err)                                                                  \
+	ck_assert_msg(oidc_jwt_parse((pool), (s), &(jwt), (keys), FALSE, &(err)) == TRUE, "oidc_jwt_parse failed: %s", \
+		      oidc_jose_e2s((pool), (err)))
 
 int oidc_test_suite_run(Suite *s);
 

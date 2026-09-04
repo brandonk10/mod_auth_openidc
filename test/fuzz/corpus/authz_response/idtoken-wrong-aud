@@ -1,0 +1,1 @@
+id_token=%7B%22iss%22%3A%22https%3A//idp.example.com%22%2C%22aud%22%3A%22other%22%2C%22sub%22%3A%22alice%22%2C%22nonce%22%3A%22x%22%2C%22iat%22%3A0%2C%22exp%22%3A0%7D

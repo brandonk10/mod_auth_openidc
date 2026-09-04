@@ -53,9 +53,18 @@
 #undef PACKAGE_BUGREPORT
 #endif
 
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
+#include <stdlib.h>
 #define __STDC_WANT_LIB_EXT1__ 1
 #include <string.h>
+
+/*
+ * compile-time assertion; uses the portable negative-array-size idiom rather than C11 _Static_assert,
+ * since the Visual Studio C compiler used for the Windows build does not accept _Static_assert
+ */
+#define OIDC_STATIC_ASSERT(cond, name) typedef char oidc_static_assert_##name[(cond) ? 1 : -1]
 
 #include <apr_strings.h>
 
@@ -81,8 +90,13 @@
 static inline size_t _oidc_strlen(const char *s) {
 	return (s ? strlen(s) : 0);
 }
+/*
+ * NULL never compares equal, even to NULL, so missing state, nonce, or CSRF values fail closed.
+ * _oidc_strcmp is byte-exact because apr_strnatcmp() can equate distinct protocol values.
+ * Secret-derived values require oidc_util_strcmp_const_time().
+ */
 static inline int _oidc_strcmp(const char *a, const char *b) {
-	return ((a && b) ? apr_strnatcmp(a, b) : -1);
+	return ((a && b) ? strcmp(a, b) : -1);
 }
 static inline int _oidc_strnatcasecmp(const char *a, const char *b) {
 	return ((a && b) ? apr_strnatcasecmp(a, b) : -1);
@@ -99,10 +113,23 @@ static inline apr_time_t _oidc_str_to_time(const char *s, const apr_time_t defau
 		sscanf(s, "%" APR_TIME_T_FMT, &v);
 	return v;
 }
+/* Strict full-string, in-range integer parsing shared by runtime and configuration callers. */
+static inline apr_byte_t _oidc_str_to_int_checked(const char *s, int *out) {
+	char *endptr = NULL;
+	long v = 0;
+	if ((s == NULL) || (*s == '\0'))
+		return FALSE;
+	errno = 0;
+	v = strtol(s, &endptr, 10);
+	if ((endptr == s) || (*endptr != '\0') || (errno == ERANGE) || (v < INT_MIN) || (v > INT_MAX))
+		return FALSE;
+	*out = (int)v;
+	return TRUE;
+}
 static inline int _oidc_str_to_int(const char *s, const int default_value) {
 	int v = default_value;
-	if (s)
-		v = strtol(s, NULL, 10);
+	/* leave v at default_value on any parse failure, rather than the old strtol() 0-on-garbage */
+	(void)_oidc_str_to_int_checked(s, &v);
 	return v;
 }
 
@@ -169,6 +196,7 @@ static inline int _oidc_str_to_int(const char *s, const int default_value) {
 #define OIDC_CHAR_PIPE '|'
 #define OIDC_CHAR_AMP '&'
 #define OIDC_CHAR_SEMI_COLON ';'
+#define OIDC_CHAR_DQUOTE '"'
 
 #define OIDC_STR_SPACE " "
 #define OIDC_STR_EQUAL "="
