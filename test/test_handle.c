@@ -537,8 +537,9 @@ START_TEST(test_handle_userinfo_pass_as_signed_jwt_fixed_ttl) {
 
 	const char *dir = getenv("srcdir") ? getenv("srcdir") : ".";
 	cmd_parms *key_cmd = oidc_test_cmd_get(OIDCPrivateKeyFiles);
-	ck_assert_ptr_null(oidc_cmd_private_keys_set(
-	    key_cmd, NULL, apr_pstrdup(r->pool, apr_psprintf(r->pool, "rsa-1#%s/private.pem", dir))));
+	const char* rc = oidc_cmd_private_keys_set(
+	    key_cmd, NULL, apr_pstrdup(r->pool, apr_psprintf(r->pool, "rsa-1#%s/private.pem", dir)));
+	ck_assert_ptr_null(rc);
 
 	oidc_json_t *claims = json_pack("{s:s}", "sub", "alice");
 	oidc_session_set_userinfo_claims(r, session, claims);
@@ -852,10 +853,11 @@ START_TEST(test_handle_response_authorization_redirect_state_mismatch_with_sso_u
 	oidc_cfg_t *c = oidc_test_cfg_get();
 	oidc_session_t *session = NULL;
 	oidc_session_load(r, &session);
+	oidc_dir_cfg_t* dir_cfg = oidc_test_dir_cfg_get();
 
 	/* OIDCDefaultURL acts as a fallback for state-mismatch failures => 302 redirect */
 	cmd_parms *cmd = oidc_test_cmd_get("OIDCDefaultURL");
-	ck_assert_ptr_null(oidc_cmd_default_sso_url_set(cmd, NULL, "https://www.example.com/fallback"));
+	ck_assert_ptr_null(oidc_cmd_dir_default_sso_url_set(cmd, dir_cfg, "https://www.example.com/fallback"));
 
 	r->args = "";
 	int rc = oidc_response_authorization_redirect(r, c, session);
@@ -1731,9 +1733,11 @@ START_TEST(test_handle_response_state_expired_no_default_url_env) {
 	oidc_cfg_t *c = oidc_test_cfg_get();
 	oidc_session_t *session = NULL;
 	oidc_session_load(r, &session);
+	oidc_dir_cfg_t* dir_cfg = oidc_test_dir_cfg_get();
 
 	c->state_timeout = 0;
-	c->default_sso_url = apr_pstrdup(r->pool, "/sso");
+	cmd_parms* cmd = oidc_test_cmd_get(OIDCDefaultLoggedOutURL);
+	oidc_cmd_dir_default_sso_url_set(cmd, dir_cfg, "/sso");
 	apr_table_set(r->subprocess_env, "OIDC_NO_DEFAULT_URL_ON_STATE_TIMEOUT", "1");
 	char *state = e2e_build_state_cookie(r, c, OIDC_PROTO_RESPONSE_TYPE_CODE);
 	r->args = apr_psprintf(r->pool, "state=%s&code=the-code", oidc_http_url_encode(r, state));
@@ -2579,9 +2583,11 @@ END_TEST
 START_TEST(test_handle_discovery_response_csrf_and_authenticate) {
 	request_rec *r = oidc_test_request_get();
 	oidc_cfg_t *c = oidc_test_cfg_get();
+	oidc_dir_cfg_t* dir_cfg = oidc_test_dir_cfg_get();
 
 	e2e_write_metadata_dir(r, "https://idp.example.com/jwks");
-	c->default_sso_url = apr_pstrdup(r->pool, "/landing");
+	cmd_parms* cmd = oidc_test_cmd_get(OIDCDefaultURL);
+	oidc_cmd_dir_default_sso_url_set(cmd, dir_cfg, "/landing");
 
 	/* a matching CSRF cookie/query pair; the issuer carries a trailing slash and no
 	 * target_link_uri is provided so the default SSO URL applies */
@@ -2607,13 +2613,15 @@ END_TEST
 START_TEST(test_handle_discovery_response_test_jwks_uri) {
 	request_rec *r = oidc_test_request_get();
 	oidc_cfg_t *c = oidc_test_cfg_get();
-
+	oidc_dir_cfg_t* dir_cfg = oidc_test_dir_cfg_get();
+	
 	oidc_test_http_response_t resp = {
 	    .status_code = 200, .content_type = "application/json", .body = "{\"keys\":[]}"};
 	oidc_test_http_server_t *srv = oidc_test_http_server_start(r->pool, &resp);
 	ck_assert_ptr_nonnull(srv);
 	e2e_write_metadata_dir(r, oidc_test_http_server_url(srv, r->pool));
-	c->default_sso_url = apr_pstrdup(r->pool, "/landing");
+	cmd_parms* cmd = oidc_test_cmd_get(OIDCDefaultURL);
+	oidc_cmd_dir_default_sso_url_set(cmd, dir_cfg, "/landing");
 
 	r->args = "iss=https%3A%2F%2Fidp.example.com&test-jwks-uri=1";
 	int rc = oidc_discovery_response(r, c);
@@ -5860,7 +5868,9 @@ START_TEST(test_handle_dispatch_response_and_discovery) {
 
 	/* 3: a discovery response through the dispatcher */
 	oidc_session_load(r, &session);
-	c->default_sso_url = apr_pstrdup(r->pool, "/landing");
+	cmd_parms* cmd = oidc_test_cmd_get(OIDCDefaultURL);
+	oidc_dir_cfg_t *d_cfg = oidc_test_dir_cfg_get();
+	oidc_cmd_dir_default_sso_url_set(cmd, d_cfg, "/landing");
 	r->args = "iss=https%3A%2F%2Fidp.example.com";
 	int rc = oidc_handle_redirect_uri_request(r, c, session);
 	ck_assert_msg((rc == HTTP_MOVED_TEMPORARILY) || (rc == HTTP_INTERNAL_SERVER_ERROR) || (rc == HTTP_UNAUTHORIZED),

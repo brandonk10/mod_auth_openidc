@@ -102,6 +102,8 @@ static apr_byte_t oidc_test_crypto_passphrase_derive_keys_cached(oidc_crypto_pas
 	return TRUE;
 }
 
+static cmd_parms* oidc_test_cmd_get_pre(const char* primitive, apr_pool_t* pool, server_rec* server);
+
 static request_rec *oidc_test_request_init(apr_pool_t *pool) {
 	const unsigned int kIdx = 0;
 	const unsigned int kEls = kIdx + 1;
@@ -151,15 +153,17 @@ static request_rec *oidc_test_request_init(apr_pool_t *pool) {
 	oidc_cfg_provider_client_id_set(request->server->process->pconf, oidc_cfg_provider_get(cfg), "client_id");
 
 
-	oidc_dir_cfg_t *d_cfg = oidc_cfg_dir_config_create(request->server->process->pconf, NULL);
-	d_cfg->redirect_uri = "https://www.example.com/protected/";
-
 	// coverity[suspicious_sizeof]
 	request->server->module_config = apr_pcalloc(request->server->process->pconf, sizeof(void *) * kEls);
 	// coverity[suspicious_sizeof]
 	request->per_dir_config = apr_pcalloc(request->server->process->pconf, sizeof(void *) * kEls);
 	ap_set_module_config(request->server->module_config, &auth_openidc_module, cfg);
+
+	cmd_parms *cmd = oidc_test_cmd_get_pre(OIDCRedirectURI, pool, request->server);
+	oidc_dir_cfg_t *d_cfg = oidc_cfg_dir_config_create(pool, "https://www.example.com/bla?foo=bar&param1=value1");
+	oidc_cmd_dir_redirect_uri_set(cmd, d_cfg, "https://www.example.com/protected/");
 	ap_set_module_config(request->per_dir_config, &auth_openidc_module, d_cfg);
+
 
 	// TODO:
 	cfg->public_keys = apr_array_make(request->server->process->pconf, 1, sizeof(const char *));
@@ -230,6 +234,20 @@ request_rec *oidc_test_request_get(void) {
 
 oidc_cfg_t *oidc_test_cfg_get(void) {
 	return (oidc_cfg_t *)ap_get_module_config(request->server->module_config, &auth_openidc_module);
+}
+
+oidc_dir_cfg_t *oidc_test_dir_cfg_get(void) {
+	return (oidc_dir_cfg_t *)ap_get_module_config(request->per_dir_config, &auth_openidc_module);
+}
+
+cmd_parms *oidc_test_cmd_get_pre(const char *primitive, apr_pool_t* pool, server_rec* server) {
+	cmd_parms *cmd = apr_pcalloc(pool, sizeof(cmd_parms));
+	cmd->server = server;
+	cmd->pool = pool;
+	cmd->temp_pool = pool;
+	cmd->directive = apr_pcalloc(cmd->pool, sizeof(ap_directive_t));
+	cmd->directive->directive = primitive;
+	return cmd;
 }
 
 cmd_parms *oidc_test_cmd_get(const char *primitive) {

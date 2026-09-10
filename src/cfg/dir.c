@@ -55,6 +55,9 @@
 /* Generate declaration, initialization, and merge logic for simple directory members. */
 #define OIDC_DIR_CFG_SIMPLE_MEMBERS(PTR, INT)                                                                          \
 	PTR(char *, discover_url)                                                                                      \
+	PTR(char *, redirect_uri)                                                                                       \
+	PTR(char *, default_slo_url)                                                                                       \
+	PTR(char *, default_sso_url)                                                                                       \
 	PTR(char *, cookie_path)                                                                                       \
 	PTR(char *, cookie)                                                                                            \
 	PTR(char *, authn_header)                                                                                      \
@@ -67,6 +70,7 @@
 	PTR(oidc_apr_expr_t *, userinfo_claims_expr)                                                                   \
 	PTR(char *, state_cookie_prefix)                                                                               \
 	PTR(apr_array_header_t *, pass_userinfo_as)                                                                    \
+	INT(redirect_uri_inherited)                                                                                       \
 	INT(unauth_action)                                                                                             \
 	INT(unautz_action)                                                                                             \
 	INT(pass_info_in)                                                                                              \
@@ -93,6 +97,14 @@
 #define OIDC_PASS_IDTOKEN_AS_PAYLOAD_STR "payload"
 #define OIDC_PASS_IDTOKEN_AS_SERIALIZED_STR "serialized"
 #define OIDC_PASS_IDTOKEN_OFF_STR "off"
+
+struct oidc_dir_cfg_t {
+	OIDC_DIR_CFG_SIMPLE_MEMBERS(OIDC_DIR_M_DECL_PTR, OIDC_DIR_M_DECL_INT)
+	/* special: created as an (empty) hash, merged on entry count */
+	apr_hash_t *oauth_accept_token_options;
+	/* special: -1 is a valid value so this uses its own OIDC_INTROSPECT_INTERVAL_UNSET sentinel */
+	int oauth_token_introspect_interval;
+};
 
 /*
  * define how to pass the id_token/claims in HTTP headers
@@ -275,6 +287,13 @@ const char *oidc_cmd_dir_pass_cookies_set(cmd_parms *cmd, void *m, const char *a
 		return (type)dir_cfg->member;                                                                          \
 	}
 
+#define OIDC_CFG_DIR_MEMBER_FUNC_GET_UT(member, type, def_val, unset_val)                                                 \
+	type oidc_cfg_dir_##member##_get_ut(oidc_dir_cfg_t* dir_cfg) {                                                             \
+		if (dir_cfg->member == unset_val)                                                                      \
+			return (type)def_val;                                                                          \
+		return (type)dir_cfg->member;                                                                          \
+	}
+
 #define OIDC_CFG_DIR_MEMBER_FUNC_INT_GET(member, type, def_val)                                                        \
 	OIDC_CFG_DIR_MEMBER_FUNC_GET(member, type, def_val, OIDC_CONFIG_POS_INT_UNSET)
 
@@ -451,7 +470,14 @@ end:
 		return OIDC_CONFIG_DIR_RV(cmd, rv);                                                                    \
 	}                                                                                                              \
                                                                                                                        \
-	OIDC_CFG_DIR_MEMBER_FUNC_GET(member, type, def_val, NULL)
+	const void oidc_cmd_dir_##member##_empty(cmd_parms *cmd, void *m) {                            \
+		oidc_dir_cfg_t *dir_cfg = (oidc_dir_cfg_t *)m;                                                         \
+		dir_cfg->member = NULL;                                                                    \
+	}                                                                                                              \
+                                                                                                                       \
+	OIDC_CFG_DIR_MEMBER_FUNC_GET(member, type, def_val, NULL)                                                          \
+                                                                                                                       \
+	OIDC_CFG_DIR_MEMBER_FUNC_GET_UT(member, type, def_val, NULL)
 
 #define OIDC_CFG_DIR_MEMBER_FUNC_STR(member, type, def_val)                                                            \
 	const char *oidc_cmd_dir_##member##_set(cmd_parms *cmd, void *m, const char *arg) {                            \
@@ -469,7 +495,7 @@ OIDC_CFG_DIR_MEMBER_FUNC_INT_GET(refresh_access_token_before_expiry, int,
 
 /* default action to be taken on access token refresh error */
 #define OIDC_DEFAULT_ON_ERROR_REFRESH OIDC_ON_ERROR_502;
-OIDC_CFG_DIR_MEMBER_FUNC_INT_GET(action_on_error_refresh, oidc_on_error_action_t, OIDC_DEFAULT_ON_ERROR_REFRESH)
+OIDC_CFG_DIR_MEMBER_FUNC_INT_GET(action_on_error_refresh, oidc_on_error_action_t, FALSE)
 
 /* default prefix of the state cookie that binds the state in the authorization request/response to the browser */
 #define OIDC_DEFAULT_STATE_COOKIE_PREFIX "mod_auth_openidc_state_"
@@ -480,6 +506,8 @@ OIDC_CFG_DIR_MEMBER_FUNC_PTR(discover_url, const char *,
 
 OIDC_CFG_DIR_MEMBER_FUNC_PTR(redirect_uri, const char *,
 			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->redirect_uri), NULL)
+
+OIDC_CFG_DIR_MEMBER_FUNCS_INT(redirect_uri_inherited, int, oidc_cfg_parse_boolean(cmd->pool, arg, &v), FALSE)
 
 OIDC_CFG_DIR_MEMBER_FUNC_PTR(default_slo_url, const char *,
 			     oidc_cfg_parse_relative_or_absolute_url(cmd->pool, arg, &dir_cfg->default_slo_url), NULL)
@@ -679,5 +707,10 @@ void *oidc_cfg_dir_config_merge(apr_pool_t *pool, void *BASE, void *ADD) {
 	    _oidc_cfg_dir_merge_hash(add->oauth_accept_token_options, base->oauth_accept_token_options);
 	c->oauth_token_introspect_interval = _oidc_cfg_dir_merge_introspect_interval(
 	    add->oauth_token_introspect_interval, base->oauth_token_introspect_interval);
+
+	/* record where the merged redirect_uri came from while "add" (this vhost's own config) and
+	 * "base" can still be told apart: the merge below collapses them into a single value */
+	c->redirect_uri_inherited = (add->redirect_uri == NULL) && (base->redirect_uri != NULL);
+
 	return c;
 }

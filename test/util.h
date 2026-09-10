@@ -50,12 +50,14 @@
 #include <stdlib.h>
 
 #include "cfg/cfg.h"
+#include "cfg/dir.h"
 
 void oidc_test_setup(void);
 void oidc_test_teardown(void);
 apr_pool_t *oidc_test_pool_get(void);
 request_rec *oidc_test_request_get(void);
 oidc_cfg_t *oidc_test_cfg_get(void);
+oidc_dir_cfg_t* oidc_test_dir_cfg_get(void);
 cmd_parms *oidc_test_cmd_get(const char *primitive);
 void oidc_test_set_auth_type(const char *auth_type);
 void oidc_test_crypto_passphrase_rederive(oidc_cfg_t *cfg);
@@ -65,11 +67,13 @@ void oidc_test_crypto_passphrase_rederive(oidc_cfg_t *cfg);
  * test can call them the way httpd would; NULL until auth_openidc_module.register_hooks() has run
  */
 typedef int (*oidc_test_hook_post_config_fn)(apr_pool_t *pool, apr_pool_t *p1, apr_pool_t *p2, server_rec *s);
+typedef int (*oidc_test_hook_fixups_fn)(request_rec *r);
 typedef void (*oidc_test_hook_child_init_fn)(apr_pool_t *p, server_rec *s);
 typedef void (*oidc_test_hook_insert_filter_fn)(request_rec *r);
 typedef apr_status_t (*oidc_test_input_filter_fn)(ap_filter_t *f, apr_bucket_brigade *b, ap_input_mode_t mode,
 						  apr_read_type_e block, apr_off_t nbytes);
 oidc_test_hook_post_config_fn oidc_test_hook_post_config_get(void);
+oidc_test_hook_fixups_fn oidc_test_hook_fixups_get(void);
 oidc_test_hook_child_init_fn oidc_test_hook_child_init_get(void);
 oidc_test_hook_insert_filter_fn oidc_test_hook_insert_filter_get(void);
 oidc_test_input_filter_fn oidc_test_input_filter_get(void);

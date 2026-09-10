@@ -196,6 +196,7 @@ static int oidc_check_config_openid_openidc(apr_pool_t *pool, request_rec *r, oi
 
 int oidc_check_dir_level_config_error(apr_pool_t *pool, request_rec *r) {
 	oidc_cfg_t *cfg = ap_get_module_config(r->server->module_config, &auth_openidc_module);
+	const char* redir_uri = oidc_cfg_dir_redirect_uri_get(r);
 
 	const int oauth_configured =
 	    (oidc_cfg_oauth_metadata_url_get(cfg) != NULL) || (oidc_cfg_oauth_client_id_get(cfg) != NULL) ||
@@ -213,27 +214,27 @@ int oidc_check_dir_level_config_error(apr_pool_t *pool, request_rec *r) {
 	 * Without OAuth RS settings, an explicitly configured OIDCRedirectURI implies RP intent.
 	 * An inherited URI does not, because unrelated vhosts commonly inherit the server default.
 	 */
-	const int rp_intent = (oidc_cfg_dir_redirect_uri_get(r) != NULL) && (!oidc_cfg_redirect_uri_inherited_get(cfg)) &&
+	const int rp_intent = (redir_uri != NULL) && !oidc_cfg_dir_redirect_uri_inherited_get(r) &&
 			      (!oauth_configured);
 
 	if ((openidc_configured || rp_intent) && (oidc_check_config_openid_openidc(pool, r, cfg) != OK))
 		return HTTP_INTERNAL_SERVER_ERROR;
 
-
-	if (oidc_cfg_cookie_domain_get(cfg) != NULL) {
+	const char* cookie_domain = oidc_cfg_cookie_domain_get(cfg);
+	if (cookie_domain != NULL) {
 		apr_uri_t r_uri;
 		apr_byte_t redirect_uri_is_relative;
-		apr_uri_parse(pool, oidc_cfg_dir_redirect_uri_get(r), &r_uri);
-		redirect_uri_is_relative = (oidc_cfg_dir_redirect_uri_get(r)[0] == OIDC_CHAR_FORWARD_SLASH);
+		apr_uri_parse(pool, redir_uri, &r_uri);
+		redirect_uri_is_relative = (redir_uri[0] == OIDC_CHAR_FORWARD_SLASH);
 		if (redirect_uri_is_relative) {
 			oidc_warn(r, "if the configured " OIDCRedirectURI " is relative, " OIDCCookieDomain
 				      " SHOULD be empty");
-		} else if (!oidc_util_cookie_domain_valid(r_uri.hostname, oidc_cfg_cookie_domain_get(cfg))) {
+		} else if (!oidc_util_cookie_domain_valid(r_uri.hostname, cookie_domain)) {
 			oidc_error(r,
 				    "the domain (%s) configured in " OIDCCookieDomain
 				    " does not match the URL hostname (%s) of the configured " OIDCRedirectURI
 				    " (%s): setting \"state\" and \"session\" cookies will not work!",
-				    oidc_cfg_cookie_domain_get(cfg), r_uri.hostname, oidc_cfg_dir_redirect_uri_get(r));
+				    cookie_domain, r_uri.hostname, redir_uri);
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 	}

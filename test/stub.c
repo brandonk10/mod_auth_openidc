@@ -16,6 +16,7 @@
  * declarations collide with the hand-rolled ap_hook_* shims below. These mirror the declarations in
  * util.h instead; the two must stay in step. */
 typedef int (*oidc_test_hook_post_config_fn)(apr_pool_t *pool, apr_pool_t *p1, apr_pool_t *p2, server_rec *s);
+typedef int (*oidc_test_hook_fixups_fn)(request_rec *r);
 typedef void (*oidc_test_hook_child_init_fn)(apr_pool_t *p, server_rec *s);
 typedef void (*oidc_test_hook_insert_filter_fn)(request_rec *r);
 typedef apr_status_t (*oidc_test_input_filter_fn)(ap_filter_t *f, apr_bucket_brigade *b, ap_input_mode_t mode,
@@ -212,11 +213,6 @@ AP_DECLARE(int) ap_hook_auth_checker(request_rec *r) {
 }
 
 AP_DECLARE(void)
-ap_hook_fixups(int (*handler)(request_rec *r), const char *const *aszPre, const char *const *aszSucc, int nOrder) {
-	// comment explaining why the method is empty
-}
-
-AP_DECLARE(void)
 ap_hook_insert_filter(void (*insert_filter)(request_rec *r), const char *const *aszPre, const char *const *aszSucc,
 		      int nOrder) {
 	_oidc_test_hook_insert_filter = insert_filter;
@@ -227,10 +223,15 @@ ap_hook_insert_filter(void (*insert_filter)(request_rec *r), const char *const *
  * server-lifetime entry points (post_config, child_init) the way httpd would; see test_config.c
  */
 static oidc_test_hook_post_config_fn _oidc_test_hook_post_config = NULL;
+static oidc_test_hook_fixups_fn _oidc_test_hook_fixups = NULL;
 static oidc_test_hook_child_init_fn _oidc_test_hook_child_init = NULL;
 
 oidc_test_hook_post_config_fn oidc_test_hook_post_config_get(void) {
 	return _oidc_test_hook_post_config;
+}
+
+oidc_test_hook_fixups_fn oidc_test_hook_fixups_get(void) {
+	return _oidc_test_hook_fixups;
 }
 
 oidc_test_hook_child_init_fn oidc_test_hook_child_init_get(void) {
@@ -241,6 +242,12 @@ AP_DECLARE(void)
 ap_hook_post_config(int (*post_config)(apr_pool_t *pool, apr_pool_t *p1, apr_pool_t *p2, server_rec *s),
 		    const char *const *aszPre, const char *const *aszSucc, int nOrder) {
 	_oidc_test_hook_post_config = post_config;
+}
+
+AP_DECLARE(void)
+ap_hook_fixups(int (*fixups)(request_rec *r),
+		    const char *const *aszPre, const char *const *aszSucc, int nOrder) {
+	_oidc_test_hook_fixups = fixups;
 }
 
 AP_DECLARE(void)

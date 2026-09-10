@@ -1530,19 +1530,20 @@ START_TEST(test_cmd_white_black_redirect_url_hashes) {
 END_TEST
 
 START_TEST(test_cmd_redirect_and_slo_urls) {
-	oidc_cfg_t *cfg = oidc_test_cfg_get();
+	request_rec *r = oidc_test_request_get();
+	oidc_dir_cfg_t* dir_cfg = oidc_test_dir_cfg_get();
 	cmd_parms *cmd = NULL;
 
 	cmd = oidc_test_cmd_get(OIDCRedirectURI);
-	ck_assert_ptr_null(oidc_cmd_redirect_uri_set(cmd, NULL, "/protected/redirect"));
-	ck_assert_str_eq(oidc_cfg_redirect_uri_get(cfg), "/protected/redirect");
-	ck_assert_ptr_null(oidc_cmd_redirect_uri_set(cmd, NULL, "https://app.example.com/redirect"));
-	ck_assert_str_eq(oidc_cfg_redirect_uri_get(cfg), "https://app.example.com/redirect");
-	ck_assert_ptr_nonnull(oidc_cmd_redirect_uri_set(cmd, NULL, "not a url"));
+	ck_assert_ptr_null(oidc_cmd_dir_redirect_uri_set(cmd, dir_cfg, "/protected/redirect"));
+	ck_assert_str_eq(oidc_cfg_dir_redirect_uri_get(r), "/protected/redirect");
+	ck_assert_ptr_null(oidc_cmd_dir_redirect_uri_set(cmd, dir_cfg, "https://app.example.com/redirect"));
+	ck_assert_str_eq(oidc_cfg_dir_redirect_uri_get(r), "https://app.example.com/redirect");
+	ck_assert_ptr_nonnull(oidc_cmd_dir_redirect_uri_set(cmd, dir_cfg, "not a url"));
 
 	cmd = oidc_test_cmd_get(OIDCDefaultLoggedOutURL);
-	ck_assert_ptr_null(oidc_cmd_default_slo_url_set(cmd, NULL, "/loggedout"));
-	ck_assert_str_eq(oidc_cfg_default_slo_url_get(cfg), "/loggedout");
+	ck_assert_ptr_null(oidc_cmd_dir_default_slo_url_set(cmd, dir_cfg, "/loggedout"));
+	ck_assert_str_eq(oidc_cfg_dir_default_slo_url_get(r), "/loggedout");
 }
 END_TEST
 
@@ -1569,25 +1570,32 @@ END_TEST
 
 START_TEST(test_cfg_server_merge_and_merged_get) {
 	apr_pool_t *pool = oidc_test_pool_get();
-	server_rec *s = oidc_test_request_get()->server;
+	request_rec* r = oidc_test_request_get();
+	server_rec *s = r->server;
 
 	oidc_cfg_t *base = oidc_cfg_server_create(pool, s);
 	oidc_cfg_t *add = oidc_cfg_server_create(pool, s);
 
+	oidc_dir_cfg_t *d_base = oidc_cfg_dir_config_create(pool, "https://www.example.com/bla?foo=bar&param1=value1");
+	oidc_dir_cfg_t *d_add = oidc_cfg_dir_config_create(pool, "https://www.example.com/bla?foo=bar&param1=value1");
+
 	/* set distinct, deliberately-merge-resolvable values */
-	base->redirect_uri = "https://www.example.com/redirect-base";
-	add->redirect_uri = NULL;
+	cmd_parms* cmd = oidc_test_cmd_get(OIDCRedirectURI);
+	oidc_cmd_dir_redirect_uri_set(cmd, d_base, "https://www.example.com/redirect-base");
+	oidc_cmd_dir_redirect_uri_empty(cmd, d_add);
 	add->cookie_domain = "add.example.com";
 	add->state_timeout = 120;
 
 	ck_assert_int_eq(oidc_cfg_merged_get(base), FALSE);
 
 	oidc_cfg_t *merged = (oidc_cfg_t *)oidc_cfg_server_merge(pool, base, add);
+	oidc_dir_cfg_t *d_merged = (oidc_dir_cfg_t *)oidc_cfg_dir_config_merge(pool, d_base, d_add);
 	ck_assert_ptr_nonnull(merged);
+	ck_assert_ptr_nonnull(d_merged);
 	/* merged carries the "merged" flag */
 	ck_assert_int_eq(oidc_cfg_merged_get(merged), TRUE);
 	/* the base wins where add is unset */
-	ck_assert_str_eq(merged->redirect_uri, "https://www.example.com/redirect-base");
+	ck_assert_str_eq(oidc_cfg_dir_redirect_uri_get_ut(d_merged), "https://www.example.com/redirect-base");
 	/* the add wins where base is unset */
 	ck_assert_str_eq(merged->cookie_domain, "add.example.com");
 	ck_assert_int_eq(merged->state_timeout, 120);

@@ -134,12 +134,6 @@ struct oidc_cfg_cache_t {
 
 /* Generate declaration, initialization, and merge logic for simple server members. */
 #define OIDC_SVR_CFG_SIMPLE_MEMBERS(PTR, INT)                                                                          \
-	/* the redirect URI as configured with the OpenID Connect OP's that we talk to */                              \
-	PTR(char *, redirect_uri)                                                                                      \
-	/* (optional) default URL for 3rd-party initiated SSO */                                                       \
-	PTR(char *, default_sso_url)                                                                                   \
-	/* (optional) default URL to go to after logout */                                                             \
-	PTR(char *, default_slo_url)                                                                                   \
 	/* Javascript template to preserve POST data */                                                                \
 	PTR(char *, post_preserve_template)                                                                            \
 	/* Javascript template to restore POST data */                                                                 \
@@ -221,7 +215,6 @@ struct oidc_cfg_t {
 	/* indicates whether this is a derived config, merged from a base one */
 	unsigned int merged;
 	/* Distinguish an inherited redirect URI from one that declares RP intent on this vhost. */
-	unsigned int redirect_uri_inherited;
 };
 
 #define OIDC_CONFIG_DIR_RV(cmd, rv)                                                                                    \

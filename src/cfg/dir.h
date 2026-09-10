@@ -45,45 +45,6 @@
 
 #include "cfg/cfg.h"
 
-/*
- * directory related configuration
- */
-struct oidc_dir_cfg_t {
-        /* the redirect URI as configured with the OpenID Connect OP's that we talk to */
-        char *redirect_uri;
-        /* (optional) default URL for 3rd-party initiated SSO */
-        char *default_sso_url;
-        /* (optional) default URL to go to after logout */
-        char *default_slo_url;
-        char *discover_url;
-        char *cookie_path;
-        char *cookie;
-        char *authn_header;
-        int unauth_action;
-        int unautz_action;
-        char *unauthz_arg;
-        apr_array_header_t *pass_cookies;
-        apr_array_header_t *strip_cookies;
-        int pass_info_in;
-        int pass_info_encoding;
-        int oauth_accept_token_in;
-        apr_hash_t *oauth_accept_token_options;
-        int oauth_token_introspect_interval;
-        int preserve_post;
-        int pass_access_token;
-        int pass_refresh_token;
-        oidc_apr_expr_t *path_auth_request_expr;
-        oidc_apr_expr_t *path_scope_expr;
-        oidc_apr_expr_t *unauth_expression;
-        oidc_apr_expr_t *userinfo_claims_expr;
-        int refresh_access_token_before_expiry;
-        int action_on_error_refresh;
-        int action_on_userinfo_refresh;
-        char *state_cookie_prefix;
-        apr_array_header_t *pass_userinfo_as;
-        int pass_idtoken_as;
-};
-
 typedef enum {
 	/* pass id_token as individual claims in headers (default) */
 	OIDC_PASS_IDTOKEN_AS_CLAIMS = 1,
@@ -138,20 +99,25 @@ typedef enum {
 	OIDC_UNAUTZ_RETURN302 = 4
 } oidc_unautz_action_t;
 
+typedef struct oidc_dir_cfg_t oidc_dir_cfg_t;
+
 /* Generate per-directory directive-handler and request-aware getter declarations. */
 
 /* const char *oidc_cmd_dir_<member>_set(cmd_parms *, void *, const char *, ...) */
 #define OIDC_CMD_DIR_MEMBER_FUNC_DECL(member, ...)                                                                     \
-	const char *oidc_cmd_dir_##member##_set(cmd_parms *, void *, const char *, ##__VA_ARGS__);
+	const char *oidc_cmd_dir_##member##_set(cmd_parms *, void *, const char *, ##__VA_ARGS__); \
+	const void oidc_cmd_dir_##member##_empty(cmd_parms *, void *);
 
 /* <type> oidc_cfg_dir_<member>_get(request_rec *) */
-#define OIDC_CFG_DIR_MEMBER_FUNC_GET_DECL(member, type) type oidc_cfg_dir_##member##_get(request_rec *r);
+#define OIDC_CFG_DIR_MEMBER_FUNC_GET_DECL(member, type) type oidc_cfg_dir_##member##_get(request_rec *r); \
+type oidc_cfg_dir_##member##_get_ut(oidc_dir_cfg_t* dir_cfg);
 
 #define OIDC_CFG_DIR_MEMBER_FUNCS(member, type, ...)                                                                   \
 	OIDC_CMD_DIR_MEMBER_FUNC_DECL(member, ##__VA_ARGS__)                                                           \
 	OIDC_CFG_DIR_MEMBER_FUNC_GET_DECL(member, type)
 
 OIDC_CFG_DIR_MEMBER_FUNCS(redirect_uri, const char *)
+OIDC_CFG_DIR_MEMBER_FUNCS(redirect_uri_inherited, int)
 OIDC_CFG_DIR_MEMBER_FUNCS(default_sso_url, const char *)
 OIDC_CFG_DIR_MEMBER_FUNCS(default_slo_url, const char *)
 OIDC_CFG_DIR_MEMBER_FUNCS(pass_userinfo_as, const apr_array_header_t *)
@@ -193,8 +159,6 @@ OIDC_CFG_DIR_MEMBER_FUNC_GET_DECL(unauthz_arg, const char *)
 const char *oidc_cfg_dir_accept_token_in_option_get(request_rec *r, const char *key);
 apr_byte_t oidc_cfg_dir_unauth_expr_is_set(request_rec *r);
 const char *oidc_cfg_dir_accept_oauth_token_in2str(apr_pool_t *pool, oidc_oauth_accept_token_in_t v);
-
-typedef struct oidc_dir_cfg_t oidc_dir_cfg_t;
 
 void *oidc_cfg_dir_config_create(apr_pool_t *, char *);
 void *oidc_cfg_dir_config_merge(apr_pool_t *, void *, void *);

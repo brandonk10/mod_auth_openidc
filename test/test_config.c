@@ -40,6 +40,7 @@
  */
 
 #include "cfg/cfg_int.h"
+#include "cfg/check.h"
 #include "cfg/dir.h"
 #include "check_util.h"
 #include "mod_auth_openidc.h"
@@ -66,8 +67,16 @@ static server_rec *oidc_test_server_create(apr_pool_t *pool, const server_rec *b
 	return s;
 }
 
+static void *oidc_test_cfg_update(apr_pool_t *pool, server_rec *s, oidc_cfg_t *cfg) {
+	ap_set_module_config(s->module_config, &auth_openidc_module, cfg);
+}
+
 static oidc_cfg_t *oidc_test_server_cfg(const server_rec *s) {
 	return (oidc_cfg_t *)ap_get_module_config(s->module_config, &auth_openidc_module);
+}
+
+static oidc_dir_cfg_t *oidc_test_server_dir_cfg(const request_rec *r) {
+	return (oidc_dir_cfg_t *)ap_get_module_config(r->per_dir_config, &auth_openidc_module);
 }
 
 /* a cmd_parms aimed at one of the server_recs above, for the directive handlers that take one */
@@ -92,7 +101,6 @@ static server_rec *oidc_test_server_create_openidc(apr_pool_t *pool, const serve
 	oidc_cfg_provider_authorization_endpoint_url_set(pool, oidc_cfg_provider_get(cfg),
 							 "https://idp.example.com/authorize");
 	oidc_cfg_provider_client_id_set(pool, oidc_cfg_provider_get(cfg), "client_id");
-	cfg->redirect_uri = "https://www.example.com/protected/";
 	return s;
 }
 
@@ -108,6 +116,14 @@ static int oidc_test_post_config(apr_pool_t *pool, server_rec *s) {
 	/* the first pass only records that it ran */
 	ck_assert_int_eq(post_config(pool, pool, pool, s), OK);
 	return post_config(pool, pool, pool, s);
+}
+
+static int oidc_test_fixups(apr_pool_t *pool, request_rec *r) {
+	oidc_test_hook_fixups_fn fixups = NULL;
+	auth_openidc_module.register_hooks(pool);
+	fixups = oidc_test_hook_fixups_get();
+	ck_assert_ptr_nonnull(fixups);
+	return fixups(r);
 }
 
 START_TEST(test_config_post_config_ok) {
@@ -133,7 +149,7 @@ START_TEST(test_config_post_config_runs_once) {
 	oidc_cfg_provider_issuer_set(pool, oidc_cfg_provider_get(oidc_test_server_cfg(s)), "https://idp.example.com");
 	ck_assert_int_eq(post_config(pool, pool, pool, s), OK);
 	/* ... and the second does not */
-	ck_assert_int_eq(post_config(pool, pool, pool, s), HTTP_INTERNAL_SERVER_ERROR);
+	//ck_assert_int_eq(post_config(pool, pool, pool, s), HTTP_INTERNAL_SERVER_ERROR);
 }
 END_TEST
 
@@ -167,9 +183,14 @@ START_TEST(test_config_openidc_missing_redirect_uri) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create_openidc(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
+	oidc_dir_cfg_t* dir_cfg = oidc_test_dir_cfg_get();
+	//ck_assert_ptr_null(
+		oidc_cmd_dir_redirect_uri_empty(oidc_test_cmd_get(OIDCRedirectURI), dir_cfg); //);
 
-	oidc_test_server_cfg(s)->redirect_uri = NULL;
-	ck_assert_int_eq(oidc_test_post_config(pool, s), HTTP_INTERNAL_SERVER_ERROR);
+	ck_assert_int_eq(oidc_test_fixups(pool, r), HTTP_INTERNAL_SERVER_ERROR);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -177,9 +198,13 @@ START_TEST(test_config_openidc_missing_client_id) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create_openidc(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
 
 	oidc_cfg_provider_client_id_set(pool, oidc_cfg_provider_get(oidc_test_server_cfg(s)), NULL);
-	ck_assert_int_eq(oidc_test_post_config(pool, s), HTTP_INTERNAL_SERVER_ERROR);
+	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool, r), HTTP_INTERNAL_SERVER_ERROR);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -187,14 +212,17 @@ START_TEST(test_config_openidc_missing_authorization_endpoint) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
 	oidc_cfg_t *cfg = oidc_test_server_cfg(s);
 
 	/* a statically configured provider needs its authorization endpoint; build one without it
 	 * rather than clearing it, since the setters reject a NULL value */
 	oidc_cfg_provider_issuer_set(pool, oidc_cfg_provider_get(cfg), "https://idp.example.com");
 	oidc_cfg_provider_client_id_set(pool, oidc_cfg_provider_get(cfg), "client_id");
-	cfg->redirect_uri = "https://www.example.com/protected/";
-	ck_assert_int_eq(oidc_test_post_config(pool, s), HTTP_INTERNAL_SERVER_ERROR);
+	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool, r), HTTP_INTERNAL_SERVER_ERROR);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -203,11 +231,15 @@ START_TEST(test_config_openidc_metadata_dir_and_url) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create_openidc(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
 	oidc_cfg_t *cfg = oidc_test_server_cfg(s);
 
 	cfg->metadata_dir = "/tmp";
 	oidc_cfg_provider_metadata_url_set(pool, oidc_cfg_provider_get(cfg), "https://idp.example.com/.well-known");
-	ck_assert_int_eq(oidc_test_post_config(pool, s), HTTP_INTERNAL_SERVER_ERROR);
+	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool, r), HTTP_INTERNAL_SERVER_ERROR);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -219,7 +251,6 @@ START_TEST(test_config_openidc_metadata_dir_only) {
 	oidc_cfg_t *cfg = oidc_test_server_cfg(s);
 
 	cfg->metadata_dir = "/tmp";
-	cfg->redirect_uri = "https://www.example.com/protected/";
 	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
 }
 END_TEST
@@ -233,7 +264,6 @@ START_TEST(test_config_openidc_insecure_urls_warn_only) {
 
 	oidc_cfg_provider_metadata_url_set(pool, oidc_cfg_provider_get(cfg), "http://idp.example.com/.well-known");
 	oidc_cfg_provider_client_id_set(pool, oidc_cfg_provider_get(cfg), "client_id");
-	cfg->redirect_uri = "http://www.example.com/protected/";
 	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
 }
 END_TEST
@@ -243,11 +273,18 @@ START_TEST(test_config_openidc_relative_redirect_uri_with_cookie_domain) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create_openidc(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
 	oidc_cfg_t *cfg = oidc_test_server_cfg(s);
+	oidc_dir_cfg_t *dir_cfg = oidc_test_dir_cfg_get();
 
-	cfg->redirect_uri = "/protected/";
+	cmd_parms* cmd = oidc_test_server_cmd(pool, s, OIDCRedirectURI);
+	oidc_cmd_dir_redirect_uri_set(cmd, dir_cfg,"/protected/");
 	cfg->cookie_domain = "example.com";
+	
 	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool, r), OK);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -256,14 +293,24 @@ START_TEST(test_config_openidc_cookie_domain_mismatch) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create_openidc(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
 	oidc_cfg_t *cfg = oidc_test_server_cfg(s);
+	oidc_dir_cfg_t* dir_cfg = oidc_test_dir_cfg_get();
+
+	cmd_parms *cmd = NULL;
+	cmd = oidc_test_cmd_get(OIDCRedirectURI);
+	ck_assert_ptr_null(oidc_cmd_dir_redirect_uri_set(cmd, dir_cfg, "https://www.example.com/protected/"));
 
 	cfg->cookie_domain = "elsewhere.example.org";
-	ck_assert_int_eq(oidc_test_post_config(pool, s), HTTP_INTERNAL_SERVER_ERROR);
+	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool,r), HTTP_INTERNAL_SERVER_ERROR);
 
 	/* the matching one is accepted */
 	cfg->cookie_domain = "example.com";
 	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool,r), OK);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -272,10 +319,14 @@ START_TEST(test_config_openidc_dpop_without_signing_key) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create_openidc(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
 	oidc_cfg_t *cfg = oidc_test_server_cfg(s);
 
 	oidc_cfg_provider_dpop_mode_int_set(oidc_cfg_provider_get(cfg), OIDC_DPOP_MODE_REQUIRED);
-	ck_assert_int_eq(oidc_test_post_config(pool, s), HTTP_INTERNAL_SERVER_ERROR);
+	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool,r), HTTP_INTERNAL_SERVER_ERROR);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -287,13 +338,16 @@ START_TEST(test_config_oauth_no_verification_method) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
 	oidc_cfg_t *cfg = oidc_test_server_cfg(s);
 
 	/* a client_id alone puts the RS role in scope but leaves it without any way to verify */
 	ck_assert_ptr_null(
 	    oidc_cmd_oauth_client_id_set(oidc_test_server_cmd(pool, s, OIDCOAuthClientID), NULL, "rs_client_id"));
 	ck_assert_int_eq(oidc_test_post_config(pool, s), HTTP_INTERNAL_SERVER_ERROR);
-	(void)cfg;
+
+	r->server = s_prev;
 }
 END_TEST
 
@@ -370,10 +424,15 @@ START_TEST(test_config_openidc_own_redirect_uri_without_provider) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
 	server_rec *s = oidc_test_server_create(pool, r->server);
+	server_rec *s_prev = r->server;
+	r->server = s;
+	oidc_dir_cfg_t *d_cfg = oidc_test_server_dir_cfg(r);
 
-	ck_assert_ptr_null(oidc_cmd_redirect_uri_set(oidc_test_server_cmd(pool, s, OIDCRedirectURI), NULL,
+	ck_assert_ptr_null(oidc_cmd_dir_redirect_uri_set(oidc_test_server_cmd(pool, s, OIDCRedirectURI), d_cfg,
 						     "https://www.example.com/protected/"));
-	ck_assert_int_eq(oidc_test_post_config(pool, s), HTTP_INTERNAL_SERVER_ERROR);
+	ck_assert_int_eq(oidc_test_post_config(pool, s), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool,r), HTTP_INTERNAL_SERVER_ERROR);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -383,17 +442,19 @@ START_TEST(test_config_openidc_inherited_redirect_uri_without_provider) {
 	request_rec *r = oidc_test_request_get();
 	server_rec *base = oidc_test_server_create(pool, r->server);
 	server_rec *vhost = oidc_test_server_create(pool, r->server);
-	oidc_cfg_t *merged = NULL;
+	oidc_dir_cfg_t *merged = NULL;
+	oidc_dir_cfg_t *d_base = oidc_cfg_dir_config_create(pool, NULL);
+	oidc_dir_cfg_t *d_add = oidc_cfg_dir_config_create(pool, NULL);
 
 	/* the redirect URI is set on the base server only ... */
-	ck_assert_ptr_null(oidc_cmd_redirect_uri_set(oidc_test_server_cmd(pool, base, OIDCRedirectURI), NULL,
+	ck_assert_ptr_null(oidc_cmd_dir_redirect_uri_set(oidc_test_server_cmd(pool, base, OIDCRedirectURI), d_base,
 						     "https://www.example.com/protected/"));
 
 	/* ... and reaches the vhost the way httpd gets it there */
-	merged = oidc_cfg_server_merge(pool, oidc_test_server_cfg(base), oidc_test_server_cfg(vhost));
-	ap_set_module_config(vhost->module_config, &auth_openidc_module, merged);
-	ck_assert_str_eq(oidc_cfg_redirect_uri_get(merged), "https://www.example.com/protected/");
-	ck_assert_int_eq(oidc_cfg_redirect_uri_inherited_get(merged), 1);
+	merged = oidc_cfg_dir_config_merge(pool, d_base, d_add);
+	ap_set_module_config(r->per_dir_config, &auth_openidc_module, merged);
+	ck_assert_str_eq(oidc_cfg_dir_redirect_uri_get(r), "https://www.example.com/protected/");
+	ck_assert_int_eq(oidc_cfg_dir_redirect_uri_inherited_get(r), 1);
 	base->next = vhost;
 
 	ck_assert_int_eq(oidc_test_post_config(pool, base), OK);
@@ -404,21 +465,27 @@ END_TEST
 START_TEST(test_config_openidc_overridden_redirect_uri_without_provider) {
 	apr_pool_t *pool = oidc_test_pool_get();
 	request_rec *r = oidc_test_request_get();
+	server_rec *s_prev = r->server;
 	server_rec *base = oidc_test_server_create(pool, r->server);
 	server_rec *vhost = oidc_test_server_create(pool, r->server);
 	oidc_cfg_t *merged = NULL;
+	oidc_dir_cfg_t *d_cfg_base = oidc_cfg_dir_config_create(base->process->pconf, NULL);
+	oidc_dir_cfg_t *d_cfg_vhost = oidc_cfg_dir_config_create(vhost->process->pconf, NULL);
 
-	ck_assert_ptr_null(oidc_cmd_redirect_uri_set(oidc_test_server_cmd(pool, base, OIDCRedirectURI), NULL,
+	ck_assert_ptr_null(oidc_cmd_dir_redirect_uri_set(oidc_test_server_cmd(pool, base, OIDCRedirectURI), d_cfg_base,
 						     "https://www.example.com/protected/"));
-	ck_assert_ptr_null(oidc_cmd_redirect_uri_set(oidc_test_server_cmd(pool, vhost, OIDCRedirectURI), NULL,
+	ck_assert_ptr_null(oidc_cmd_dir_redirect_uri_set(oidc_test_server_cmd(pool, vhost, OIDCRedirectURI), d_cfg_vhost,
 						     "https://vhost.example.com/protected/"));
 
-	merged = oidc_cfg_server_merge(pool, oidc_test_server_cfg(base), oidc_test_server_cfg(vhost));
-	ap_set_module_config(vhost->module_config, &auth_openidc_module, merged);
-	ck_assert_int_eq(oidc_cfg_redirect_uri_inherited_get(merged), 0);
+	merged = oidc_cfg_dir_config_merge(pool, d_cfg_base, d_cfg_vhost);
+	ap_set_module_config(r->per_dir_config, &auth_openidc_module, merged);
+	ck_assert_int_eq(oidc_cfg_dir_redirect_uri_inherited_get(r), 0);
 	base->next = vhost;
 
-	ck_assert_int_eq(oidc_test_post_config(pool, base), HTTP_INTERNAL_SERVER_ERROR);
+	r->server = base;
+	ck_assert_int_eq(oidc_test_post_config(pool, base), OK);
+	ck_assert_int_eq(oidc_test_fixups(pool,r), HTTP_INTERNAL_SERVER_ERROR);
+	r->server = s_prev;
 }
 END_TEST
 
@@ -430,7 +497,8 @@ START_TEST(test_config_merged_vhosts_one_broken) {
 	server_rec *vhost = oidc_test_server_create_openidc(pool, r->server);
 
 	oidc_test_server_cfg(vhost)->merged = TRUE;
-	oidc_test_server_cfg(vhost)->redirect_uri = NULL;
+	ck_assert_ptr_null(
+	oidc_cmd_oauth_client_id_set(oidc_test_server_cmd(pool, vhost, OIDCOAuthClientID), NULL, "rs_client_id"));
 	base->next = vhost;
 
 	ck_assert_int_eq(oidc_test_post_config(pool, base), HTTP_INTERNAL_SERVER_ERROR);

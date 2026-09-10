@@ -27,6 +27,7 @@
 
 #include "cache/cache.h"
 #include "cfg/cfg_int.h"
+#include "cfg/dir.h"
 #include "cfg/oauth.h"
 #include "cfg/provider.h"
 #include "check_util.h"
@@ -1369,9 +1370,11 @@ START_TEST(test_metadata_disk_dyn_registration_post_logout_redirect_uris) {
 	request_rec *r = oidc_test_request_get();
 	oidc_cfg_t *c = oidc_test_cfg_get();
 	const char *dir = e2e_make_metadata_dir(r);
+	oidc_dir_cfg_t* dir_cfg = oidc_test_dir_cfg_get();
+
 
 	cmd_parms *cmd = oidc_test_cmd_get(OIDCDefaultLoggedOutURL);
-	ck_assert_ptr_null(oidc_cmd_default_slo_url_set(cmd, NULL, "/logged-out.html"));
+	ck_assert_ptr_null(oidc_cmd_dir_default_slo_url_set(cmd, dir_cfg, "/logged-out.html"));
 
 	oidc_test_http_response_t resp = {.status_code = 200,
 					  .content_type = "application/json",
