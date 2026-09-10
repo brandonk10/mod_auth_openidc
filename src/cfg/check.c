@@ -225,7 +225,7 @@ int oidc_check_dir_level_config_error(apr_pool_t *pool, request_rec *r) {
 		apr_uri_t r_uri;
 		apr_byte_t redirect_uri_is_relative;
 		apr_uri_parse(pool, redir_uri, &r_uri);
-		redirect_uri_is_relative = (redir_uri[0] == OIDC_CHAR_FORWARD_SLASH);
+		redirect_uri_is_relative = (redir_uri != NULL && redir_uri[0] == OIDC_CHAR_FORWARD_SLASH);
 		if (redirect_uri_is_relative) {
 			oidc_warn(r, "if the configured " OIDCRedirectURI " is relative, " OIDCCookieDomain
 				      " SHOULD be empty");

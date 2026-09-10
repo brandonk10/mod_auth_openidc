@@ -106,7 +106,7 @@ typedef struct oidc_dir_cfg_t oidc_dir_cfg_t;
 /* const char *oidc_cmd_dir_<member>_set(cmd_parms *, void *, const char *, ...) */
 #define OIDC_CMD_DIR_MEMBER_FUNC_DECL(member, ...)                                                                     \
 	const char *oidc_cmd_dir_##member##_set(cmd_parms *, void *, const char *, ##__VA_ARGS__); \
-	const void oidc_cmd_dir_##member##_empty(cmd_parms *, void *);
+	void oidc_cmd_dir_##member##_empty(cmd_parms *, void *);
 
 /* <type> oidc_cfg_dir_<member>_get(request_rec *) */
 #define OIDC_CFG_DIR_MEMBER_FUNC_GET_DECL(member, type) type oidc_cfg_dir_##member##_get(request_rec *r); \
