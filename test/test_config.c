@@ -67,10 +67,6 @@ static server_rec *oidc_test_server_create(apr_pool_t *pool, const server_rec *b
 	return s;
 }
 
-static void *oidc_test_cfg_update(apr_pool_t *pool, server_rec *s, oidc_cfg_t *cfg) {
-	ap_set_module_config(s->module_config, &auth_openidc_module, cfg);
-}
-
 static oidc_cfg_t *oidc_test_server_cfg(const server_rec *s) {
 	return (oidc_cfg_t *)ap_get_module_config(s->module_config, &auth_openidc_module);
 }
@@ -340,7 +336,6 @@ START_TEST(test_config_oauth_no_verification_method) {
 	server_rec *s = oidc_test_server_create(pool, r->server);
 	server_rec *s_prev = r->server;
 	r->server = s;
-	oidc_cfg_t *cfg = oidc_test_server_cfg(s);
 
 	/* a client_id alone puts the RS role in scope but leaves it without any way to verify */
 	ck_assert_ptr_null(
