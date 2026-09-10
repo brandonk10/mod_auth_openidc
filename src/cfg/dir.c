@@ -470,7 +470,7 @@ end:
 		return OIDC_CONFIG_DIR_RV(cmd, rv);                                                                    \
 	}                                                                                                              \
                                                                                                                        \
-	const void oidc_cmd_dir_##member##_empty(cmd_parms *cmd, void *m) {                            \
+	void oidc_cmd_dir_##member##_empty(cmd_parms *cmd, void *m) {                            \
 		oidc_dir_cfg_t *dir_cfg = (oidc_dir_cfg_t *)m;                                                         \
 		dir_cfg->member = NULL;                                                                    \
 	}                                                                                                              \
